@@ -160,6 +160,47 @@ def _nvidia_fused_verify(
 
 @register_kernel(
     "attention",
+    "kda_verify_conv_update",
+    name="triton_nvidia_kda_verify_conv_update",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
+    signatures=_DENSE_BF16_SIGNATURES,
+    priority=Priority.SPECIALIZED,
+    traits={
+        "paged_state": frozenset({True}),
+        "split_producers": frozenset({True}),
+        "recurrent_layout": frozenset({"v_major"}),
+    },
+    tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
+)
+def triton_nvidia_kda_verify_conv_update(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Materialize the NVIDIA split-verify convolution producer."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_kda_verify_conv_update,
+    )
+
+    return fused_kda_verify_conv_update(
+        mixed_qkv,
+        conv_weights,
+        conv_states,
+        read_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+    )
+
+
+@register_kernel(
+    "attention",
     "kda_fused_paged_verify",
     name="triton_nvidia_kda_fused_paged_verify",
     solution="triton",

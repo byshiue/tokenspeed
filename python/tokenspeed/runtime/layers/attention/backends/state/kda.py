@@ -30,6 +30,7 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention import (
     kda_batched_replay_uses_raw_gate,
+    kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
     kda_paged_prefill,
 )
@@ -38,13 +39,10 @@ from tokenspeed_kernel.ops.attention import (
 )
 from tokenspeed_kernel.ops.attention import (
     kda_replay_commit_supported,
+    kda_verify_conv_update,
     resolve_kda_batched_replay_commit,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
-)
-from tokenspeed_kernel.ops.attention import (
-    kda_fused_paged_verify_uses_split_producers,
-    kda_verify_conv_update,
 )
 from tokenspeed_kernel.ops.attention.triton.capture_payload import (
     capture_replay_payload,
@@ -615,7 +613,16 @@ class KdaAttnBackend(MambaAttnBackend):
                         num_heads=value_dim // attn_tp_size // head_v_dim,
                         head_dim=head_v_dim,
                         draft_token_num=draft_token_num,
+                        recurrent_layout=self.kda_recurrent_layout,
                     )
+                # The graph capture pool owns captured allocations. In eager
+                # mode the producer tensors outlive this Python scope while
+                # verify runs on the main stream, so register that use with
+                # the caching allocator before launching its consumer.
+                if not torch.cuda.is_current_stream_capturing():
+                    consumer_stream = torch.cuda.current_stream()
+                    g_raw.record_stream(consumer_stream)
+                    conv_qkv.record_stream(consumer_stream)
                 split_producers = {"g_raw": g_raw, "conv_qkv": conv_qkv}
             else:
                 capture_replay_payload(

@@ -5240,6 +5240,9 @@ def try_kda_fused_paged_verify(
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if recurrent_layout not in ("k_major", "v_major"):
         raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
+    split_producers = g_raw is not None or conv_qkv is not None
+    if split_producers and (g_raw is None or conv_qkv is None):
+        raise ValueError("g_raw and conv_qkv must be provided together")
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -5256,6 +5259,7 @@ def try_kda_fused_paged_verify(
                 "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "split_producers": split_producers,
             },
             solution=solution,
             override=override,
@@ -5271,9 +5275,7 @@ def try_kda_fused_paged_verify(
                 "replay_beta": replay_beta,
             }
         )
-    if g_raw is not None or conv_qkv is not None:
-        if g_raw is None or conv_qkv is None:
-            raise ValueError("g_raw and conv_qkv must be provided together")
+    if split_producers:
         kwargs.update({"g_raw": g_raw, "conv_qkv": conv_qkv})
     return kernel(
         mixed_qkv=mixed_qkv,
@@ -5349,6 +5351,7 @@ def kda_verify_conv_update(
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
+    recurrent_layout: str,
 ) -> torch.Tensor:
     """Materialize the convolution producer used by split KDA verification.
 
@@ -5360,19 +5363,31 @@ def kda_verify_conv_update(
         num_heads: Per-rank KDA head count.
         head_dim: KDA head width.
         draft_token_num: Verify positions per request.
+        recurrent_layout: Committed recurrent-state layout.
 
     Returns:
         Convolved and SiLU-activated QKV rows.
     """
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
-        fused_kda_verify_conv_update,
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
     )
-
-    return fused_kda_verify_conv_update(
-        mixed_qkv,
-        conv_weights,
-        conv_states,
-        read_indices,
+    kernel = select_kernel(
+        "attention",
+        "kda_verify_conv_update",
+        signature,
+        traits={
+            "paged_state": True,
+            "split_producers": True,
+            "recurrent_layout": recurrent_layout,
+        },
+    )
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        read_indices=read_indices,
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
