@@ -1109,6 +1109,7 @@ def _run_megafuse(inp, *, fused: bool):
         NORM_EPS,
         heads,
         head_dim,
+        enable_pdl=False,
     ).view_as(out)
 
 

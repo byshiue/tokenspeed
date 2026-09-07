@@ -15,7 +15,7 @@ from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel.ops.attention import KdaPrefillResult
-from tokenspeed_kernel.platform import CapabilityRequirement
+from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -110,25 +110,27 @@ def _nvidia_fused_verify(
     lower_bound: float | None,
     store_states: bool,
     split_producers: bool = False,
+    g_raw: torch.Tensor | None = None,
+    conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
         fused_kda_verify_conv_update,
         fused_recurrent_kda_verify_megafuse,
     )
 
-    conv_qkv = None
-    g_raw = None
     if split_producers:
-        conv_qkv = fused_kda_verify_conv_update(
-            mixed_qkv,
-            conv_weights,
-            conv_states,
-            read_indices,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            draft_token_num=draft_token_num,
-        )
-        g_raw = torch.mm(f_a_out, f_b_weight.t())
+        if conv_qkv is None:
+            conv_qkv = fused_kda_verify_conv_update(
+                mixed_qkv,
+                conv_weights,
+                conv_states,
+                read_indices,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                draft_token_num=draft_token_num,
+            )
+        if g_raw is None:
+            g_raw = torch.mm(f_a_out, f_b_weight.t())
 
     return fused_recurrent_kda_verify_megafuse(
         mixed_qkv,
@@ -152,6 +154,7 @@ def _nvidia_fused_verify(
         store_states=store_states,
         g_raw=g_raw,
         conv_qkv=conv_qkv,
+        enable_pdl=pdl_enabled(),
     ).view(1, -1, num_heads, head_dim)
 
 
@@ -166,6 +169,7 @@ def _nvidia_fused_verify(
     traits={
         "paged_state": frozenset({True}),
         "store_states": frozenset({True}),
+        "split_producers": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
@@ -210,6 +214,7 @@ def triton_nvidia_kda_fused_paged_verify(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         store_states=True,
+        split_producers=False,
     )
 
 
@@ -224,6 +229,7 @@ def triton_nvidia_kda_fused_paged_verify(
     traits={
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
+        "split_producers": frozenset({False}),
         "recurrent_layout": frozenset({"v_major"}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
@@ -268,6 +274,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         store_states=False,
+        split_producers=False,
     )
 
 
@@ -284,6 +291,7 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     traits={
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
+        "split_producers": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
     },
     tags={"nvidia", "paged_cache", "cuda_graph", "fusion", "speculative"},
@@ -307,6 +315,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    g_raw: torch.Tensor | None = None,
+    conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run target verify with split convolution and gate producers."""
     return _nvidia_fused_verify(
@@ -329,6 +339,8 @@ def triton_nvidia_kda_fused_paged_verify_split(
         lower_bound=lower_bound,
         store_states=False,
         split_producers=True,
+        g_raw=g_raw,
+        conv_qkv=conv_qkv,
     )
 
 
