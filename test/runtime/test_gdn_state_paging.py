@@ -233,6 +233,54 @@ class ComputeStatePageIndicesTest(unittest.TestCase):
         self.assertEqual(state_in.tolist(), [0])
         self.assertEqual(state_out.tolist(), [7])
 
+
+class PrefillCheckpointPageTest(unittest.TestCase):
+    """A finishing off-page prefill owns two distinct state outputs."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+                MambaAttnBackend,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.backend = object.__new__(MambaAttnBackend)
+        self.backend._checkpoint_granularity = 4
+        self.backend._state_group_ids = ("linear_attention",)
+        self.backend.pad_slot_id = -1
+
+    def test_off_page_endpoint_selects_aligned_and_final_output_pages(self):
+        torch = self.torch
+        before = torch.tensor([4], dtype=torch.int32)
+        after = torch.tensor([11], dtype=torch.int32)
+        state_in, state_out, checkpoint = self.backend._cache_contract_state_blocks(
+            before,
+            after,
+            {"linear_attention": torch.tensor([[7, 8, 9]], dtype=torch.int32)},
+            validate=True,
+            checkpoint_mask=torch.tensor([True]),
+        )
+
+        self.assertEqual(state_in["linear_attention"].tolist(), [7])
+        self.assertEqual(checkpoint["linear_attention"].tolist(), [8])
+        self.assertEqual(state_out["linear_attention"].tolist(), [9])
+
+    def test_aligned_endpoint_has_no_extra_checkpoint_page(self):
+        torch = self.torch
+        _, state_out, checkpoint = self.backend._cache_contract_state_blocks(
+            torch.tensor([8], dtype=torch.int32),
+            torch.tensor([12], dtype=torch.int32),
+            {"linear_attention": torch.tensor([[7, 8, 9]], dtype=torch.int32)},
+            validate=True,
+            checkpoint_mask=torch.tensor([True]),
+        )
+
+        self.assertEqual(checkpoint["linear_attention"].tolist(), [-1])
+        self.assertEqual(state_out["linear_attention"].tolist(), [9])
+
     def test_validate_off_masks_guards(self):
         torch = self.torch
         state_in, state_out = self.fn(
