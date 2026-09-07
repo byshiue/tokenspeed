@@ -1110,7 +1110,7 @@ def fused_recurrent_kda_verify_megafuse(
     conv_qkv: torch.Tensor | None = None,
     num_warps: int | None = None,
     num_stages: int | None = None,
-    enable_pdl: bool,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Run target-verify recurrence with inline or precomputed producers.
 
@@ -1132,7 +1132,7 @@ def fused_recurrent_kda_verify_megafuse(
         num_warps/num_stages: Optional launch overrides. Defaults route to
             1/3 for the fully split producer path and 4/2 otherwise.
         enable_pdl: Whether this grid releases a programmatic-launch dependent
-            after its producer-independent prologue.
+            after its producer-independent prologue. Defaults to ``False``.
 
     Returns:
         o: ``[N*T, HV, V]`` attention output in ``qkv_raw``'s dtype.
