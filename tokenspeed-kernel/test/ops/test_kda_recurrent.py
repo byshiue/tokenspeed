@@ -354,6 +354,7 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             {
                 "paged_state": frozenset({True}),
                 "store_states": frozenset({True}),
+                "split_producers": frozenset({False}),
                 "recurrent_layout": frozenset({"v_major"}),
             },
         ),
@@ -370,6 +371,7 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             {
                 "paged_state": frozenset({True}),
                 "store_states": frozenset({False}),
+                "split_producers": frozenset({False}),
                 "recurrent_layout": frozenset({"v_major"}),
             },
         ),
@@ -478,6 +480,7 @@ def test_kda_split_verify_registration_traits() -> None:
     assert spec.traits == {
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
+        "split_producers": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
     }
 
