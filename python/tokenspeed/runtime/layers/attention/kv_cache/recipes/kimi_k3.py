@@ -418,7 +418,9 @@ class KimiK3Recipe(CacheRecipe):
                     + protected_pages
                 )
             else:
-                # Snapshot state rolls between two pages per live request.
-                child_pages = 2 * max_live_requests
+                # A finishing off-page prefill can hold the input snapshot,
+                # the aligned cacheable checkpoint, and the final continuation
+                # state concurrently.
+                child_pages = 3 * max_live_requests
             parents += math.ceil(child_pages / packing)
         return parents

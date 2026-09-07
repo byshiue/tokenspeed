@@ -21,7 +21,6 @@
 #pragma once
 
 #include <map>
-#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -42,9 +41,11 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
                                std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens);
 
-std::optional<std::int32_t> FinalAlignedTailTokens(std::int32_t first_pos, std::int32_t unscheduled,
-                                                   std::int32_t token_budget, std::int32_t prefix_granularity,
-                                                   std::int32_t promotion_boundary_tokens);
+// First state slot materialized for one local prefill. When an off-page
+// endpoint crosses an aligned prefix boundary, the runtime writes both that
+// checkpoint and the final continuation state in the same model forward.
+std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std::int32_t after_tokens,
+                                                 std::int32_t prefix_granularity);
 
 void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 
