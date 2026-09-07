@@ -98,17 +98,16 @@ TEST(AlignPrefillChunkTest, ReachedPromotionUsesOrdinaryPageAlignment) {
               8);
 }
 
-TEST(FinalAlignedTailTokensTest, FindsSubPageTailAfterAlignedBody) {
-    const std::optional<std::int32_t> tail =
-        FinalAlignedTailTokens(/*first_pos=*/16, /*unscheduled=*/11, /*token_budget=*/16,
-                               /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0);
-    EXPECT_EQ(tail, 3);
+TEST(StateCheckpointMaterializationStartTest, KeepsAlignedCheckpointAndFinalContinuation) {
+    EXPECT_EQ(StateCheckpointMaterializationStart(/*before_tokens=*/50432, /*after_tokens=*/51300,
+                                                  /*prefix_granularity=*/128),
+              51200);
 }
 
-TEST(FinalAlignedTailTokensTest, LeavesAStandaloneSubPageWhole) {
-    EXPECT_EQ(FinalAlignedTailTokens(/*first_pos=*/24, /*unscheduled=*/3, /*token_budget=*/16,
-                                     /*prefix_granularity=*/4, /*promotion_boundary_tokens=*/0),
-              std::nullopt);
+TEST(StateCheckpointMaterializationStartTest, UsesOnlyFinalSlotWhenNoBoundaryFallsInsideExtent) {
+    EXPECT_EQ(StateCheckpointMaterializationStart(/*before_tokens=*/51200, /*after_tokens=*/51300,
+                                                  /*prefix_granularity=*/128),
+              51300);
 }
 
 TEST(ForwardCacheOpsPrefill, FirstChunkAcquiresPagesForTokens) {

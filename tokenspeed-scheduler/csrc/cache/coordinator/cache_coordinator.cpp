@@ -709,13 +709,10 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
     if (demand.num_computed_tokens < 0) {
         return;
     }
-    // Mamba can publish only a state checkpoint that the kernel materialized
-    // exactly at this boundary. SWA pages are ordinary KV, so an unaligned
-    // endpoint can still publish its trailing complete-page boundary.
-    if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
-        demand.num_computed_tokens % prefix_granularity_ != 0) {
-        return;
-    }
+    // Snapshot-state prefill materializes the last completed prefix boundary
+    // and the final continuation state in one forward. An unaligned endpoint
+    // may therefore publish its preceding full prefix page; the endpoint
+    // state itself remains request-local and is never keyed here.
 
     const std::int32_t boundary_cache_block =
         static_cast<std::int32_t>(demand.prefix_hashes.size()) * pages_per_prefix_hash;
