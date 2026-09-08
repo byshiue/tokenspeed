@@ -4,6 +4,7 @@
 #   salloc --no-shell --nodes=2 --gpus-per-node=4 ...
 #   K3_NSYS_ALLOCATION_ID=<job-id> K3_NSYS_RUN_LABEL=<label> \
 #     K3_NSYS_MODEL=<checkpoint> K3_NSYS_CACHE_SETTINGS=<cache-setting.json> \
+#     K3_NSYS_PROFILE_ITERATIONS=<number-of-incremental-prefills> \
 #     K3_NSYS_ROOT=<nsight-systems-root> bash "$0"
 
 set -euo pipefail
@@ -12,6 +13,7 @@ worktree=${K3_NSYS_WORKTREE:-$(git rev-parse --show-toplevel)}
 allocation_id=${K3_NSYS_ALLOCATION_ID:-${SLURM_JOB_ID:?}}
 run_label=${K3_NSYS_RUN_LABEL:?}
 profile_concurrency=${K3_NSYS_PROFILE_CONCURRENCY:-1}
+profile_iterations=${K3_NSYS_PROFILE_ITERATIONS:-1}
 source_root=${K3_NSYS_SOURCE_ROOT:-${worktree}}
 source_model=${K3_NSYS_MODEL:?}
 output_root=${K3_NSYS_OUTPUT_ROOT:-${worktree}/outputs/kimi_k3_agentic_incremental_nsys}
@@ -148,6 +150,7 @@ python3 "${worktree}/test/random_benchmark/tokenspeed/kimi_k3_agentic_incrementa
     --subsequent-turn-length 800 \
     --output-length 500 \
     --profile-output-length 1 \
+    --profile-iterations "${profile_iterations}" \
     --seed 1 \
     --shape-warmup-seed 2 \
     --profile-concurrency "${profile_concurrency}" \

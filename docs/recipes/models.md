@@ -328,6 +328,13 @@ one-token scheduler steps and can consume the window before the target request
 arrives. The `/generate` response may be a one-element list at the gateway, so
 profiling clients should accept both that form and a direct result object.
 
+Set `K3_NSYS_PROFILE_ITERATIONS` to capture multiple sequential incremental
+prefills in one report. Each iteration keeps the warmed conversation prefix but
+uses a distinct subsequent-turn tail, preventing later iterations from
+collapsing into full prefix-cache hits. `--profile-output-length` controls the
+number of generated output tokens per request; it is not the number of profiled
+prefill steps.
+
 The `forward_step ext=N dec=M` NVTX label counts extend and decode *requests*,
 not tokens. Confirm the incremental token count from the adjacent scheduler log
 (for example, `#new-token: 868, #cached-token: 50432`) and use the NVTX range

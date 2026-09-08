@@ -128,19 +128,16 @@ def main() -> None:
     parser.add_argument("--first-turn-length", required=True, type=int)
     parser.add_argument("--subsequent-turn-length", required=True, type=int)
     parser.add_argument("--output-length", required=True, type=int)
-    parser.add_argument(
-        "--profile-output-length",
-        "--profile-steps",
-        dest="profile_output_length",
-        required=True,
-        type=int,
-    )
+    parser.add_argument("--profile-output-length", required=True, type=int)
+    parser.add_argument("--profile-iterations", required=True, type=int)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--shape-warmup-seed", required=True, type=int)
     parser.add_argument("--profile-concurrency", required=True, type=int)
     args = parser.parse_args()
     if args.profile_concurrency < 1:
         parser.error("--profile-concurrency must be positive")
+    if args.profile_iterations < 1:
+        parser.error("--profile-iterations must be positive")
 
     request_rngs = [
         random.Random(args.seed + request_id)
@@ -161,9 +158,17 @@ def main() -> None:
         conversations, first_outputs, request_rngs, strict=True
     ):
         conversation.extend(first_output)
-        conversation.extend(
-            rng.randrange(1000, 160000) for _ in range(args.subsequent_turn_length)
-        )
+
+    profile_conversation_batches = []
+    for _ in range(args.profile_iterations):
+        profile_conversations = []
+        for conversation, rng in zip(conversations, request_rngs, strict=True):
+            profile_conversation = conversation.copy()
+            profile_conversation.extend(
+                rng.randrange(1000, 160000) for _ in range(args.subsequent_turn_length)
+            )
+            profile_conversations.append(profile_conversation)
+        profile_conversation_batches.append(profile_conversations)
 
     warmup_rngs = [
         random.Random(args.shape_warmup_seed + request_id)
@@ -205,13 +210,17 @@ def main() -> None:
         timeout=60,
     )
     print(f"profile start response: {profile_response}", flush=True)
-    generate_batch(
-        args.base_url,
-        args.control_url,
-        args.model,
-        conversations,
-        args.profile_output_length,
-    )
+    for iteration, profile_conversations in enumerate(
+        profile_conversation_batches, start=1
+    ):
+        print(f"profile iteration={iteration}/{args.profile_iterations}", flush=True)
+        generate_batch(
+            args.base_url,
+            args.control_url,
+            args.model,
+            profile_conversations,
+            args.profile_output_length,
+        )
     stop_response = post_json(
         f"{args.base_url}/stop_profile",
         {},
