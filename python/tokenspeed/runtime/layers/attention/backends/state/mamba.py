@@ -113,6 +113,21 @@ class _StateBlockIndexPlan:
     out_slots: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _PrefillCheckpointBatch:
+    """One packed varlen batch containing every internal checkpoint prefix."""
+
+    rows: torch.Tensor
+    rows_cpu: torch.Tensor
+    sequence_starts: torch.Tensor
+    sequence_starts_cpu: torch.Tensor
+    checkpoint_seq_lens: torch.Tensor
+    token_indices: torch.Tensor
+    query_start_loc: torch.Tensor
+    checkpoint_seq_lens_cpu: torch.Tensor
+    cu_seqlens_cpu: torch.Tensor
+
+
 def _compute_state_block_index_plan(
     checkpoint_granularity: int,
     seq_lens_before: torch.Tensor,
@@ -308,6 +323,62 @@ def _build_cu_extend_seq_lens_cpu(
     return bounds
 
 
+def _build_prefill_checkpoint_batch(
+    extend_seq_lens_cpu: torch.Tensor,
+    checkpoint_seq_lens_cpu: torch.Tensor | None,
+    device: torch.device | str,
+) -> _PrefillCheckpointBatch | None:
+    """Pack all request-local checkpoint prefixes without a Python row loop."""
+    if checkpoint_seq_lens_cpu is None:
+        return None
+    if checkpoint_seq_lens_cpu.shape != extend_seq_lens_cpu.shape:
+        raise RuntimeError(
+            "checkpoint lengths disagree with extend lengths on the sequence count"
+        )
+    rows_cpu = torch.nonzero(checkpoint_seq_lens_cpu > 0).flatten()
+    if rows_cpu.numel() == 0:
+        return None
+
+    sequence_starts_cpu = torch.zeros_like(extend_seq_lens_cpu)
+    if extend_seq_lens_cpu.numel() > 1:
+        torch.cumsum(
+            extend_seq_lens_cpu[:-1],
+            dim=0,
+            out=sequence_starts_cpu[1:],
+        )
+    selected_starts_cpu = sequence_starts_cpu.index_select(0, rows_cpu)
+    selected_lens_cpu = checkpoint_seq_lens_cpu.index_select(0, rows_cpu)
+    cu_seqlens_cpu = torch.zeros(selected_lens_cpu.numel() + 1, dtype=torch.int64)
+    torch.cumsum(
+        selected_lens_cpu.to(torch.int64),
+        dim=0,
+        out=cu_seqlens_cpu[1:],
+    )
+    total_tokens = int(cu_seqlens_cpu[-1])
+    packed_offsets_cpu = torch.arange(total_tokens, dtype=torch.int64)
+    packed_offsets_cpu -= torch.repeat_interleave(
+        cu_seqlens_cpu[:-1], selected_lens_cpu.to(torch.int64)
+    )
+    token_indices_cpu = (
+        torch.repeat_interleave(
+            selected_starts_cpu.to(torch.int64), selected_lens_cpu.to(torch.int64)
+        )
+        + packed_offsets_cpu
+    )
+    query_start_loc = cu_seqlens_cpu.to(device=device, dtype=torch.int32)
+    return _PrefillCheckpointBatch(
+        rows=rows_cpu.to(device=device, dtype=torch.int64),
+        rows_cpu=rows_cpu,
+        sequence_starts=selected_starts_cpu.to(device=device, dtype=torch.int64),
+        sequence_starts_cpu=selected_starts_cpu,
+        checkpoint_seq_lens=selected_lens_cpu.to(device=device, dtype=torch.int64),
+        token_indices=token_indices_cpu.to(device=device, dtype=torch.int64),
+        query_start_loc=query_start_loc,
+        checkpoint_seq_lens_cpu=selected_lens_cpu,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+    )
+
+
 @dataclass
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
@@ -325,6 +396,7 @@ class MambaForwardMetadata:
     state_out_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_checkpoint_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_checkpoint_seq_lens_cpu: torch.Tensor | None = None
+    prefill_checkpoint_batch: _PrefillCheckpointBatch | None = None
 
 
 @dataclass
@@ -1059,6 +1131,7 @@ class MambaAttnBackend(AttentionBackend):
         state_out_blocks_by_group = None
         state_checkpoint_blocks_by_group = None
         state_checkpoint_seq_lens_cpu = None
+        prefill_checkpoint_batch = None
         if bs > 0:
             before, after = self._extend_state_block_bounds(
                 bs, seq_lens, num_extends, extend_prefix_lens
@@ -1086,6 +1159,11 @@ class MambaAttnBackend(AttentionBackend):
                     checkpoint_cpu - prefix_cpu,
                     torch.full_like(checkpoint_cpu, -1),
                 )
+            prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
+                extend_seq_lens_cpu,
+                state_checkpoint_seq_lens_cpu,
+                self.device,
+            )
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
@@ -1095,6 +1173,7 @@ class MambaAttnBackend(AttentionBackend):
             state_out_blocks_by_group=state_out_blocks_by_group,
             state_checkpoint_blocks_by_group=state_checkpoint_blocks_by_group,
             state_checkpoint_seq_lens_cpu=state_checkpoint_seq_lens_cpu,
+            prefill_checkpoint_batch=prefill_checkpoint_batch,
         )
 
     # ---- CUDA graph state ----
@@ -1462,42 +1541,85 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks: torch.Tensor,
         state_out_blocks: torch.Tensor,
         checkpoint_blocks: torch.Tensor | None,
-        checkpoint_seq_lens_cpu: torch.Tensor | None,
-        extend_seq_lens_cpu: torch.Tensor | None,
+        checkpoint_batch: _PrefillCheckpointBatch | None,
     ) -> None:
-        """Write sparse conv snapshots without creating another model forward."""
-        if (
-            checkpoint_blocks is None
-            or checkpoint_seq_lens_cpu is None
-            or extend_seq_lens_cpu is None
-        ):
+        """Write every request's sparse conv snapshot as one batched update."""
+        if checkpoint_blocks is None or checkpoint_batch is None:
             return
         state_len = conv_states.shape[-1]
         if state_len == 0:
             return
-        offsets = 0
-        for row, length in enumerate(extend_seq_lens_cpu.tolist()):
-            checkpoint_len = int(checkpoint_seq_lens_cpu[row])
-            if checkpoint_len <= 0:
-                offsets += int(length)
-                continue
+        rows = checkpoint_batch.rows
+        if rows.numel() == 1:
+            row = int(checkpoint_batch.rows_cpu[0])
+            checkpoint_len = int(checkpoint_batch.checkpoint_seq_lens_cpu[0])
+            sequence_start = int(checkpoint_batch.sequence_starts_cpu[0])
             destination = checkpoint_blocks[row : row + 1].to(torch.int64)
             source = torch.where(
                 state_in_blocks[row : row + 1] > 0,
                 state_in_blocks[row : row + 1],
                 state_out_blocks[row : row + 1],
             ).to(torch.int64)
-            state_len_from_input = min(state_len, checkpoint_len)
-            conv_states[destination] = conv_states[source]
-            conv_states[destination, :, state_len - state_len_from_input :] = (
-                raw_inputs[
-                    offsets
+            if checkpoint_len >= state_len:
+                checkpoint_state = raw_inputs[
+                    sequence_start
                     + checkpoint_len
-                    - state_len_from_input : offsets
+                    - state_len : sequence_start
                     + checkpoint_len
                 ].transpose(0, 1)
-            )
-            offsets += int(length)
+                conv_states[destination] = checkpoint_state
+            else:
+                source_state = conv_states[source]
+                raw_tail = raw_inputs[
+                    sequence_start : sequence_start + checkpoint_len
+                ].transpose(0, 1)
+                conv_states[destination] = torch.cat(
+                    (source_state[:, :, checkpoint_len:], raw_tail.unsqueeze(0)),
+                    dim=2,
+                )
+            return
+
+        destination = checkpoint_blocks.index_select(0, rows).to(torch.int64)
+        state_in = state_in_blocks.index_select(0, rows)
+        state_out = state_out_blocks.index_select(0, rows)
+        source = torch.where(state_in > 0, state_in, state_out).to(torch.int64)
+        source_state = conv_states.index_select(0, source)
+
+        state_positions = torch.arange(
+            state_len,
+            dtype=torch.int64,
+            device=raw_inputs.device,
+        ).unsqueeze(0)
+        relative_tokens = (
+            checkpoint_batch.checkpoint_seq_lens.unsqueeze(1)
+            - state_len
+            + state_positions
+        )
+        raw_indices = checkpoint_batch.sequence_starts.unsqueeze(1) + relative_tokens
+        raw_indices.clamp_(min=0)
+        raw_window = raw_inputs.index_select(0, raw_indices.flatten()).view(
+            rows.numel(), state_len, raw_inputs.shape[1]
+        )
+        raw_window = raw_window.transpose(1, 2)
+
+        # This also handles a checkpoint shorter than the convolution window:
+        # leading values shift from the input page and only the available new
+        # tokens come from raw_inputs. Normal aligned checkpoints take only
+        # the raw-input arm.
+        source_positions = (state_len + relative_tokens).clamp_(
+            min=0,
+            max=state_len - 1,
+        )
+        source_window = source_state.gather(
+            2,
+            source_positions.unsqueeze(1).expand(-1, source_state.shape[1], -1),
+        )
+        checkpoint_state = torch.where(
+            (relative_tokens >= 0).unsqueeze(1),
+            raw_window,
+            source_window,
+        )
+        conv_states.index_copy_(0, destination, checkpoint_state)
 
     def _write_prefill_recurrent_checkpoints(
         self,
@@ -1507,8 +1629,7 @@ class MambaAttnBackend(AttentionBackend):
         recurrent_state: torch.Tensor,
         ssm_states: torch.Tensor,
         checkpoint_blocks: torch.Tensor | None,
-        checkpoint_seq_lens_cpu: torch.Tensor | None,
-        extend_seq_lens_cpu: torch.Tensor | None,
+        checkpoint_batch: _PrefillCheckpointBatch | None,
         *,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
@@ -1520,58 +1641,107 @@ class MambaAttnBackend(AttentionBackend):
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
     ) -> None:
-        """Materialize one aligned recurrent checkpoint per extend row.
+        """Materialize every aligned checkpoint with one packed varlen scan.
 
         This correctness path reuses the selected prefill scan for the prefix
-        of a row, so it works for both GDN and KDA implementations. A native
+        of every eligible row, so it works for both GDN and KDA implementations.
+        All request prefixes share one kernel call rather than launching once
+        per request. A native
         multi-tap kernel can replace this helper without changing the cache or
         scheduler contract.
         """
-        if (
-            checkpoint_blocks is None
-            or checkpoint_seq_lens_cpu is None
-            or extend_seq_lens_cpu is None
-        ):
+        if checkpoint_blocks is None or checkpoint_batch is None:
             return
-        offset = 0
-        for row, length in enumerate(extend_seq_lens_cpu.tolist()):
-            checkpoint_len = int(checkpoint_seq_lens_cpu[row])
-            if checkpoint_len > 0:
-                end = offset + checkpoint_len
-                q = query[:, offset:end]
-                k = key[:, offset:end]
-                v = value[:, offset:end]
+        rows = checkpoint_batch.rows
+        if rows.numel() == 1:
+            row = int(checkpoint_batch.rows_cpu[0])
+            start = int(checkpoint_batch.sequence_starts_cpu[0])
+            checkpoint_len = int(checkpoint_batch.checkpoint_seq_lens_cpu[0])
+            end = start + checkpoint_len
 
-                def slice_tokens(tensor: torch.Tensor | None) -> torch.Tensor | None:
-                    return None if tensor is None else tensor[offset:end]
+            def slice_tokens(
+                tensor: torch.Tensor | None,
+            ) -> torch.Tensor | None:
+                return None if tensor is None else tensor[start:end]
 
-                cu = torch.tensor(
-                    [0, checkpoint_len], dtype=torch.int32, device=query.device
-                )
-                cu_cpu = torch.tensor([0, checkpoint_len], dtype=torch.int64)
-                _, checkpoint_state = self._prefill_scan(
-                    q,
-                    k,
-                    v,
-                    recurrent_state[row : row + 1],
-                    cu,
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    a=slice_tokens(a),
-                    b=slice_tokens(b),
-                    g_raw=slice_tokens(g_raw),
-                    f_a_out=slice_tokens(f_a_out),
-                    f_b_weight=f_b_weight,
-                    beta_raw=slice_tokens(beta_raw),
-                    seq_len=checkpoint_len,
-                    num_real_tokens=checkpoint_len,
-                    lower_bound=lower_bound,
-                    cu_seqlens_cpu=cu_cpu,
-                )
-                ssm_states[checkpoint_blocks[row : row + 1].to(torch.int64)] = (
-                    checkpoint_state.to(ssm_states.dtype, copy=False)
-                )
-            offset += int(length)
+            set_total_chunks_hint(
+                checkpoint_batch.checkpoint_seq_lens_cpu,
+                checkpoint_batch.query_start_loc,
+            )
+            _, checkpoint_state = self._prefill_scan(
+                query[:, start:end],
+                key[:, start:end],
+                value[:, start:end],
+                recurrent_state[row : row + 1],
+                checkpoint_batch.query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                a=slice_tokens(a),
+                b=slice_tokens(b),
+                g_raw=slice_tokens(g_raw),
+                f_a_out=slice_tokens(f_a_out),
+                f_b_weight=f_b_weight,
+                beta_raw=slice_tokens(beta_raw),
+                seq_len=checkpoint_len,
+                num_real_tokens=checkpoint_len,
+                lower_bound=lower_bound,
+                cu_seqlens_cpu=checkpoint_batch.cu_seqlens_cpu,
+            )
+            destination = checkpoint_blocks[row : row + 1].to(torch.int64)
+            ssm_states[destination] = checkpoint_state.to(
+                ssm_states.dtype,
+                copy=False,
+            )
+            return
+
+        token_indices = checkpoint_batch.token_indices
+
+        def select_tokens(
+            tensor: torch.Tensor | None,
+            token_dim: int,
+        ) -> torch.Tensor | None:
+            return (
+                None
+                if tensor is None
+                else tensor.index_select(token_dim, token_indices)
+            )
+
+        checkpoint_query = query.index_select(1, token_indices)
+        checkpoint_key = key.index_select(1, token_indices)
+        checkpoint_value = value.index_select(1, token_indices)
+        num_checkpoint_tokens = token_indices.numel()
+        # The chunk-count cache holds one active hint set. Install the packed
+        # checkpoint batch immediately before its scan; forward_extend restores
+        # the ordinary full-batch hint before running the final prefill scan.
+        set_total_chunks_hint(
+            checkpoint_batch.checkpoint_seq_lens_cpu,
+            checkpoint_batch.query_start_loc,
+        )
+        _, checkpoint_state = self._prefill_scan(
+            checkpoint_query,
+            checkpoint_key,
+            checkpoint_value,
+            recurrent_state.index_select(0, rows),
+            checkpoint_batch.query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            a=select_tokens(a, 0),
+            b=select_tokens(b, 0),
+            g_raw=select_tokens(g_raw, 0),
+            f_a_out=select_tokens(f_a_out, 0),
+            f_b_weight=f_b_weight,
+            beta_raw=select_tokens(beta_raw, 0),
+            seq_len=num_checkpoint_tokens,
+            num_real_tokens=num_checkpoint_tokens,
+            lower_bound=lower_bound,
+            cu_seqlens_cpu=checkpoint_batch.cu_seqlens_cpu,
+        )
+        destination = checkpoint_blocks.index_select(0, rows).to(torch.int64)
+        ssm_states.index_copy_(
+            0,
+            destination,
+            checkpoint_state.to(ssm_states.dtype, copy=False),
+        )
 
     def forward_decode(
         self,
@@ -1948,9 +2118,7 @@ class MambaAttnBackend(AttentionBackend):
                 self._layer_state(layer_id)
             )
             checkpoint_blocks = self._layer_prefill_checkpoint_blocks(layer_id)
-            checkpoint_seq_lens_cpu = (
-                self.forward_metadata.state_checkpoint_seq_lens_cpu
-            )
+            checkpoint_batch = self.forward_metadata.prefill_checkpoint_batch
             state_out_long = state_out_blocks.to(torch.int64)
             recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
                 conv_states,
@@ -1973,8 +2141,7 @@ class MambaAttnBackend(AttentionBackend):
                 state_in_blocks,
                 state_out_blocks,
                 checkpoint_blocks,
-                checkpoint_seq_lens_cpu,
-                extend_seq_lens_cpu,
+                checkpoint_batch,
             )
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             mixed_qkv = causal_conv1d_fn(
@@ -2065,8 +2232,7 @@ class MambaAttnBackend(AttentionBackend):
                 recurrent_state,
                 ssm_states,
                 checkpoint_blocks,
-                checkpoint_seq_lens_cpu,
-                extend_seq_lens_cpu,
+                checkpoint_batch,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 a=a,
@@ -2077,6 +2243,8 @@ class MambaAttnBackend(AttentionBackend):
                 beta_raw=beta_raw,
                 lower_bound=gate_lower_bound,
             )
+            if extend_seq_lens_cpu is not None:
+                set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
             core_attn_out, last_recurrent_state = self._prefill_scan(
                 query,
                 key,

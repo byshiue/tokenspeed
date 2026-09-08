@@ -80,6 +80,13 @@ decode reserve atomically. The runtime writes both conv and recurrent state
 pages from the same prefill input. Only the aligned checkpoint is cached; the
 off-page endpoint is never keyed as a complete prefix.
 
+Within one forward, the runtime packs every request's aligned prefix into one
+variable-length checkpoint batch. Conv snapshots use one batched gather/write,
+and recurrent snapshots use one checkpoint scan for the whole batch; the
+ordinary full-prefill scan still produces final outputs and continuation state.
+The checkpoint work is therefore intentionally recomputed, but its kernel count
+does not grow with the number of requests.
+
 This keeps the usual head-of-line rule for incomplete prefills. There is no
 special tail round and no state-checkpoint-tail capacity reservation.
 

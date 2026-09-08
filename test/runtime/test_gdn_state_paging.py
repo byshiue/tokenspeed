@@ -243,11 +243,13 @@ class PrefillCheckpointPageTest(unittest.TestCase):
 
             from tokenspeed.runtime.layers.attention.backends.state.mamba import (
                 MambaAttnBackend,
+                compute_state_block_indices,
             )
         except (ImportError, ModuleNotFoundError) as exc:
             self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
         self.torch = torch
         self.backend = object.__new__(MambaAttnBackend)
+        self.fn = compute_state_block_indices
         self.backend._checkpoint_granularity = 4
         self.backend._state_group_ids = ("linear_attention",)
         self.backend.pad_slot_id = -1
@@ -292,6 +294,162 @@ class PrefillCheckpointPageTest(unittest.TestCase):
         )
         self.assertEqual(state_in.tolist(), [0])
         self.assertEqual(state_out.tolist(), [0])
+
+
+class PrefillCheckpointBatchTest(unittest.TestCase):
+    """Checkpoint helpers batch sparse prefixes instead of looping by row."""
+
+    def setUp(self):
+        try:
+            import torch
+
+            from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+                MambaAttnBackend,
+                _build_prefill_checkpoint_batch,
+            )
+        except (ImportError, ModuleNotFoundError) as exc:
+            self.skipTest(f"needs torch + tokenspeed_kernel: {exc}")
+        self.torch = torch
+        self.backend = object.__new__(MambaAttnBackend)
+        self.plan = _build_prefill_checkpoint_batch(
+            torch.tensor([5, 4, 6], dtype=torch.int32),
+            torch.tensor([-1, 2, 4], dtype=torch.int32),
+            "cpu",
+        )
+        assert self.plan is not None
+
+    def test_builds_one_packed_varlen_prefix_batch(self):
+        self.assertEqual(self.plan.rows.tolist(), [1, 2])
+        self.assertEqual(self.plan.sequence_starts.tolist(), [5, 9])
+        self.assertEqual(self.plan.checkpoint_seq_lens.tolist(), [2, 4])
+        self.assertEqual(self.plan.token_indices.tolist(), [5, 6, 9, 10, 11, 12])
+        self.assertEqual(self.plan.query_start_loc.tolist(), [0, 2, 6])
+        self.assertEqual(self.plan.cu_seqlens_cpu.tolist(), [0, 2, 6])
+
+    def test_conv_checkpoints_are_written_as_one_batch(self):
+        torch = self.torch
+        raw = torch.arange(30, dtype=torch.float32).view(15, 2)
+        states = torch.arange(60, dtype=torch.float32).view(10, 2, 3)
+        source_page_two = states[2].clone()
+
+        self.backend._write_prefill_conv_checkpoints(
+            raw,
+            states,
+            torch.tensor([1, 2, 3], dtype=torch.int32),
+            torch.tensor([4, 5, 6], dtype=torch.int32),
+            torch.tensor([-1, 7, 8], dtype=torch.int32),
+            self.plan,
+        )
+
+        expected_short = torch.stack((source_page_two[:, -1], raw[5], raw[6]), dim=1)
+        expected_long = raw[[10, 11, 12]].transpose(0, 1)
+        self.assertTrue(torch.equal(states[7], expected_short))
+        self.assertTrue(torch.equal(states[8], expected_long))
+
+    def test_recurrent_checkpoints_share_one_scan_call(self):
+        torch = self.torch
+        calls = []
+
+        def fake_scan(query, key, value, recurrent_state, query_start_loc, **kwargs):
+            calls.append((query, key, value, recurrent_state, query_start_loc, kwargs))
+            return query, recurrent_state + 100
+
+        self.backend._prefill_scan = fake_scan
+        tokens = torch.arange(15, dtype=torch.float32).view(1, 15, 1, 1)
+        per_token = tokens.view(15, 1)
+        recurrent = torch.arange(3, dtype=torch.float32).view(3, 1, 1, 1)
+        slab = torch.zeros(10, 1, 1, 1)
+
+        self.backend._write_prefill_recurrent_checkpoints(
+            tokens,
+            tokens,
+            tokens,
+            recurrent,
+            slab,
+            torch.tensor([-1, 7, 8], dtype=torch.int32),
+            self.plan,
+            A_log=torch.empty(1),
+            dt_bias=torch.empty(1),
+            a=per_token,
+            b=per_token,
+            g_raw=per_token,
+            f_a_out=per_token,
+            f_b_weight=torch.empty(1),
+            beta_raw=per_token,
+            lower_bound=-5.0,
+        )
+
+        self.assertEqual(len(calls), 1)
+        query, _, _, initial, boundaries, kwargs = calls[0]
+        self.assertEqual(query.flatten().tolist(), [5, 6, 9, 10, 11, 12])
+        self.assertEqual(initial.flatten().tolist(), [1, 2])
+        self.assertEqual(boundaries.tolist(), [0, 2, 6])
+        self.assertEqual(kwargs["a"].flatten().tolist(), [5, 6, 9, 10, 11, 12])
+        self.assertEqual(kwargs["seq_len"], 6)
+        self.assertEqual(slab[[7, 8]].flatten().tolist(), [101, 102])
+
+    def test_single_checkpoint_uses_direct_slices(self):
+        torch = self.torch
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        plan = _build_prefill_checkpoint_batch(
+            torch.tensor([5], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            "cpu",
+        )
+        assert plan is not None
+        raw = torch.arange(10, dtype=torch.float32).view(5, 2)
+        conv_states = torch.arange(36, dtype=torch.float32).view(6, 2, 3)
+        source = conv_states[1].clone()
+        self.backend._write_prefill_conv_checkpoints(
+            raw,
+            conv_states,
+            torch.tensor([1], dtype=torch.int32),
+            torch.tensor([2], dtype=torch.int32),
+            torch.tensor([4], dtype=torch.int32),
+            plan,
+        )
+        expected_conv = torch.stack((source[:, -1], raw[0], raw[1]), dim=1)
+        self.assertTrue(torch.equal(conv_states[4], expected_conv))
+
+        calls = []
+
+        def fake_scan(query, key, value, recurrent_state, query_start_loc, **kwargs):
+            calls.append((query, recurrent_state, query_start_loc, kwargs))
+            return query, recurrent_state + 10
+
+        self.backend._prefill_scan = fake_scan
+        tokens = torch.arange(5, dtype=torch.float32).view(1, 5, 1, 1)
+        per_token = tokens.view(5, 1)
+        recurrent = torch.tensor([[[[3.0]]]])
+        slab = torch.zeros(6, 1, 1, 1)
+        self.backend._write_prefill_recurrent_checkpoints(
+            tokens,
+            tokens,
+            tokens,
+            recurrent,
+            slab,
+            torch.tensor([4], dtype=torch.int32),
+            plan,
+            A_log=torch.empty(1),
+            dt_bias=torch.empty(1),
+            a=per_token,
+            b=per_token,
+            g_raw=per_token,
+            f_a_out=per_token,
+            f_b_weight=torch.empty(1),
+            beta_raw=per_token,
+            lower_bound=-5.0,
+        )
+        self.assertEqual(len(calls), 1)
+        query, initial, boundaries, kwargs = calls[0]
+        self.assertEqual(query.flatten().tolist(), [0, 1])
+        self.assertEqual(initial.flatten().tolist(), [3])
+        self.assertEqual(boundaries.tolist(), [0, 2])
+        self.assertEqual(kwargs["a"].flatten().tolist(), [0, 1])
+        self.assertEqual(slab[4].item(), 13)
 
 
 class CacheContractMetadataTest(unittest.TestCase):
