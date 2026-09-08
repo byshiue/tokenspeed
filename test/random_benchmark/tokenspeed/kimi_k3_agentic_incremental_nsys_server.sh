@@ -40,16 +40,19 @@ if [[ ! -x "${venv_dir}/bin/python3" ]] || \
     mkdir -p "${CI_CACHE_ROOT}" "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
     export CUDA_VERSION=13.0.1
     export SM=sm103
-    export WORKSPACE=${K3_NSYS_WORKTREE}
+    # K3_NSYS_SOURCE_ROOT may select a detached comparison worktree. Build
+    # both Python and native packages from that source so the scheduler and
+    # runtime always come from the same commit.
+    export WORKSPACE=${source_root}
 
     # The shared source checkout can contain ignored CUDA objects built for a
     # different architecture.  setup.py treats newer .so files as reusable, so
     # move them aside before the SM103 wheel build rather than packaging SM100.
-    kernel_objs=${K3_NSYS_WORKTREE}/tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/objs
+    kernel_objs=${source_root}/tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/objs
     if [[ -d "${kernel_objs}" ]]; then
         mv "${kernel_objs}" "${kernel_objs}.pre-sm103-${SLURM_JOB_ID}"
     fi
-    bash "${K3_NSYS_WORKTREE}/test/ci_system/install_deps.sh"
+    bash "${source_root}/test/ci_system/install_deps.sh"
 
     printf '%s\n' "${install_fingerprint}" > "${install_marker}"
 else
