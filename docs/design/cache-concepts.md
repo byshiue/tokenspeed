@@ -157,6 +157,15 @@ skipped intermediate checkpoints as null holes (`0`). State consumers may
 gather only the declared input/output slots; compacting the row or publishing an
 unwritten intermediate checkpoint would break position identity.
 
+When an extend materializes internal state checkpoints, convolution windows
+are assembled directly into their destination blocks by the kernel package.
+Recurrent checkpoint prefixes are packed in one operation, evaluated by the
+same selected GDN/KDA prefill scan as the final state, and scattered back to
+their destination blocks in one operation. Batch size one is the one-row case
+of this contract, not a separate runtime path. The pack/scatter optimization
+does not change the recurrent scan mathematics; a future native multi-tap scan
+may replace it without changing cache ownership or scheduler metadata.
+
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
 replaying the accepted prefix from the committed page. The Kimi-K3 recipe

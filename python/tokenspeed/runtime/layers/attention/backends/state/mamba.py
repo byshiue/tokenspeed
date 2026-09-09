@@ -42,6 +42,11 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
+from tokenspeed_kernel.ops.attention.triton.prefill_checkpoints import (
+    pack_prefill_recurrent_checkpoint_inputs,
+    write_prefill_conv_checkpoints,
+    write_prefill_recurrent_checkpoints,
+)
 from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
     verify_state_blocks,
 )
@@ -1437,80 +1442,16 @@ class MambaAttnBackend(AttentionBackend):
         """Write every request's sparse conv snapshot as one batched update."""
         if checkpoint_blocks is None or checkpoint_batch is None:
             return
-        state_len = conv_states.shape[-1]
-        if state_len == 0:
-            return
-        rows = checkpoint_batch.rows
-        if rows.numel() == 1:
-            row = int(checkpoint_batch.rows_cpu[0])
-            checkpoint_len = int(checkpoint_batch.checkpoint_seq_lens_cpu[0])
-            sequence_start = int(checkpoint_batch.sequence_starts_cpu[0])
-            destination = checkpoint_blocks[row : row + 1].to(torch.int64)
-            source = torch.where(
-                state_in_blocks[row : row + 1] > 0,
-                state_in_blocks[row : row + 1],
-                state_out_blocks[row : row + 1],
-            ).to(torch.int64)
-            if checkpoint_len >= state_len:
-                checkpoint_state = raw_inputs[
-                    sequence_start
-                    + checkpoint_len
-                    - state_len : sequence_start
-                    + checkpoint_len
-                ].transpose(0, 1)
-                conv_states[destination] = checkpoint_state
-            else:
-                source_state = conv_states[source]
-                raw_tail = raw_inputs[
-                    sequence_start : sequence_start + checkpoint_len
-                ].transpose(0, 1)
-                conv_states[destination] = torch.cat(
-                    (source_state[:, :, checkpoint_len:], raw_tail.unsqueeze(0)),
-                    dim=2,
-                )
-            return
-
-        destination = checkpoint_blocks.index_select(0, rows).to(torch.int64)
-        state_in = state_in_blocks.index_select(0, rows)
-        state_out = state_out_blocks.index_select(0, rows)
-        source = torch.where(state_in > 0, state_in, state_out).to(torch.int64)
-        source_state = conv_states.index_select(0, source)
-
-        state_positions = torch.arange(
-            state_len,
-            dtype=torch.int64,
-            device=raw_inputs.device,
-        ).unsqueeze(0)
-        relative_tokens = (
-            checkpoint_batch.checkpoint_seq_lens.unsqueeze(1)
-            - state_len
-            + state_positions
+        write_prefill_conv_checkpoints(
+            raw_inputs,
+            conv_states,
+            state_in_blocks,
+            state_out_blocks,
+            checkpoint_blocks,
+            checkpoint_batch.rows,
+            checkpoint_batch.sequence_starts,
+            checkpoint_batch.checkpoint_seq_lens,
         )
-        raw_indices = checkpoint_batch.sequence_starts.unsqueeze(1) + relative_tokens
-        raw_indices.clamp_(min=0)
-        raw_window = raw_inputs.index_select(0, raw_indices.flatten()).view(
-            rows.numel(), state_len, raw_inputs.shape[1]
-        )
-        raw_window = raw_window.transpose(1, 2)
-
-        # This also handles a checkpoint shorter than the convolution window:
-        # leading values shift from the input page and only the available new
-        # tokens come from raw_inputs. Normal aligned checkpoints take only
-        # the raw-input arm.
-        source_positions = (state_len + relative_tokens).clamp_(
-            min=0,
-            max=state_len - 1,
-        )
-        source_window = source_state.gather(
-            2,
-            source_positions.unsqueeze(1).expand(-1, source_state.shape[1], -1),
-        )
-        checkpoint_state = torch.where(
-            (relative_tokens >= 0).unsqueeze(1),
-            raw_window,
-            source_window,
-        )
-        conv_states.index_copy_(0, destination, checkpoint_state)
 
     def _write_prefill_recurrent_checkpoints(
         self,
@@ -1543,64 +1484,20 @@ class MambaAttnBackend(AttentionBackend):
         """
         if checkpoint_blocks is None or checkpoint_batch is None:
             return
-        rows = checkpoint_batch.rows
-        if rows.numel() == 1:
-            row = int(checkpoint_batch.rows_cpu[0])
-            start = int(checkpoint_batch.sequence_starts_cpu[0])
-            checkpoint_len = int(checkpoint_batch.checkpoint_seq_lens_cpu[0])
-            end = start + checkpoint_len
-
-            def slice_tokens(
-                tensor: torch.Tensor | None,
-            ) -> torch.Tensor | None:
-                return None if tensor is None else tensor[start:end]
-
-            set_total_chunks_hint(
-                checkpoint_batch.checkpoint_seq_lens_cpu,
-                checkpoint_batch.query_start_loc,
-            )
-            _, checkpoint_state = self._prefill_scan(
-                query[:, start:end],
-                key[:, start:end],
-                value[:, start:end],
-                recurrent_state[row : row + 1],
-                checkpoint_batch.query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                a=slice_tokens(a),
-                b=slice_tokens(b),
-                g_raw=slice_tokens(g_raw),
-                f_a_out=slice_tokens(f_a_out),
-                f_b_weight=f_b_weight,
-                beta_raw=slice_tokens(beta_raw),
-                seq_len=checkpoint_len,
-                num_real_tokens=checkpoint_len,
-                lower_bound=lower_bound,
-                cu_seqlens_cpu=checkpoint_batch.cu_seqlens_cpu,
-            )
-            destination = checkpoint_blocks[row : row + 1].to(torch.int64)
-            ssm_states[destination] = checkpoint_state.to(
-                ssm_states.dtype,
-                copy=False,
-            )
-            return
-
-        token_indices = checkpoint_batch.token_indices
-
-        def select_tokens(
-            tensor: torch.Tensor | None,
-            token_dim: int,
-        ) -> torch.Tensor | None:
-            return (
-                None
-                if tensor is None
-                else tensor.index_select(token_dim, token_indices)
-            )
-
-        checkpoint_query = query.index_select(1, token_indices)
-        checkpoint_key = key.index_select(1, token_indices)
-        checkpoint_value = value.index_select(1, token_indices)
-        num_checkpoint_tokens = token_indices.numel()
+        packed = pack_prefill_recurrent_checkpoint_inputs(
+            query,
+            key,
+            value,
+            recurrent_state,
+            checkpoint_batch.rows,
+            checkpoint_batch.token_indices,
+            a,
+            b,
+            g_raw,
+            f_a_out,
+            beta_raw,
+        )
+        num_checkpoint_tokens = checkpoint_batch.token_indices.numel()
         # The chunk-count cache holds one active hint set. Install the packed
         # checkpoint batch immediately before its scan; forward_extend restores
         # the ordinary full-batch hint before running the final prefill scan.
@@ -1609,29 +1506,29 @@ class MambaAttnBackend(AttentionBackend):
             checkpoint_batch.query_start_loc,
         )
         _, checkpoint_state = self._prefill_scan(
-            checkpoint_query,
-            checkpoint_key,
-            checkpoint_value,
-            recurrent_state.index_select(0, rows),
+            packed.query,
+            packed.key,
+            packed.value,
+            packed.recurrent_state,
             checkpoint_batch.query_start_loc,
             A_log=A_log,
             dt_bias=dt_bias,
-            a=select_tokens(a, 0),
-            b=select_tokens(b, 0),
-            g_raw=select_tokens(g_raw, 0),
-            f_a_out=select_tokens(f_a_out, 0),
+            a=packed.a,
+            b=packed.b,
+            g_raw=packed.g_raw,
+            f_a_out=packed.f_a_out,
             f_b_weight=f_b_weight,
-            beta_raw=select_tokens(beta_raw, 0),
+            beta_raw=packed.beta_raw,
             seq_len=num_checkpoint_tokens,
             num_real_tokens=num_checkpoint_tokens,
             lower_bound=lower_bound,
             cu_seqlens_cpu=checkpoint_batch.cu_seqlens_cpu,
         )
-        destination = checkpoint_blocks.index_select(0, rows).to(torch.int64)
-        ssm_states.index_copy_(
-            0,
-            destination,
+        write_prefill_recurrent_checkpoints(
             checkpoint_state.to(ssm_states.dtype, copy=False),
+            ssm_states,
+            checkpoint_blocks,
+            checkpoint_batch.rows,
         )
 
     def forward_decode(
