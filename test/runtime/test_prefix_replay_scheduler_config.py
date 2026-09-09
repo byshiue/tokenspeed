@@ -12,6 +12,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     make_config,
     resolve_dspark_prefix_replay_tokens,
 )
+from tokenspeed.runtime.utils.env import StateCheckpointPrefillMode
 
 
 def _make_config(*, prefix_replay_tokens: int | None = None):
@@ -27,6 +28,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         disable_l2_cache=True,
         enable_l3_storage=False,
         role="fused",
+        state_checkpoint_prefill_mode=StateCheckpointPrefillMode.SINGLE_FORWARD,
         **kwargs,
     )
 

@@ -44,6 +44,40 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
     return chunk_size - chunk_size % prefix_granularity;
 }
 
+StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode mode, Role role,
+                                                      bool prefix_cache_enabled, std::int32_t first_pos,
+                                                      std::int32_t unscheduled_tokens, std::int32_t token_budget,
+                                                      std::int32_t prefix_granularity,
+                                                      std::int32_t promotion_boundary_tokens) {
+    _assert(first_pos >= 0 && unscheduled_tokens >= 0 && token_budget >= 0, "prefill positions must be non-negative");
+    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
+
+    std::int32_t split_tail_tokens = 0;
+    const std::int32_t bounded_tokens = std::min(unscheduled_tokens, token_budget);
+    const bool reaches_final_extent =
+        bounded_tokens == unscheduled_tokens &&
+        (promotion_boundary_tokens <= first_pos || first_pos + bounded_tokens <= promotion_boundary_tokens);
+    if (mode == StateCheckpointPrefillMode::kSplitTail && role != Role::kD && prefix_cache_enabled &&
+        reaches_final_extent) {
+        const std::int32_t endpoint = first_pos + bounded_tokens;
+        const std::int32_t tail = endpoint % prefix_granularity;
+        if (tail > 0 && bounded_tokens > tail) {
+            split_tail_tokens = tail;
+        }
+    }
+
+    const std::int32_t tokens_this_round = split_tail_tokens > 0
+                                               ? unscheduled_tokens - split_tail_tokens
+                                               : AlignPrefillChunk(first_pos, unscheduled_tokens, token_budget,
+                                                                   prefix_granularity, promotion_boundary_tokens);
+    return StateCheckpointPrefillPlan{
+        .tokens_this_round = tokens_this_round,
+        .split_tail_tokens = split_tail_tokens,
+        .materialization_after = first_pos + tokens_this_round,
+        .completes_prefill = tokens_this_round == unscheduled_tokens,
+    };
+}
+
 std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std::int32_t after_tokens,
                                                  std::int32_t prefix_granularity) {
     _assert(before_tokens >= 0 && after_tokens > before_tokens, "state checkpoint extent must advance");
