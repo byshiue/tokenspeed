@@ -26,10 +26,25 @@ caching — a chunk ending mid-page would leave a partial page that can never be
 matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
-**Decode reserve.** The chunk that completes the prompt also reserves
-`decode_input_tokens` (`completes_prefill ? reserve : 0`), so the request's
-first decode step is guaranteed a slot. Intermediate chunks reserve nothing —
-they are not about to decode.
+**Reserve.** What an admission holds beyond the chunk it computes is stated
+once per round (`PrefillReserve`: split tail, decode width, prompt headroom,
+whether the round finishes shaping the state groups) and turned into each
+group's page demand by `reservePrefillDemands` — the only writer of
+`GroupDemand::reserve_tokens`. `groupReserveTokens` picks the rule by the
+group's retention, never by call site:
+
+- *Full-history* groups hold the tail and decode slot — the chunk that
+  completes the prompt reserves `decode_input_tokens`, so the first decode step
+  is guaranteed a slot; intermediate chunks reserve nothing, they are not about
+  to decode — raised on a decoding role's first chunk to the rest of the prompt
+  plus the admission headroom (§4), so a partially prefetched request is never
+  stranded.
+- *Sliding-window* groups (either family) recycle slid-out pages, so the rest
+  of the prompt costs them nothing: they hold only the tail and decode slot.
+  Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
+  waiting on a pool that had room for it.
+- *Snapshot-state* groups bank one growth block at the admission that finishes
+  shaping them and nothing on any other round (§1.2).
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
@@ -106,13 +121,41 @@ release it because the dependent tail is already secured; that pending tail is
 not eligible for retraction and cannot reserve another tail. Decode-role remote
 admission and prefix-disabled execution always keep the final extent whole.
 
+The capacity guarantees still apply in both modes:
+
+- **In hybrid architectures the split tail is banked in every cache group,
+  not just the state group.** `groupReserveTokens` gives the history/KV and
+  sliding-window groups `tail + decode` (a decoding role's first chunk raises
+  the history group's to the prompt headroom) and the state groups
+  `max(block_granularity, tail, decode)` — never less than the tail, never a
+  headroom-sized token reserve.
+- **Tail splitting is bound to snapshot-state groups.** Without
+  `HasMambaStateGroup()`, the caller passes `kSingleForward` to the planner;
+  a pure-KV model never banks a tail and holds the head of line until its final
+  chunk. Extending tail reservation there would need its own capacity bound.
+- **Every state group banks one growth block at the admission that finishes
+  shaping it** (completing chunk, split body, or remote landing):
+  `groupReserveTokens` reserves `max(block_granularity, tail,
+  decode_input_tokens)`, one block beyond the endpoint for every prompt length.
+  Without it an endpoint that lands alone in its block (aligned prompt, remote
+  landing, `disable_prefix_cache`) needs a fresh **empty** parent per state
+  group at its first boundary crossing, and a full pool deadlocks because
+  residents are retraction-exempt. Invariant: *no request needs an empty parent
+  for its first crossing* — it either owns the block or recycles its expired
+  body checkpoint (split-tail path). Later crossings re-acquire from the shared
+  pool and depend on the capacity bound (§1.3) and admission back-pressure.
+  The P role banks only the split tail; intermediate chunks and the
+  tail-spending round reserve nothing (the next sparse re-shaping requires
+  `AvailableTokens() == 0`).
+
 ### 1.3 What bounds a single request
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
 `singleRequestLcmBlocksRequired`: the largest prompt whose worst-case working
 set — aligned checkpoint + final continuation state, decode reserve,
-overlap-depth protection, and for sparse local recovery the state parents —
-fits the pool. It is not a live
+overlap-depth protection, the state growth block, and for chunked sparse local
+recovery the retained input checkpoint (and, with the prefix cache on, a first
+chunk's cached one) — fits the pool. It is not a live
 check against currently free capacity; a prompt within the bound can still fail
 admission right now and simply waits.
 
@@ -357,11 +400,17 @@ no victim and nothing could free that page.
 ## 5. Invariants a change must preserve
 
 - Admission never grants pages for tokens beyond the chunk being scheduled,
-  except the decode reserve on the completing chunk and the admission headroom
-  (4).
-- An incomplete local prefill is not overtaken (1.1). Decodes are never
-  hostage to it: they consume no fresh capacity within their reserve, so they
-  keep running beside a stalled
+  except the decode reserve on the completing chunk (1), the state-checkpoint
+  tail (1.2), which is banked for exactly one round and asserted against
+  nesting, the snapshot-state growth block banked by the admission that
+  finishes shaping a state group (1.2), and the admission headroom (4) — which
+  only full-history groups hold.
+- A prefill demand's reserve is decided once per group, by retention, in
+  `reservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
+  helper asserts it found none set.
+- An incomplete local prefill is not overtaken (1.1) — unless its tail is
+  already banked. Decodes are never hostage to it: they consume no fresh
+  capacity within their reserve, so they keep running beside a stalled
   prefill.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,

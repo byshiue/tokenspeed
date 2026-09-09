@@ -111,13 +111,28 @@ void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<co
     }
 }
 
+// What a prefill admission holds beyond the chunk it computes, stated once
+// per round in tokens. Every cache group derives its own reserve from it in
+// reservePrefillDemands -- the only writer of GroupDemand::reserve_tokens.
 struct PrefillReserve {
+    // Off-boundary state-checkpoint tail this round banks for the next one;
+    // 0 if the round splits no tail.
     std::int32_t split_tail_tokens{};
+    // Width of the decode step that follows the completed prompt; 0 on the P
+    // role, which never decodes locally.
     std::int32_t decode_input_tokens{};
     bool completes_prefill{false};
+    // Rest of the prompt plus escalating decode room, prepaid by a decoding
+    // role at first-chunk admission (Request::AdmissionHeadroom); 0 on later
+    // chunks and on the P role.
     std::int32_t prompt_headroom_tokens{};
+    // Whether this admission finishes shaping the snapshot-state groups: the
+    // chunk that completes the prompt, the body that banks a split tail, or
+    // a remote landing.
     bool reserve_snapshot_state_growth{false};
 
+    // Tail plus decode when a tail is banked, the decode slot when the chunk
+    // completes the prompt, else 0: what a group must hold at minimum.
     std::int32_t TailAndDecodeTokens() const {
         if (split_tail_tokens > 0) {
             return split_tail_tokens + decode_input_tokens;
@@ -126,6 +141,14 @@ struct PrefillReserve {
     }
 };
 
+// One group's reserve, by retention. Full-history groups hold every token the
+// round is accountable for, including the prepaid prompt headroom: a
+// partially prefetched request must never be stranded. Sliding-window groups
+// recycle slid-out pages, so the rest of the prompt costs them nothing and
+// they hold only the tail and decode slot. Snapshot-state groups bank one
+// growth block (max(block_granularity, tail, decode)) on the admission that
+// finishes shaping them, so the first boundary crossing never needs an empty
+// parent; every other round reserves 0 there.
 std::int32_t groupReserveTokens(const CacheGroupConfig& group, std::int32_t block_granularity,
                                 const PrefillReserve& reserve) {
     if (group.IsSnapshotStateGroup()) {
@@ -375,6 +398,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         .decode_input_tokens = decode_input_tokens,
         .completes_prefill = checkpoint_plan.completes_prefill,
         .prompt_headroom_tokens = headroom > 0 ? unscheduled - checkpoint_plan.tokens_this_round + headroom : 0,
+        // A remote landing always finishes the shaping; the P role never
+        // decodes, so it banks only a split tail.
         .reserve_snapshot_state_growth =
             checkpoint_plan.split_tail_tokens > 0 ||
             (config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || checkpoint_plan.completes_prefill)),
@@ -393,6 +418,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             const CacheGroupConfig& group = config_.cache_groups[i];
             const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
+                // The peer lands only the endpoint snapshot, in slot (PrefillSize-1)/g.
                 demands[i].num_tokens = request->PrefillSize();
                 demands[i].materialized_suffix_start = (request->PrefillSize() - 1) / block_granularity;
             } else if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
@@ -445,6 +471,10 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
+    // Spend a state-checkpoint tail banked by the previous round's admission
+    // (read-and-clear at entry, so a tail banked BELOW is untouched): its
+    // pages are already held, so this round must complete it -- asserted
+    // once the chunk size is fixed -- and skips its sparse re-shaping.
     const bool consumes_pending_tail = std::exchange(cache_progress.state_checkpoint_tail_pending, false);
     StateCheckpointPrefillPlan checkpoint_plan{
         .tokens_this_round = std::min(remaining, unscheduled),
@@ -471,11 +501,14 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
             "pending state-checkpoint tail must complete in one scheduler round");
     const std::int32_t decode_reserve =
         checkpoint_plan.completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
+    // The prompt headroom was prepaid at first-chunk admission.
     const PrefillReserve reserve{
         .split_tail_tokens = checkpoint_plan.split_tail_tokens,
         .decode_input_tokens = reserve_num_tokens_in_next_schedule_event,
         .completes_prefill = checkpoint_plan.completes_prefill,
         .prompt_headroom_tokens = 0,
+        // The round that spends a banked tail got its growth block with the
+        // body; the P role banks only a split tail.
         .reserve_snapshot_state_growth =
             checkpoint_plan.split_tail_tokens > 0 ||
             (config_.role != Role::kP && checkpoint_plan.completes_prefill && !consumes_pending_tail),
