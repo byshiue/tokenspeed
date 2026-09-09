@@ -91,6 +91,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
+    nb::enum_<tokenspeed::StateCheckpointPrefillMode>(scheduler_config, "StateCheckpointPrefillMode")
+        .value("SingleForward", tokenspeed::StateCheckpointPrefillMode::kSingleForward)
+        .value("SplitTail", tokenspeed::StateCheckpointPrefillMode::kSplitTail);
+
     nb::enum_<tokenspeed::CacheGroupConfig::Retention>(m, "CacheRetention")
         .value("FullHistory", tokenspeed::CacheGroupConfig::Retention::FullHistory)
         .value("SlidingWindow", tokenspeed::CacheGroupConfig::Retention::SlidingWindow);
@@ -157,6 +161,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
+        .def_rw("state_checkpoint_prefill_mode", &tokenspeed::SchedulerConfig::state_checkpoint_prefill_mode)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens);
 

@@ -44,6 +44,9 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
+    // Storage for the final request-local state tail was secured atomically
+    // with the preceding aligned body.
+    bool state_checkpoint_tail_pending{false};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -151,6 +154,7 @@ struct Prefilling : public ForwardState {
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    bool StateCheckpointTailPending() const { return CacheProgressRef().state_checkpoint_tail_pending; }
     TokenContainer::Window window{};
 
 private:

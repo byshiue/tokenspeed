@@ -146,16 +146,16 @@ Consumers outside the cache layer treat the ids as opaque.
 
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
-full-history snapshot-state prefill normally needs only its input and final
-output checkpoints. With prefix caching and an off-page final tail, the aligned
-body materializes its endpoint and atomically reserves the tail storage; the
-tail consumes that reservation instead of materializing another sparse input
-checkpoint. The next decode admission allocates its destination after prefill
-scheduling and rolls the expired input page forward, including under overlap
-scheduling. The table keeps absolute slot positions while representing other
-skipped intermediate checkpoints as null holes (`0`). State consumers may
-gather only the declared input/output slots; compacting the row or publishing an
-unwritten intermediate checkpoint would break position identity.
+full-history snapshot-state prefill normally needs only its input, aligned
+prefix output, and final continuation checkpoints. The startup-selected
+checkpoint-prefill plan either materializes the aligned and final outputs in
+one forward, or lets an aligned body atomically reserve an off-page tail whose
+next forward consumes that reservation. The next decode admission rolls the
+expired input block forward, including under overlap scheduling. The table
+keeps absolute slot positions while representing other skipped intermediate
+checkpoints as null holes (`0`). State consumers may gather only the declared
+input/output slots; compacting the row or publishing an unwritten intermediate
+checkpoint would break position identity.
 
 When an extend materializes internal state checkpoints, convolution windows
 are assembled directly into their destination blocks by the kernel package.

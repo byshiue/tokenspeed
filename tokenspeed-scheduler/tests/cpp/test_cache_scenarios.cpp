@@ -217,9 +217,33 @@ protected:
         SchedulerConfig cfg = MambaChunkAlignmentSuite::MakeConfig();
         cfg.max_scheduled_tokens = 64;
         cfg.disable_prefix_cache = false;
+        cfg.state_checkpoint_prefill_mode = StateCheckpointPrefillMode::kSplitTail;
         return cfg;
     }
 };
+
+class MambaStateCheckpointSingleForwardSuite : public MambaStateCheckpointSplitSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = MambaStateCheckpointSplitSuite::MakeConfig();
+        cfg.state_checkpoint_prefill_mode = StateCheckpointPrefillMode::kSingleForward;
+        return cfg;
+    }
+};
+
+TEST_F(MambaStateCheckpointSingleForwardSuite, BatchesFinalExtentInOneForward) {
+    RequestSpec first = MakeRequestSpec("a", /*num_pages=*/3);
+    RequestSpec second = MakeRequestSpec("b", /*num_pages=*/3, /*start=*/100);
+    first.tokens.resize(10);
+    second.tokens.resize(10);
+    Submit({first, second});
+
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* op = FindForwardBatch(plan);
+    ASSERT_NE(op, nullptr);
+    EXPECT_EQ(op->request_ids, (std::vector<std::string>{"a", "b"}));
+    EXPECT_EQ(op->input_lengths, (std::vector<std::int32_t>{10, 10}));
+}
 
 TEST_F(MambaStateCheckpointSplitSuite, ReservesAndBatchesDependentTails) {
     RequestSpec first = MakeRequestSpec("a", /*num_pages=*/3);
@@ -280,6 +304,7 @@ TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {
     cfg.max_scheduled_tokens = 8;
     cfg.max_batch_size = 1;
     cfg.disable_l2_cache = true;
+    cfg.state_checkpoint_prefill_mode = StateCheckpointPrefillMode::kSplitTail;
     cfg.cache_groups = {
         MakeGroup("state", /*block_granularity=*/1, cfg.device_allocator.total_pages,
                   CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State),

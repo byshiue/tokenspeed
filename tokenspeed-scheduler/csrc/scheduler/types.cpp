@@ -51,6 +51,10 @@ void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group)
 }  // namespace
 
 void SchedulerConfig::Validate() const {
+    if (state_checkpoint_prefill_mode != StateCheckpointPrefillMode::kSingleForward &&
+        state_checkpoint_prefill_mode != StateCheckpointPrefillMode::kSplitTail) {
+        throw std::invalid_argument("Scheduler: invalid state_checkpoint_prefill_mode");
+    }
     if (prefix_granularity <= 0) {
         throw std::invalid_argument("Scheduler: prefix_granularity must be > 0");
     }

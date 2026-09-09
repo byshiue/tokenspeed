@@ -332,6 +332,7 @@ protected:
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 128;
         cfg.disable_l2_cache = true;
+        cfg.state_checkpoint_prefill_mode = StateCheckpointPrefillMode::kSplitTail;
         for (std::int32_t i = 0; i < 3; ++i) {
             CacheGroupConfig state = cfg.cache_groups.front();
             state.group_id = "linear_attention_" + std::to_string(i);

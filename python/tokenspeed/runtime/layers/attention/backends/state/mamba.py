@@ -329,6 +329,11 @@ def _build_prefill_checkpoint_batch(
         )
     selected_starts_cpu = sequence_starts_cpu.index_select(0, rows_cpu)
     selected_lens_cpu = checkpoint_seq_lens_cpu.index_select(0, rows_cpu)
+    selected_extend_lens_cpu = extend_seq_lens_cpu.index_select(0, rows_cpu)
+    if bool((selected_lens_cpu >= selected_extend_lens_cpu).any()):
+        raise RuntimeError(
+            "prefill checkpoint prefixes must end strictly inside their extents"
+        )
     cu_seqlens_cpu = torch.zeros(selected_lens_cpu.numel() + 1, dtype=torch.int64)
     torch.cumsum(
         selected_lens_cpu.to(torch.int64),

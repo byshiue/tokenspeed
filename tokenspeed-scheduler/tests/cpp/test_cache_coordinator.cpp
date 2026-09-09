@@ -3545,7 +3545,7 @@ TEST(MambaStateRegistrationTest, MambaPublishesAlignedEndpoint) {
     coord.Free(tables);
 }
 
-TEST(MambaStateRegistrationTest, MambaPublishesNoUnalignedBoundary) {
+TEST(MambaStateRegistrationTest, MambaPublishesAlignedCheckpointBeforeUnalignedEndpoint) {
     BlockPool pool(32);
     std::vector<CacheGroupSpec> specs = {
         {.kind = AttnKind::kMambaState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
@@ -3561,7 +3561,8 @@ TEST(MambaStateRegistrationTest, MambaPublishesNoUnalignedBoundary) {
         .num_computed_tokens = 10,
     }};
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands));
-    EXPECT_EQ(coord.GroupPrefixIndex(0).NumEntries(pool), 0);
+    EXPECT_EQ(coord.GroupPrefixIndex(0).NumEntries(pool), 1);
+    EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[1], 0)));
     coord.Free(tables);
 }
 

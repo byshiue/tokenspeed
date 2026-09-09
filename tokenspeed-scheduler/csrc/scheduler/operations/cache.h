@@ -31,6 +31,14 @@
 namespace tokenspeed {
 
 struct SchedulerConfig;
+enum class StateCheckpointPrefillMode;
+
+struct StateCheckpointPrefillPlan {
+    std::int32_t tokens_this_round{};
+    std::int32_t split_tail_tokens{};
+    std::int32_t materialization_after{};
+    bool completes_prefill{false};
+};
 
 // One CacheGroupSpec per config cache_group (group_id = index); all groups share config.prefix_granularity.
 // Pure translation: the caller must have accepted `config` through
@@ -40,6 +48,15 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config);
 
 std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled, std::int32_t token_budget,
                                std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens);
+
+// Describe one prefill extent without performing admission. The caller passes
+// kSingleForward when no snapshot-state group is present, keeping promotion
+// boundary alignment on this same planning path without enabling tail splits.
+StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode mode, Role role,
+                                                      bool prefix_cache_enabled, std::int32_t first_pos,
+                                                      std::int32_t unscheduled_tokens, std::int32_t token_budget,
+                                                      std::int32_t prefix_granularity,
+                                                      std::int32_t promotion_boundary_tokens);
 
 // First state slot materialized for one local prefill. When an off-page
 // endpoint crosses an aligned prefix boundary, the runtime writes both that

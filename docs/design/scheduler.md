@@ -66,19 +66,32 @@ Outside mixed mode, prefill and decode never share a round at all — decodes
 get the round only when no prefill scheduled — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
 
-### 1.2 State checkpoints: one prefill, two outputs
+### 1.2 State checkpoints: one planner, two startup modes
 
 A stateful prompt may finish off a prefix boundary. Its final state is needed
 to continue decode, while the preceding aligned state is needed to publish the
-last reusable prefix page. A completing prefill therefore materializes both
-outputs in **one** forward: the last aligned checkpoint and the final,
-request-local continuation state.
+last reusable prefix page. `PlanStateCheckpointPrefill` is the one planner for
+this extent. Its behavior is selected once at scheduler startup by
+`TOKENSPEED_STATE_CHECKPOINT_PREFILL_MODE`:
+
+* `single_forward` (the default) schedules the whole final extent in one
+  forward and materializes both the aligned checkpoint and the final,
+  request-local continuation state.
+* `split_tail` schedules an aligned body followed by the off-boundary tail.
+  The body atomically reserves the tail's dependent storage; the following
+  round consumes that reservation and must complete the prompt.
+
+For example, after a 50,432-token cache hit with an 868-token extent and
+128-token prefix granularity, `single_forward` schedules `[868]`, while
+`split_tail` schedules `[768, 100]`. The switch is process-wide and requires a
+restart; invalid or empty values fail startup.
 
 Admission allocates the sparse state suffix beginning at the aligned checkpoint
-when one falls inside the chunk; it includes the final state page and ordinary
-decode reserve atomically. The runtime writes both conv and recurrent state
-pages from the same prefill input. Only the aligned checkpoint is cached; the
-off-page endpoint is never keyed as a complete prefix.
+when one falls inside the chunk. In `single_forward` it includes the final
+state page and ordinary decode reserve atomically. In `split_tail`, the body
+secures the dependent endpoint and the tail consumes it without reshaping the
+sparse table. Only materialized aligned checkpoints are cached; an off-page
+endpoint is never keyed as a complete prefix.
 
 Within one forward, the runtime packs every request's aligned prefix into one
 variable-length checkpoint batch. Conv snapshots use one batched gather/write,
@@ -87,8 +100,11 @@ ordinary full-prefill scan still produces final outputs and continuation state.
 The checkpoint work is therefore intentionally recomputed, but its kernel count
 does not grow with the number of requests.
 
-This keeps the usual head-of-line rule for incomplete prefills. There is no
-special tail round and no state-checkpoint-tail capacity reservation.
+The two modes share admission, operation construction, dispatch, and result
+handling. A normal incomplete prefill holds the head of line. A split body may
+release it because the dependent tail is already secured; that pending tail is
+not eligible for retraction and cannot reserve another tail. Decode-role remote
+admission and prefix-disabled execution always keep the final extent whole.
 
 ### 1.3 What bounds a single request
 

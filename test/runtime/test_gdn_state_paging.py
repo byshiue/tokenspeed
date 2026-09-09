@@ -326,6 +326,31 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.assertEqual(self.plan.query_start_loc.tolist(), [0, 2, 6])
         self.assertEqual(self.plan.cu_seqlens_cpu.tolist(), [0, 2, 6])
 
+    def test_split_body_and_tail_have_no_internal_checkpoint_batch(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        for extend_len in (768, 100):
+            plan = _build_prefill_checkpoint_batch(
+                self.torch.tensor([extend_len], dtype=self.torch.int32),
+                self.torch.tensor([-1], dtype=self.torch.int32),
+                "cpu",
+            )
+            self.assertIsNone(plan)
+
+    def test_rejects_checkpoint_at_extent_endpoint(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "strictly inside"):
+            _build_prefill_checkpoint_batch(
+                self.torch.tensor([100], dtype=self.torch.int32),
+                self.torch.tensor([100], dtype=self.torch.int32),
+                "cpu",
+            )
+
     def test_conv_checkpoints_are_written_as_one_batch(self):
         torch = self.torch
         raw = torch.arange(30, dtype=torch.float32).view(15, 2)

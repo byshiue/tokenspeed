@@ -45,6 +45,7 @@ from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
+    effective_state_checkpoint_prefill_mode,
     make_config,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
@@ -83,7 +84,7 @@ from tokenspeed.runtime.utils import (
     get_colorful_logger,
     get_zmq_socket,
 )
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, state_checkpoint_prefill_mode
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.process import register_usr_signal
@@ -298,6 +299,13 @@ class EventLoop:
         # Backend/pool compatibility is validated inside ModelExecutor
         # (validate_scheduler_config), before CUDA-graph capture.
         self._cache_groups = cache_groups
+        requested_state_checkpoint_prefill_mode = state_checkpoint_prefill_mode()
+        effective_checkpoint_mode = effective_state_checkpoint_prefill_mode(
+            requested=requested_state_checkpoint_prefill_mode,
+            cache_groups=cache_groups,
+            prefix_cache_enabled=server_args.enable_prefix_caching,
+            role=server_args.disaggregation_mode,
+        )
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
             max_scheduled_tokens=max_scheduled_tokens,
@@ -307,6 +315,7 @@ class EventLoop:
             disable_l2_cache=not server_args.enable_kvstore,
             enable_l3_storage=server_args.kvstore_storage_backend is not None,
             role=server_args.disaggregation_mode,
+            state_checkpoint_prefill_mode=requested_state_checkpoint_prefill_mode,
             enable_kv_cache_events=self._kv_events_enabled,
             decode_input_tokens=decode_input_tokens,
             overlap_schedule_depth=self.overlap_schedule_depth,
@@ -321,6 +330,7 @@ class EventLoop:
             "overlap_schedule_depth=%s disable_l2_cache=%s "
             "max_batch_size=%s (global max_num_seqs=%s, dp_size=%s) "
             "disable_prefix_cache=%s prefix_replay_tokens=%s "
+            "state_checkpoint_prefill_mode(requested=%s effective=%s) "
             "cache_groups=%s",
             scheduler_cfg.prefix_granularity,
             scheduler_cfg.num_device_pages,
@@ -333,6 +343,8 @@ class EventLoop:
             self.dp_size,
             scheduler_cfg.disable_prefix_cache,
             scheduler_cfg.prefix_replay_tokens,
+            requested_state_checkpoint_prefill_mode.value,
+            effective_checkpoint_mode.value,
             [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)

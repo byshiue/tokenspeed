@@ -118,7 +118,9 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     const std::int64_t prefix_granularity = config_.prefix_granularity;
     // A final sub-page tail can follow the first aligned body, or a later body
     // that also retains an input checkpoint. Bound both cases independently.
-    const bool splits_final_state_checkpoint = config_.role != Role::kD && !config_.disable_prefix_cache;
+    const bool splits_final_state_checkpoint =
+        config_.state_checkpoint_prefill_mode == StateCheckpointPrefillMode::kSplitTail && config_.role != Role::kD &&
+        !config_.disable_prefix_cache;
     const auto max_split_tail_after = [&](std::int64_t minimum_body_end) {
         return splits_final_state_checkpoint
                    ? std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
