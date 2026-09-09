@@ -57,6 +57,9 @@ StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode
     const bool reaches_final_extent =
         bounded_tokens == unscheduled_tokens &&
         (promotion_boundary_tokens <= first_pos || first_pos + bounded_tokens <= promotion_boundary_tokens);
+    // Only a local prefill splits off its final state checkpoint -- and outside
+    // the D role every prefill is local (a D-role admission is the peer's work,
+    // riding plan.remote_prefill).
     if (mode == StateCheckpointPrefillMode::kSplitTail && role != Role::kD && prefix_cache_enabled &&
         reaches_final_extent) {
         const std::int32_t endpoint = first_pos + bounded_tokens;

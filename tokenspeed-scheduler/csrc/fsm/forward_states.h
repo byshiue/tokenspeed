@@ -154,6 +154,8 @@ struct Prefilling : public ForwardState {
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    // The final state-checkpoint tail's storage is already reserved, so this
+    // request's remaining prompt is capacity-safe.
     bool StateCheckpointTailPending() const { return CacheProgressRef().state_checkpoint_tail_pending; }
     TokenContainer::Window window{};
 

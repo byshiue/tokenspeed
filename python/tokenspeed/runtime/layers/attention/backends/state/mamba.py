@@ -912,8 +912,9 @@ class MambaAttnBackend(AttentionBackend):
 
         Returns:
             ``(state_in_blocks, state_out_blocks, checkpoint_blocks)`` mappings
-            keyed by group. ``checkpoint_blocks`` is -1 when no additional
-            aligned checkpoint falls inside that row's prefill extent.
+            keyed by state group id, each value an int32 ``[bs]`` page-id tensor.
+            ``checkpoint_blocks`` is -1 when no additional aligned checkpoint
+            falls inside that row's prefill extent.
         """
         if validate is None:
             validate = cache_debug_enabled()
