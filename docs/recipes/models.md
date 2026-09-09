@@ -229,10 +229,11 @@ target's whatever the drafter proposed.
 Kimi-K3 combines a MoonViT vision encoder with a hybrid KDA
 (linear-attention) / NoPE-MLA (full-attention) decoder and a
 DeepSeek-V3-style latent MoE. The KDA layers currently use
-the TokenSpeed kernel registry. On B200/B300, use the pinned TokenSpeed runner
-image and select the packaged CuteDSL implementation with
-`--kda-backend cutedsl_kda`; installing `flash-linear-attention` is not required
-for that path. `--kda-backend triton` remains the portable NVIDIA fallback.
+flash-linear-attention kernels on NVIDIA, so install it first:
+
+```bash
+pip install flash-linear-attention
+```
 
 Notes:
 
@@ -286,12 +287,12 @@ Notes:
   processor. Preserve the checkpoint's
   `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
-- KDA recurrent-state pages are published at aligned logical cache-page
-  boundaries. If one forward ends after such a boundary, the runtime writes
-  both the aligned reusable checkpoint and the request-local final
-  continuation state; the scheduler does not need a separate tail forward.
-  Prefix hits remain page-granular, and the state checkpoint granularity is
-  currently 128 tokens for Kimi-K3.
+- KDA recurrent-state pages register for prefix-cache reuse only when a
+  prefill chunk ends exactly on a logical cache-page boundary. The engine floors
+  `--chunked-prefill-size` to the plan's page grain automatically (logged as
+  a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
+  at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
+  hard-coded page value. Prefix hits are page-granular.
 
 ### NVIDIA
 
@@ -303,11 +304,9 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --trust-remote-code \
   --max-model-len 32768 \
   --kv-cache-dtype fp8 \
-  --quantization nvfp4 \
   --tensor-parallel-size 8 \
   --mm-encoder-tp-mode data \
   --ep-size 8 \
-  --kda-backend cutedsl_kda \
   --moe-backend flashinfer_trtllm \
   --gpu-memory-utilization 0.94 \
   --max-num-seqs 32 \
@@ -319,41 +318,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
 Plain TP8 (drop `--ep-size 8`) works too. The fused MoE path needs a
 Blackwell GPU (B200/B300); on other NVIDIA platforms use
 `--moe-backend triton`.
-
-### Reduced-layer agentic profiling
-
-For an incremental-prefill timeline, keep the allocation alive and launch
-each server/profile run as a step in that allocation (for example, allocate
-two 4-GPU nodes with `salloc --no-shell`, then use `srun --jobid ...`). This
-avoids comparing runs on different machines. Keep CUDA graph settings identical
-between the baseline and candidate runs.
-
-When deriving a 20-layer configuration from the real checkpoint, update both
-`text_config.num_hidden_layers` and the safetensors index. Merely changing the
-model config still makes the loader inspect all checkpoint shards. Retain
-non-layer tensors and `layers.0` through `layers.19`; do not copy or regenerate
-the weights.
-
-Warm the exact incremental shape with a separate random conversation before
-starting Nsight Systems. Start profiling explicitly immediately before the
-measured request and stop it explicitly after the first output token. A fixed
-`num_steps` window is unsafe here because gateway health checks are ordinary
-one-token scheduler steps and can consume the window before the target request
-arrives. The `/generate` response may be a one-element list at the gateway, so
-profiling clients should accept both that form and a direct result object.
-
-The `forward_step ext=N dec=M` NVTX label counts extend and decode *requests*,
-not tokens. Confirm the incremental token count from the adjacent scheduler log
-(for example, `#new-token: 868, #cached-token: 50432`) and use the NVTX range
-duration for the per-rank forward measurement.
-
-To profile checkpoint batching, submit distinct warmed conversations
-concurrently rather than repeating one prefix: the latter can collapse into a
-prefix-cache hit. HTTP thread concurrency alone does not guarantee one
-scheduler forward, so the repository runbook pauses generation admission,
-queues the group, and resumes it together. It accepts
-`K3_NSYS_PROFILE_CONCURRENCY`; keep that value no larger than the server's
-`--max-num-seqs` value.
 
 ### AMD
 
