@@ -42,7 +42,7 @@ from tokenspeed_kernel.ops.attention.triton.linear.index import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
-from tokenspeed_kernel.ops.attention.triton.prefill_checkpoints import (
+from tokenspeed_kernel.ops.attention.triton.prefill_state_checkpoints import (
     pack_prefill_recurrent_checkpoint_inputs,
     write_prefill_conv_checkpoints,
     write_prefill_recurrent_checkpoints,

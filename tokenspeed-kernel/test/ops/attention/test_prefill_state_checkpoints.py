@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.triton.prefill_checkpoints import (
+from tokenspeed_kernel.ops.attention.triton.prefill_state_checkpoints import (
     pack_prefill_recurrent_checkpoint_inputs,
     write_prefill_conv_checkpoints,
     write_prefill_recurrent_checkpoints,
