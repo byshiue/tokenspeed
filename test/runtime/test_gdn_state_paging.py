@@ -1341,5 +1341,108 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.assertGreater(ssm_slab[3].abs().max().item(), 0.0)
 
 
+class TritonCheckpointContinuationTest(unittest.TestCase):
+    def test_batched_transposed_body_state_matches_full_scan(self):
+        import torch
+
+        if not torch.cuda.is_available():
+            self.skipTest("GPU required")
+        from unittest.mock import patch
+
+        from tokenspeed_kernel.ops.attention.triton.gated_delta_rule import (
+            triton_gdn_chunk_prefill,
+        )
+
+        import tokenspeed.runtime.layers.attention.backends.state.mamba as mamba
+
+        torch.manual_seed(7)
+        h, d = 2, 128
+        backend = object.__new__(mamba.MambaAttnBackend)
+        for lengths in ([7, 7], [7, 3]):
+            with self.subTest(lengths=lengths), patch.object(
+                mamba, "gdn_chunk_prefill", triton_gdn_chunk_prefill
+            ):
+                n = sum(lengths)
+                q, k, v = (
+                    torch.randn(1, n, h, d, device="cuda", dtype=torch.bfloat16)
+                    for _ in range(3)
+                )
+                initial = torch.zeros(2, h, d, d, device="cuda")
+                slab = torch.zeros(6, h, d, d, device="cuda")
+                kwargs = dict(
+                    A_log=torch.zeros(h, device="cuda"),
+                    dt_bias=torch.zeros(h, device="cuda"),
+                    a=torch.randn(n, h, device="cuda", dtype=torch.bfloat16),
+                    b=torch.randn(n, h, device="cuda", dtype=torch.bfloat16),
+                    g_raw=None,
+                    f_a_out=None,
+                    f_b_weight=None,
+                    beta_raw=None,
+                    lower_bound=None,
+                )
+                bounds_cpu = torch.tensor([0, lengths[0], n], dtype=torch.int64)
+                expected_out, expected_state = backend._prefill_scan(
+                    q,
+                    k,
+                    v,
+                    initial,
+                    bounds_cpu.to(device="cuda", dtype=torch.int32),
+                    seq_len=n,
+                    num_real_tokens=n,
+                    cu_seqlens_cpu=bounds_cpu,
+                    **kwargs,
+                )
+                self.assertFalse(expected_state[0].is_contiguous())
+                plan = mamba._build_prefill_checkpoint_batch(
+                    torch.tensor(lengths, dtype=torch.int32),
+                    torch.zeros(2, dtype=torch.int32),
+                    2,
+                    4,
+                    "cuda",
+                )
+                checkpoint_blocks = torch.tensor(
+                    [3, 4], device="cuda", dtype=torch.int32
+                )
+                actual_out, actual_state = (
+                    backend._run_prefill_recurrent_checkpoint_split(
+                        q,
+                        k,
+                        v,
+                        initial,
+                        slab,
+                        checkpoint_blocks,
+                        plan,
+                        **kwargs,
+                    )
+                )
+                torch.testing.assert_close(
+                    actual_out, expected_out, atol=2e-3, rtol=1e-2
+                )
+                torch.testing.assert_close(
+                    actual_state, expected_state, atol=2e-3, rtol=1e-2
+                )
+                # The saved body state must also be reusable independently.
+                for row in plan.rows.cpu().tolist():
+                    start = int(bounds_cpu[row])
+                    body_kwargs = dict(kwargs)
+                    for name in ("a", "b"):
+                        body_kwargs[name] = kwargs[name][start : start + 4]
+                    prefix_bounds = torch.tensor([0, 4], dtype=torch.int64)
+                    _, prefix_state = backend._prefill_scan(
+                        q[:, start : start + 4],
+                        k[:, start : start + 4],
+                        v[:, start : start + 4],
+                        initial[row : row + 1],
+                        prefix_bounds.to(device="cuda", dtype=torch.int32),
+                        seq_len=4,
+                        num_real_tokens=4,
+                        cu_seqlens_cpu=prefix_bounds,
+                        **body_kwargs,
+                    )
+                    torch.testing.assert_close(
+                        slab[3 + row], prefix_state[0], atol=2e-3, rtol=1e-2
+                    )
+
+
 if __name__ == "__main__":
     unittest.main()

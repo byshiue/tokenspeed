@@ -296,6 +296,60 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
                 assert _find_forward_op(scheduler.next_execution_plan()) is not None
 
 
+@pytest.mark.parametrize("mode", ["SingleForward", "SplitTail"])
+@pytest.mark.parametrize("publish_on_finish", [False, True])
+@pytest.mark.parametrize("decode_width", [1, 3])
+@pytest.mark.parametrize("state_granularity", [1, 2, 4])
+def test_decode_reuses_only_materialized_state_boundary(
+    mode: str, publish_on_finish: bool, decode_width: int, state_granularity: int
+) -> None:
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 4
+    cfg.num_device_pages = 33
+    cfg.num_host_pages = 0
+    cfg.max_scheduled_tokens = 32
+    cfg.max_batch_size = 2
+    cfg.disable_l2_cache = True
+    cfg.disable_prefix_cache = False
+    cfg.decode_input_tokens = decode_width
+    cfg.overlap_schedule_depth = 0
+    cfg.state_checkpoint_prefill_mode = getattr(cfg.StateCheckpointPrefillMode, mode)
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="state",
+            rows_per_page=state_granularity,
+            entry_stride_tokens=1,
+            total_pages=33,
+            retention=ts.CacheRetention.FullHistory,
+            family=ts.CacheGroupFamily.State,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    request = _spec("r", [1, 2, 3])
+    request.max_new_tokens = 30
+    scheduler.submit_requests([request])
+    assert _find_forward_op(scheduler.next_execution_plan()) is not None
+    _advance_tokens(scheduler, "r", [4])
+    assert _find_forward_op(scheduler.next_execution_plan()) is not None
+    _advance_tokens(scheduler, "r", list(range(5, 5 + decode_width)))
+    if not publish_on_finish:
+        assert _find_forward_op(scheduler.next_execution_plan()) is not None
+        _advance_tokens(
+            scheduler, "r", list(range(5 + decode_width, 5 + 2 * decode_width))
+        )
+    _finish(scheduler, "r")
+    scheduler.next_execution_plan()
+
+    # Width 1 actually writes checkpoint 4. Width 3 jumps from state 3 to
+    # state 6; its allocated first block still contains state 3, not state 4.
+    reuse = _spec("reuse", [1, 2, 3, 4, 90, 91])
+    reuse.max_new_tokens = 4
+    scheduler.submit_requests([reuse])
+    batch = _find_forward_op(scheduler.next_execution_plan())
+    assert batch is not None
+    assert list(batch.extend_prefix_lens) == [4 if decode_width == 1 else 0]
+
+
 def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
     request_ids = ("a", "b", "c", "d")
     scheduler.submit_requests(

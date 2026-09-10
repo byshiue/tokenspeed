@@ -120,8 +120,9 @@ def test_conv_checkpoint_fused_kernel(
 @pytest.mark.parametrize("num_rows", [1, 2])
 @pytest.mark.parametrize("row_padding", [0, 7])
 @pytest.mark.parametrize("cuda_graph", [False, True])
+@pytest.mark.parametrize("transpose_state", [False, True])
 def test_recurrent_input_pack_is_one_semantic_path(
-    num_rows: int, row_padding: int, cuda_graph: bool
+    num_rows: int, row_padding: int, cuda_graph: bool, transpose_state: bool
 ) -> None:
     device = _device()
     tokens = 7
@@ -135,6 +136,10 @@ def test_recurrent_input_pack_is_one_semantic_path(
     state = torch.arange(3 * 2 * 4 * 3, dtype=torch.float32, device=device).view(
         3, 2, 4, 3
     )
+    if transpose_state:
+        # GDN/FLA expose a transposed final-state view in the public layout.
+        state = state.transpose(-1, -2).contiguous().transpose(-1, -2)
+        assert not state[0].is_contiguous()
     all_rows = torch.tensor([0, 2], dtype=torch.int64, device=device)
     all_indices = torch.tensor([0, 1, 4, 5, 6], dtype=torch.int64, device=device)
     rows = all_rows[:num_rows]
