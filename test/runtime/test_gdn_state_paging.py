@@ -268,7 +268,7 @@ class PrefillCheckpointPageTest(unittest.TestCase):
             {"linear_attention": torch.tensor([[7, 8, 9]], dtype=torch.int32)},
             validate=True,
             checkpoint_batch=_build_prefill_checkpoint_batch(
-                after - before, before, 4, "cpu"
+                after - before, before, 1, 4, "cpu"
             ),
         )
 
@@ -298,7 +298,7 @@ class PrefillCheckpointPageTest(unittest.TestCase):
         before = torch.tensor([0], dtype=torch.int32)
         after = torch.tensor([7], dtype=torch.int32)
         self.backend._checkpoint_granularity = 2
-        batch = _build_prefill_checkpoint_batch(after - before, before, 4, "cpu")
+        batch = _build_prefill_checkpoint_batch(after - before, before, 1, 4, "cpu")
         self.assertEqual(batch.checkpoint_positions.tolist(), [4])
         _, state_out, checkpoint = self.backend._cache_contract_state_blocks(
             before,
@@ -358,19 +358,27 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.plan = _build_prefill_checkpoint_batch(
             torch.tensor([5, 4, 6], dtype=torch.int32),
             torch.tensor([3, 2, 0], dtype=torch.int32),
+            3,
             4,
             "cpu",
         )
         assert self.plan is not None
 
-    def test_builds_one_packed_varlen_prefix_batch(self):
+    def test_builds_packed_body_and_tail_batches(self):
         self.assertEqual(self.plan.rows.tolist(), [1, 2])
         self.assertEqual(self.plan.sequence_starts.tolist(), [5, 9])
         self.assertEqual(self.plan.checkpoint_seq_lens.tolist(), [2, 4])
-        self.assertEqual(self.plan.token_indices.tolist(), [5, 6, 9, 10, 11, 12])
-        self.assertEqual(self.plan.query_start_loc.tolist(), [0, 2, 6])
-        self.assertEqual(self.plan.cu_seqlens_cpu.tolist(), [0, 2, 6])
         self.assertEqual(self.plan.checkpoint_positions.tolist(), [4, 4])
+        self.assertEqual(self.plan.body_rows.tolist(), [0, 1, 2])
+        self.assertEqual(self.plan.body_seq_lens_cpu.tolist(), [5, 2, 4])
+        self.assertEqual(
+            self.plan.body_token_indices.tolist(),
+            [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12],
+        )
+        self.assertEqual(self.plan.body_query_start_loc.tolist(), [0, 5, 7, 11])
+        self.assertEqual(self.plan.tail_seq_lens_cpu.tolist(), [2, 2])
+        self.assertEqual(self.plan.tail_token_indices.tolist(), [7, 8, 13, 14])
+        self.assertEqual(self.plan.tail_query_start_loc.tolist(), [0, 2, 4])
 
     def test_device_metadata_shares_one_upload_storage(self):
         parts = (
@@ -378,11 +386,31 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             self.plan.sequence_starts,
             self.plan.checkpoint_seq_lens,
             self.plan.checkpoint_positions,
-            self.plan.token_indices,
-            self.plan.query_start_loc,
+            self.plan.body_rows,
+            self.plan.body_token_indices,
+            self.plan.body_query_start_loc,
+            self.plan.tail_token_indices,
+            self.plan.tail_query_start_loc,
         )
         self.assertEqual(len({part.untyped_storage().data_ptr() for part in parts}), 1)
-        self.assertEqual(self.plan.query_start_loc.dtype, self.torch.int32)
+        self.assertEqual(self.plan.body_query_start_loc.dtype, self.torch.int32)
+
+    def test_only_extend_rows_may_create_internal_checkpoints(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        batch = _build_prefill_checkpoint_batch(
+            self.torch.tensor([7, 7], dtype=self.torch.int32),
+            self.torch.tensor([0, 0], dtype=self.torch.int32),
+            1,
+            4,
+            "cpu",
+        )
+        assert batch is not None
+        self.assertEqual(batch.rows.tolist(), [0])
+        self.assertEqual(batch.body_seq_lens_cpu.tolist(), [4, 7])
+        self.assertEqual(batch.tail_seq_lens_cpu.tolist(), [3])
 
     def test_kda_boundary_preparation_reuses_int64_input(self):
         from tokenspeed.runtime.layers.attention.backends.state.kda import (
@@ -415,6 +443,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             batch = _build_prefill_checkpoint_batch(
                 torch.tensor([5, 4, 6], dtype=torch.int32),
                 torch.tensor([3, 2, 0], dtype=torch.int32),
+                3,
                 4,
                 "cuda",
             )
@@ -422,7 +451,8 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             torch.cuda.set_sync_debug_mode(previous)
         self.assertEqual(batch.checkpoint_positions.cpu().tolist(), [4, 4])
         self.assertEqual(
-            batch.token_indices.cpu().tolist(), self.plan.token_indices.tolist()
+            batch.body_token_indices.cpu().tolist(),
+            self.plan.body_token_indices.tolist(),
         )
 
     def test_split_body_and_tail_have_no_internal_checkpoint_batch(self):
@@ -434,10 +464,30 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             plan = _build_prefill_checkpoint_batch(
                 self.torch.tensor([extend_len], dtype=self.torch.int32),
                 self.torch.tensor([prefix_len], dtype=self.torch.int32),
+                1,
                 128,
                 "cpu",
             )
             self.assertIsNone(plan)
+
+    def test_single_forward_868_builds_768_body_and_100_tail(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        plan = _build_prefill_checkpoint_batch(
+            self.torch.tensor([868], dtype=self.torch.int32),
+            self.torch.tensor([50_432], dtype=self.torch.int32),
+            1,
+            128,
+            "cpu",
+        )
+        assert plan is not None
+        self.assertEqual(plan.checkpoint_positions.tolist(), [51_200])
+        self.assertEqual(plan.body_seq_lens_cpu.tolist(), [768])
+        self.assertEqual(plan.tail_seq_lens_cpu.tolist(), [100])
+        self.assertEqual(plan.body_token_indices.tolist(), list(range(768)))
+        self.assertEqual(plan.tail_token_indices.tolist(), list(range(768, 868)))
 
     def test_rejects_mismatched_prefix_and_extend_lengths(self):
         from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -446,7 +496,17 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "same shape"):
             _build_prefill_checkpoint_batch(
-                self.torch.tensor([7, 7]), self.torch.tensor([0]), 4, "cpu"
+                self.torch.tensor([7, 7]), self.torch.tensor([0]), 2, 4, "cpu"
+            )
+
+    def test_rejects_checkpoint_row_count_outside_batch(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        with self.assertRaisesRegex(ValueError, "checkpoint row count"):
+            _build_prefill_checkpoint_batch(
+                self.torch.tensor([7]), self.torch.tensor([0]), 2, 4, "cpu"
             )
 
     def test_empty_extend_batch_has_no_checkpoints(self):
@@ -458,6 +518,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             _build_prefill_checkpoint_batch(
                 self.torch.empty(0, dtype=self.torch.int32),
                 self.torch.empty(0, dtype=self.torch.int32),
+                0,
                 128,
                 "cpu",
             )
@@ -483,13 +544,14 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.assertTrue(torch.equal(states[7], expected_short))
         self.assertTrue(torch.equal(states[8], expected_long))
 
-    def test_recurrent_checkpoints_share_one_scan_call(self):
+    def test_recurrent_checkpoint_split_scans_body_then_tail(self):
         torch = self.torch
         calls = []
 
         def fake_scan(query, key, value, recurrent_state, query_start_loc, **kwargs):
             calls.append((query, key, value, recurrent_state, query_start_loc, kwargs))
-            return query, recurrent_state + 100
+            # KDA removes the leading scan batch and returns [T, H, D].
+            return query.squeeze(0), recurrent_state + 100
 
         self.backend._prefill_scan = fake_scan
         tokens = torch.arange(15, dtype=torch.float32).view(1, 15, 1, 1)
@@ -497,7 +559,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         recurrent = torch.arange(3, dtype=torch.float32).view(3, 1, 1, 1)
         slab = torch.zeros(10, 1, 1, 1)
 
-        self.backend._write_prefill_recurrent_checkpoints(
+        output, final_state = self.backend._run_prefill_recurrent_checkpoint_split(
             tokens,
             tokens,
             tokens,
@@ -516,13 +578,28 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             lower_bound=-5.0,
         )
 
-        self.assertEqual(len(calls), 1)
-        query, _, _, initial, boundaries, kwargs = calls[0]
-        self.assertEqual(query.flatten().tolist(), [5, 6, 9, 10, 11, 12])
-        self.assertEqual(initial.flatten().tolist(), [1, 2])
-        self.assertEqual(boundaries.tolist(), [0, 2, 6])
-        self.assertEqual(kwargs["a"].flatten().tolist(), [5, 6, 9, 10, 11, 12])
-        self.assertEqual(kwargs["seq_len"], 6)
+        self.assertEqual(len(calls), 2)
+        body_query, _, _, body_initial, body_boundaries, body_kwargs = calls[0]
+        self.assertEqual(
+            body_query.flatten().tolist(), [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12]
+        )
+        self.assertEqual(body_initial.flatten().tolist(), [0, 1, 2])
+        self.assertEqual(body_boundaries.tolist(), [0, 5, 7, 11])
+        self.assertEqual(
+            body_kwargs["a"].flatten().tolist(),
+            [0, 1, 2, 3, 4, 5, 6, 9, 10, 11, 12],
+        )
+        self.assertEqual(body_kwargs["seq_len"], 11)
+
+        tail_query, _, _, tail_initial, tail_boundaries, tail_kwargs = calls[1]
+        self.assertEqual(tail_query.flatten().tolist(), [7, 8, 13, 14])
+        self.assertEqual(tail_initial.flatten().tolist(), [101, 102])
+        self.assertEqual(tail_boundaries.tolist(), [0, 2, 4])
+        self.assertEqual(tail_kwargs["a"].flatten().tolist(), [7, 8, 13, 14])
+        self.assertEqual(tail_kwargs["seq_len"], 4)
+        self.assertEqual(output.shape, (15, 1, 1))
+        self.assertEqual(output.flatten().tolist(), list(range(15)))
+        self.assertEqual(final_state.flatten().tolist(), [100, 201, 202])
         self.assertEqual(slab[[7, 8]].flatten().tolist(), [101, 102])
 
     def test_single_checkpoint_uses_the_same_pack_and_write_contract(self):
@@ -534,6 +611,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         plan = _build_prefill_checkpoint_batch(
             torch.tensor([5], dtype=torch.int32),
             torch.tensor([2], dtype=torch.int32),
+            1,
             4,
             "cpu",
         )
@@ -563,7 +641,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         per_token = tokens.view(5, 1)
         recurrent = torch.tensor([[[[3.0]]]])
         slab = torch.zeros(6, 1, 1, 1)
-        self.backend._write_prefill_recurrent_checkpoints(
+        output, final_state = self.backend._run_prefill_recurrent_checkpoint_split(
             tokens,
             tokens,
             tokens,
@@ -581,12 +659,19 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             beta_raw=per_token,
             lower_bound=-5.0,
         )
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls), 2)
         query, initial, boundaries, kwargs = calls[0]
         self.assertEqual(query.flatten().tolist(), [0, 1])
         self.assertEqual(initial.flatten().tolist(), [3])
         self.assertEqual(boundaries.tolist(), [0, 2])
         self.assertEqual(kwargs["a"].flatten().tolist(), [0, 1])
+        query, initial, boundaries, kwargs = calls[1]
+        self.assertEqual(query.flatten().tolist(), [2, 3, 4])
+        self.assertEqual(initial.flatten().tolist(), [13])
+        self.assertEqual(boundaries.tolist(), [0, 3])
+        self.assertEqual(kwargs["a"].flatten().tolist(), [2, 3, 4])
+        self.assertEqual(output.flatten().tolist(), [0, 1, 2, 3, 4])
+        self.assertEqual(final_state.item(), 23)
         self.assertEqual(slab[4].item(), 13)
 
 

@@ -171,13 +171,15 @@ are assembled directly into their destination blocks by the kernel package.
 At most one internal checkpoint per eligible request is selected. Its token
 position and packed-prefix metadata are computed once on the host; the GPU
 views share one immutable, pinned asynchronous upload. Decode has no such batch
-and does not compute checkpoint indices. Recurrent checkpoint prefixes are
-packed in one operation, evaluated by the
-same selected GDN/KDA prefill scan as the final state, and scattered back to
-their destination blocks in one operation. Batch size one is the one-row case
-of this contract, not a separate runtime path. The pack/scatter optimization
-does not change the recurrent scan mathematics; a future native multi-tap scan
-may replace it without changing cache ownership or scheduler metadata.
+and does not compute checkpoint indices. Recurrent execution partitions the
+batch into a body scan and a tail scan. Every request participates in the body:
+rows crossing a checkpoint stop at that boundary, while other rows run to
+completion. Only crossing rows enter the packed tail scan, initialized directly
+from their body final states. Body and tail outputs are scattered back to
+original token order, so every token is evaluated exactly once while the aligned
+and final states are both retained. Batch size one uses zero-copy body/tail
+views; larger batches use the same batched pack/scatter contract. This split
+does not change cache ownership or scheduler metadata.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
