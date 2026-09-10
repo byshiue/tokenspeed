@@ -155,7 +155,8 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, std::int32_t bloc
         if (!reserve.reserve_snapshot_state_growth) {
             return 0;
         }
-        return std::max({block_granularity, reserve.split_tail_tokens, reserve.decode_input_tokens});
+        return static_cast<std::int32_t>(
+            SnapshotStateReserveTokens(block_granularity, reserve.split_tail_tokens, reserve.decode_input_tokens));
     }
     if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
         return reserve.TailAndDecodeTokens();
@@ -373,11 +374,8 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         .completes_prefill = remaining >= unscheduled,
     };
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
-        const StateCheckpointPrefillMode mode = coordinator_.HasMambaStateGroup()
-                                                    ? config_.state_checkpoint_prefill_mode
-                                                    : StateCheckpointPrefillMode::kSingleForward;
         checkpoint_plan =
-            PlanStateCheckpointPrefill(mode, config_.role, !config_.disable_prefix_cache, hit_tokens, unscheduled,
+            PlanStateCheckpointPrefill(config_.EffectiveStateCheckpointPrefillMode(), hit_tokens, unscheduled,
                                        remaining, coordinator_.PrefixGranularity(), promotion_boundary_tokens);
         if (checkpoint_plan.tokens_this_round == 0) {
             return std::nullopt;
@@ -482,12 +480,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .completes_prefill = remaining >= unscheduled,
     };
     if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
-        const StateCheckpointPrefillMode mode = coordinator_.HasMambaStateGroup()
-                                                    ? config_.state_checkpoint_prefill_mode
-                                                    : StateCheckpointPrefillMode::kSingleForward;
-        checkpoint_plan = PlanStateCheckpointPrefill(mode, config_.role, !config_.disable_prefix_cache, first_pos,
-                                                     unscheduled, remaining, coordinator_.PrefixGranularity(),
-                                                     cache_progress.promotion_boundary_tokens);
+        checkpoint_plan =
+            PlanStateCheckpointPrefill(config_.EffectiveStateCheckpointPrefillMode(), first_pos, unscheduled, remaining,
+                                       coordinator_.PrefixGranularity(), cache_progress.promotion_boundary_tokens);
         if (checkpoint_plan.split_tail_tokens > 0) {
             _assert(!consumes_pending_tail, "cannot reserve a second state-checkpoint tail while one is pending");
             cache_progress.state_checkpoint_tail_pending = true;

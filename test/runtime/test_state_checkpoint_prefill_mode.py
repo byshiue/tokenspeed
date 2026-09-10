@@ -22,10 +22,7 @@ import pytest
 
 pytest.importorskip("tokenspeed_scheduler")
 
-from tokenspeed.runtime.engine.scheduler_utils import (
-    effective_state_checkpoint_prefill_mode,
-    make_config,
-)
+from tokenspeed.runtime.engine.scheduler_utils import make_config
 from tokenspeed.runtime.utils.env import (
     StateCheckpointPrefillMode,
     envs,
@@ -36,7 +33,9 @@ from tokenspeed.runtime.utils.env import (
 def test_state_checkpoint_prefill_mode_defaults_to_single_forward() -> None:
     with envs.TOKENSPEED_STATE_CHECKPOINT_PREFILL_MODE.override("single_forward"):
         envs.TOKENSPEED_STATE_CHECKPOINT_PREFILL_MODE.clear()
-        assert state_checkpoint_prefill_mode() is StateCheckpointPrefillMode.SINGLE_FORWARD
+        assert (
+            state_checkpoint_prefill_mode() is StateCheckpointPrefillMode.SINGLE_FORWARD
+        )
 
 
 @pytest.mark.parametrize("mode", list(StateCheckpointPrefillMode))
@@ -69,12 +68,43 @@ def test_state_checkpoint_prefill_mode_rejects_invalid_value(value: str) -> None
 
 
 def test_split_tail_is_ineffective_without_snapshot_state_prefix_cache() -> None:
+    from tokenspeed_scheduler import SchedulerConfig
+
+    cfg = SchedulerConfig()
+    cfg.state_checkpoint_prefill_mode = cfg.StateCheckpointPrefillMode.SplitTail
     assert (
-        effective_state_checkpoint_prefill_mode(
-            requested=StateCheckpointPrefillMode.SPLIT_TAIL,
-            cache_groups=[],
-            prefix_cache_enabled=True,
-            role="fused",
-        )
-        is StateCheckpointPrefillMode.SINGLE_FORWARD
+        cfg.effective_state_checkpoint_prefill_mode
+        == cfg.StateCheckpointPrefillMode.SingleForward
     )
+
+
+@pytest.mark.parametrize("role", ["Fused", "P", "D"])
+@pytest.mark.parametrize("prefix_cache_enabled", [False, True])
+def test_effective_mode_comes_from_scheduler_config(role, prefix_cache_enabled) -> None:
+    from tokenspeed_scheduler import (
+        CacheGroupConfig,
+        CacheGroupFamily,
+        CacheRetention,
+        SchedulerConfig,
+    )
+
+    cfg = SchedulerConfig()
+    cfg.role = getattr(cfg.Role, role)
+    cfg.state_checkpoint_prefill_mode = cfg.StateCheckpointPrefillMode.SplitTail
+    cfg.disable_prefix_cache = not prefix_cache_enabled
+    cfg.cache_groups = [
+        CacheGroupConfig(
+            group_id="state",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            total_pages=32,
+            retention=CacheRetention.FullHistory,
+            family=CacheGroupFamily.State,
+        )
+    ]
+    expected = (
+        cfg.StateCheckpointPrefillMode.SplitTail
+        if prefix_cache_enabled and role != "D"
+        else cfg.StateCheckpointPrefillMode.SingleForward
+    )
+    assert cfg.effective_state_checkpoint_prefill_mode == expected

@@ -50,10 +50,9 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
                                std::int32_t prefix_granularity, std::int32_t promotion_boundary_tokens);
 
 // Describe one prefill extent without performing admission. The caller passes
-// kSingleForward when no snapshot-state group is present, keeping promotion
-// boundary alignment on this same planning path without enabling tail splits.
-StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode mode, Role role,
-                                                      bool prefix_cache_enabled, std::int32_t first_pos,
+// SchedulerConfig::EffectiveStateCheckpointPrefillMode(), keeping promotion
+// boundary alignment on this same planning path without enabling pure-KV tails.
+StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode mode, std::int32_t first_pos,
                                                       std::int32_t unscheduled_tokens, std::int32_t token_budget,
                                                       std::int32_t prefix_granularity,
                                                       std::int32_t promotion_boundary_tokens);
@@ -63,6 +62,11 @@ StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode
 // checkpoint and the final continuation state in the same model forward.
 std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std::int32_t after_tokens,
                                                  std::int32_t prefix_granularity);
+
+// Storage banked beyond a snapshot-state body. Shared by admission and its
+// startup capacity bound; callers decide whether this round needs a reserve.
+std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int64_t tail_tokens,
+                                        std::int64_t decode_tokens);
 
 void FreeRequest(CacheCoordinator& coordinator, std::vector<BlockTable>& tables);
 

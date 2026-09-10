@@ -112,10 +112,10 @@ TEST(StateCheckpointMaterializationStartTest, UsesOnlyFinalSlotWhenNoBoundaryFal
 }
 
 TEST(PlanStateCheckpointPrefillTest, SingleForwardKeepsFinalExtentWhole) {
-    const StateCheckpointPrefillPlan plan = PlanStateCheckpointPrefill(
-        StateCheckpointPrefillMode::kSingleForward, Role::kFused, /*prefix_cache_enabled=*/true,
-        /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
-        /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
+    const StateCheckpointPrefillPlan plan =
+        PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSingleForward,
+                                   /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
+                                   /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
     EXPECT_EQ(plan.tokens_this_round, 868);
     EXPECT_EQ(plan.split_tail_tokens, 0);
     EXPECT_EQ(plan.materialization_after, 51300);
@@ -124,7 +124,7 @@ TEST(PlanStateCheckpointPrefillTest, SingleForwardKeepsFinalExtentWhole) {
 
 TEST(PlanStateCheckpointPrefillTest, SplitTailSeparatesAlignedBody) {
     const StateCheckpointPrefillPlan plan =
-        PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSplitTail, Role::kFused, /*prefix_cache_enabled=*/true,
+        PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSplitTail,
                                    /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
                                    /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
     EXPECT_EQ(plan.tokens_this_round, 768);
@@ -133,24 +133,39 @@ TEST(PlanStateCheckpointPrefillTest, SplitTailSeparatesAlignedBody) {
     EXPECT_FALSE(plan.completes_prefill);
 }
 
-TEST(PlanStateCheckpointPrefillTest, SplitTailDoesNotAffectRemoteOrPrefixDisabledWork) {
-    for (const auto [role, prefix_cache_enabled] : {std::pair{Role::kD, true}, std::pair{Role::kFused, false}}) {
-        const StateCheckpointPrefillPlan plan =
-            PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSplitTail, role, prefix_cache_enabled,
-                                       /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
-                                       /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
-        EXPECT_EQ(plan.tokens_this_round, 868);
-        EXPECT_EQ(plan.split_tail_tokens, 0);
-        EXPECT_TRUE(plan.completes_prefill);
+TEST(PlanStateCheckpointPrefillTest, EffectiveModeIsSharedByPlanningAndDiagnostics) {
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        for (const bool prefix_cache_enabled : {false, true}) {
+            for (const bool has_state : {false, true}) {
+                SchedulerConfig cfg{};
+                cfg.role = role;
+                cfg.disable_prefix_cache = !prefix_cache_enabled;
+                cfg.state_checkpoint_prefill_mode = StateCheckpointPrefillMode::kSplitTail;
+                CacheGroupConfig group{};
+                group.family = has_state ? CacheGroupFamily::State : CacheGroupFamily::History;
+                group.retention = CacheGroupConfig::Retention::FullHistory;
+                cfg.cache_groups = {group};
+                const bool splits = has_state && prefix_cache_enabled && role != Role::kD;
+                EXPECT_EQ(cfg.EffectiveStateCheckpointPrefillMode(),
+                          splits ? StateCheckpointPrefillMode::kSplitTail : StateCheckpointPrefillMode::kSingleForward);
+                const StateCheckpointPrefillPlan plan =
+                    PlanStateCheckpointPrefill(cfg.EffectiveStateCheckpointPrefillMode(),
+                                               /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
+                                               /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
+                EXPECT_EQ(plan.tokens_this_round, splits ? 768 : 868);
+                EXPECT_EQ(plan.split_tail_tokens, splits ? 100 : 0);
+                EXPECT_EQ(plan.completes_prefill, !splits);
+            }
+        }
     }
 }
 
 TEST(PlanStateCheckpointPrefillTest, SplitTailKeepsAlignedAndBoundaryFreeExtentsWhole) {
     for (const std::int32_t unscheduled : {768, 100}) {
-        const StateCheckpointPrefillPlan plan = PlanStateCheckpointPrefill(
-            StateCheckpointPrefillMode::kSplitTail, Role::kFused, /*prefix_cache_enabled=*/true,
-            /*first_pos=*/51200, unscheduled, /*token_budget=*/868,
-            /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
+        const StateCheckpointPrefillPlan plan =
+            PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSplitTail,
+                                       /*first_pos=*/51200, unscheduled, /*token_budget=*/868,
+                                       /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
         EXPECT_EQ(plan.tokens_this_round, unscheduled);
         EXPECT_EQ(plan.split_tail_tokens, 0);
         EXPECT_TRUE(plan.completes_prefill);

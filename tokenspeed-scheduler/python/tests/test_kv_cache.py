@@ -199,25 +199,25 @@ def _make_k3_128k_config(num_device_pages: int) -> ts.SchedulerConfig:
 
 
 def test_k3_reports_group_aware_single_request_capacity() -> None:
-    # Each sparse State group needs an input checkpoint, an aligned-body
-    # checkpoint, and its reserved tail. The three groups therefore leave 275
+    # Each sparse State group needs input, aligned checkpoint, final state,
+    # and banked growth. The three groups therefore leave 272
     # of the 284 usable parents for Full KV. K_full=12 and P=128 expose
-    # 275 * 12 * 128 tokens.
+    # 272 * 12 * 128 tokens.
     scheduler = ts.Scheduler(_make_k3_128k_config(285))
-    assert scheduler.max_single_request_tokens() == 422_400
+    assert scheduler.max_single_request_tokens() == 417_792
 
 
 def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     prompt = _spec("128k", list(range(131_072)))
 
-    # Nine State parents plus 86 Full parents admit 128K; one fewer Full parent
+    # Twelve State parents plus 86 Full parents admit 128K; one fewer Full parent
     # is 512 tokens short because each Full parent carries 12 * 128 tokens.
-    undersized = ts.Scheduler(_make_k3_128k_config(95))
+    undersized = ts.Scheduler(_make_k3_128k_config(98))
     assert undersized.max_single_request_tokens() < 131_072
 
-    corrected = ts.Scheduler(_make_k3_128k_config(96))
+    corrected = ts.Scheduler(_make_k3_128k_config(99))
     before = corrected.available_kv_pages()
-    assert before == 95
+    assert before == 98
     corrected.submit_requests([prompt])
     completed_tokens = 0
     for chunk in range(32):
@@ -232,6 +232,70 @@ def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     _finish(corrected, "128k")
     corrected.next_execution_plan()
     assert corrected.available_kv_pages() == before
+
+
+@pytest.mark.parametrize("mode", ["SingleForward", "SplitTail"])
+@pytest.mark.parametrize("block_granularity", [1, 2, 4])
+@pytest.mark.parametrize("chunk_tokens", [4, 8, 9])
+@pytest.mark.parametrize("decode_width", [1, 3])
+@pytest.mark.parametrize("overlap_depth", [0, 1])
+@pytest.mark.parametrize("prefix_cache_enabled", [False, True])
+def test_accepted_state_prompts_can_prefill_and_start_decode(
+    mode: str,
+    block_granularity: int,
+    chunk_tokens: int,
+    decode_width: int,
+    overlap_depth: int,
+    prefix_cache_enabled: bool,
+) -> None:
+    """An empty pool must serve every prompt below its advertised startup bound."""
+    for usable_blocks in range(2, 9):
+        cfg = ts.SchedulerConfig()
+        cfg.prefix_granularity = 4
+        cfg.num_device_pages = usable_blocks + 1
+        cfg.max_scheduled_tokens = chunk_tokens
+        cfg.max_batch_size = 1
+        cfg.disable_l2_cache = True
+        cfg.disable_prefix_cache = not prefix_cache_enabled
+        cfg.decode_input_tokens = decode_width
+        cfg.overlap_schedule_depth = overlap_depth
+        cfg.state_checkpoint_prefill_mode = getattr(
+            cfg.StateCheckpointPrefillMode, mode
+        )
+        cfg.cache_groups = [
+            ts.CacheGroupConfig(
+                group_id="state",
+                rows_per_page=block_granularity,
+                entry_stride_tokens=1,
+                total_pages=usable_blocks + 1,
+                retention=ts.CacheRetention.FullHistory,
+                family=ts.CacheGroupFamily.State,
+            )
+        ]
+        capacity = ts.Scheduler(cfg).max_single_request_tokens()
+        for prompt_tokens in range(1, min(16, capacity - decode_width) + 1):
+            scheduler = ts.Scheduler(cfg)
+            spec = _spec("r", list(range(prompt_tokens)))
+            spec.max_new_tokens = min(decode_width + 1, capacity - prompt_tokens)
+            scheduler.submit_requests([spec])
+            computed = 0
+            while computed < prompt_tokens:
+                batch = _find_forward_op(scheduler.next_execution_plan())
+                assert batch is not None, (
+                    usable_blocks,
+                    prompt_tokens,
+                    computed,
+                    capacity,
+                )
+                assert list(batch.request_ids) == ["r"]
+                assert batch.input_lengths[0] > 0
+                computed += batch.input_lengths[0]
+                _advance_tokens(
+                    scheduler, "r", [101] if computed == prompt_tokens else []
+                )
+            # The completing admission must also secure the first decode step.
+            if spec.max_new_tokens > 1:
+                assert _find_forward_op(scheduler.next_execution_plan()) is not None
 
 
 def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
@@ -286,7 +350,9 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
 
 def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     """Binding smoke for a split readmit and its reserved state tail."""
-    scheduler = ts.Scheduler(_make_k3_config())
+    cfg = _make_k3_config()
+    cfg.state_checkpoint_prefill_mode = cfg.StateCheckpointPrefillMode.SplitTail
+    scheduler = ts.Scheduler(cfg)
     before = scheduler.available_kv_pages()
     pre_retract_pages = _drive_k3_to_retract(scheduler)
 

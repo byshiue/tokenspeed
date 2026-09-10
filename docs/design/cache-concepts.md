@@ -157,9 +157,22 @@ checkpoints as null holes (`0`). State consumers may gather only the declared
 input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
+Snapshot selection and slot addressing are distinct even within this mapping:
+the last internal reusable checkpoint is at
+`floor(after / prefix_granularity) * prefix_granularity`, strictly between
+`before` and `after`. Its slot is `(checkpoint - 1) / block_granularity`.
+The two granularities need not be equal. Selecting the snapshot by a smaller
+state-group span would leave the prefix-boundary state unwritten while the
+coordinator publishes it. With smaller state blocks, admission also accounts
+for the whole materialized suffix through the endpoint and its reserve.
+
 When an extend materializes internal state checkpoints, convolution windows
 are assembled directly into their destination blocks by the kernel package.
-Recurrent checkpoint prefixes are packed in one operation, evaluated by the
+At most one internal checkpoint per eligible request is selected. Its token
+position and packed-prefix metadata are computed once on the host; the GPU
+views share one immutable, pinned asynchronous upload. Decode has no such batch
+and does not compute checkpoint indices. Recurrent checkpoint prefixes are
+packed in one operation, evaluated by the
 same selected GDN/KDA prefill scan as the final state, and scattered back to
 their destination blocks in one operation. Batch size one is the one-row case
 of this contract, not a separate runtime path. The pack/scatter optimization
@@ -191,9 +204,11 @@ Provenance discipline: each quantity is sourced from its own domain and never
 laundered through another's name. The contract's `prefix_granularity` comes
 from the memory plan, not read back out of pool state. The arena carries
 **two** scalars with distinct roles: `CacheArena.prefix_granularity` is the
-identity grain, used only for contract publication and plan-consistency
-checks — `prefix_granularity` exists to compute prefix hits, and runtime
-arithmetic must not reach for it; `CacheArena.kv_page_size` is the KV arena
+identity grain, used for contract publication and plan-consistency checks.
+The state-checkpoint mapping point additionally uses the contract's identity
+grain to select the snapshot required for prefix reuse; this is not kernel
+geometry. Other runtime arithmetic must not reach for it.
+`CacheArena.kv_page_size` is the KV arena
 page span that paged-KV geometry math (row views, slot↔page arithmetic,
 scale-tile branching) reads. Both derive from the one plan, which is the
 single point of the prefix-page ↔ KV-page convention.
@@ -657,9 +672,10 @@ plan/arena/`CacheBlock` view, mirrored by the host tier. Specifically:
   GSM8K 1319-question sweep: nospec 0.9651, DSpark 0.9629). ✓
 * Two arena scalars, two roles, both derived from the plan:
   `CacheArena.prefix_granularity` (identity grain; contract publication and
-  plan checks only) and `CacheArena.kv_page_size` (KV arena geometry, read by
-  row/slot/tile math in the paged pools and their consumers). Prefix-hit
-  computation is the only computational consumer of `prefix_granularity`. ✓
+  plan checks) and `CacheArena.kv_page_size` (KV arena geometry, read by
+  row/slot/tile math in the paged pools and their consumers). Prefix reuse
+  also requires the state-checkpoint mapping point to select the snapshot
+  at the contract's prefix boundary, independently of its state-block span. ✓
 * Cache geometry has one owner and no mirrors. `CacheArena` holds the
   allocation, the field views, the plan, the contract and the geometry
   scalars; `CachePool` is a typed layer window that forwards nothing, so

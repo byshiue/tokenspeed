@@ -269,7 +269,7 @@ TEST_F(MambaStateCheckpointSplitSuite, ReservesAndBatchesDependentTails) {
     EXPECT_EQ(tail_op->input_lengths, (std::vector<std::int32_t>{2, 2}));
 }
 
-TEST(MambaStateCheckpointCapacityTest, CountsEndpointGrowthAndChunkedInputCheckpoint) {
+TEST(MambaStateCheckpointCapacityTest, CountsInternalCheckpointEvenWithoutPrefixCaching) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 4;
     cfg.device_allocator.total_pages = 3;  // null + two usable state blocks
@@ -285,15 +285,48 @@ TEST(MambaStateCheckpointCapacityTest, CountsEndpointGrowthAndChunkedInputCheckp
 
     Scheduler scheduler{std::move(cfg)};
 
-    // Up to eight prompt tokens plus the decode reservation fit in two blocks
-    // (endpoint + banked growth block). A longer prompt is chunked and also
-    // retains the previous chunk's input checkpoint, which needs three.
-    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 9);
+    // Four prompt tokens plus decode fit in two blocks (endpoint + growth).
+    // A five-token prompt also materializes the token-4 checkpoint, requiring
+    // three blocks. Reject it at submission rather than waiting forever.
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 5);
     RequestSpec too_long{
         .request_id = "too-long",
-        .tokens = std::vector<std::int32_t>(14, 1),
+        .tokens = std::vector<std::int32_t>(6, 1),
     };
     EXPECT_THROW(scheduler.SubmitRequests({too_long}), std::invalid_argument);
+}
+
+TEST(MambaStateCheckpointCapacityTest, CountsRetainedInputForChunkedSingleForward) {
+    for (const std::int32_t usable_blocks : {3, 4}) {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 4;
+        cfg.device_allocator.total_pages = usable_blocks + 1;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 1;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = true;
+        cfg.cache_groups = {
+            MakeGroup("state", 4, cfg.device_allocator.total_pages, CacheGroupConfig::Retention::FullHistory,
+                      CacheGroupFamily::State, 0),
+        };
+        Scheduler scheduler{cfg};
+        RequestSpec spec{.request_id = "chunked", .tokens = std::vector<std::int32_t>(14, 1), .max_new_tokens = 1};
+        if (usable_blocks == 3) {
+            EXPECT_EQ(scheduler.MaxSingleRequestTokens(), 9);
+            EXPECT_THROW(scheduler.SubmitRequests({spec}), std::invalid_argument);
+            continue;
+        }
+        scheduler.SubmitRequests({spec});
+        for (const std::int32_t length : {8, 6}) {
+            const ExecutionPlan plan = scheduler.NextExecutionPlan();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr);
+            EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{length}));
+            ExecutionEvent done;
+            done.With(forward::ExtendResult{.request_id = "chunked", .tokens = {}});
+            scheduler.Advance(std::move(done));
+        }
+    }
 }
 
 TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkBodyAndSubPageTail) {

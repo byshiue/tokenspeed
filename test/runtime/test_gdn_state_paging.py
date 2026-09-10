@@ -256,6 +256,10 @@ class PrefillCheckpointPageTest(unittest.TestCase):
 
     def test_off_page_endpoint_selects_aligned_and_final_output_pages(self):
         torch = self.torch
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
         before = torch.tensor([4], dtype=torch.int32)
         after = torch.tensor([11], dtype=torch.int32)
         state_in, state_out, checkpoint = self.backend._cache_contract_state_blocks(
@@ -263,7 +267,9 @@ class PrefillCheckpointPageTest(unittest.TestCase):
             after,
             {"linear_attention": torch.tensor([[7, 8, 9]], dtype=torch.int32)},
             validate=True,
-            checkpoint_mask=torch.tensor([True]),
+            checkpoint_batch=_build_prefill_checkpoint_batch(
+                after - before, before, 4, "cpu"
+            ),
         )
 
         self.assertEqual(state_in["linear_attention"].tolist(), [7])
@@ -277,11 +283,49 @@ class PrefillCheckpointPageTest(unittest.TestCase):
             torch.tensor([12], dtype=torch.int32),
             {"linear_attention": torch.tensor([[7, 8, 9]], dtype=torch.int32)},
             validate=True,
-            checkpoint_mask=torch.tensor([True]),
+            checkpoint_batch=None,
         )
 
-        self.assertEqual(checkpoint["linear_attention"].tolist(), [-1])
+        self.assertIsNone(checkpoint)
         self.assertEqual(state_out["linear_attention"].tolist(), [9])
+
+    def test_prefix_boundary_is_independent_of_state_block_span(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        torch = self.torch
+        before = torch.tensor([0], dtype=torch.int32)
+        after = torch.tensor([7], dtype=torch.int32)
+        self.backend._checkpoint_granularity = 2
+        batch = _build_prefill_checkpoint_batch(after - before, before, 4, "cpu")
+        self.assertEqual(batch.checkpoint_positions.tolist(), [4])
+        _, state_out, checkpoint = self.backend._cache_contract_state_blocks(
+            before,
+            after,
+            {"linear_attention": torch.tensor([[0, 7, 8, 9]], dtype=torch.int32)},
+            validate=True,
+            checkpoint_batch=batch,
+        )
+        # Publish token 4 (slot 1), not token 6 (slot 2). The endpoint is token 7.
+        self.assertEqual(checkpoint["linear_attention"].tolist(), [7])
+        self.assertEqual(state_out["linear_attention"].tolist(), [9])
+
+    def test_decode_never_builds_checkpoint_tensors(self):
+        from unittest.mock import patch
+
+        torch = self.torch
+        with patch.object(
+            torch, "full_like", side_effect=AssertionError("checkpoint work in decode")
+        ):
+            _, _, checkpoint = self.backend._cache_contract_state_blocks(
+                torch.tensor([8], dtype=torch.int32),
+                torch.tensor([9], dtype=torch.int32),
+                {"linear_attention": torch.tensor([[0, 7, 9]], dtype=torch.int32)},
+                validate=False,
+                checkpoint_batch=None,
+            )
+        self.assertIsNone(checkpoint)
 
     def test_validate_off_masks_guards(self):
         torch = self.torch
@@ -313,7 +357,8 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.backend = object.__new__(MambaAttnBackend)
         self.plan = _build_prefill_checkpoint_batch(
             torch.tensor([5, 4, 6], dtype=torch.int32),
-            torch.tensor([-1, 2, 4], dtype=torch.int32),
+            torch.tensor([3, 2, 0], dtype=torch.int32),
+            4,
             "cpu",
         )
         assert self.plan is not None
@@ -325,31 +370,82 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.assertEqual(self.plan.token_indices.tolist(), [5, 6, 9, 10, 11, 12])
         self.assertEqual(self.plan.query_start_loc.tolist(), [0, 2, 6])
         self.assertEqual(self.plan.cu_seqlens_cpu.tolist(), [0, 2, 6])
+        self.assertEqual(self.plan.checkpoint_positions.tolist(), [4, 4])
+
+    def test_device_metadata_shares_one_upload_storage(self):
+        parts = (
+            self.plan.rows,
+            self.plan.sequence_starts,
+            self.plan.checkpoint_seq_lens,
+            self.plan.checkpoint_positions,
+            self.plan.token_indices,
+            self.plan.query_start_loc,
+        )
+        self.assertEqual(len({part.untyped_storage().data_ptr() for part in parts}), 1)
+        self.assertEqual(self.plan.query_start_loc.dtype, self.torch.int32)
+
+    def test_cuda_metadata_upload_does_not_synchronize(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        torch = self.torch
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        torch.cuda.synchronize()
+        previous = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            batch = _build_prefill_checkpoint_batch(
+                torch.tensor([5, 4, 6], dtype=torch.int32),
+                torch.tensor([3, 2, 0], dtype=torch.int32),
+                4,
+                "cuda",
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+        self.assertEqual(batch.checkpoint_positions.cpu().tolist(), [4, 4])
+        self.assertEqual(
+            batch.token_indices.cpu().tolist(), self.plan.token_indices.tolist()
+        )
 
     def test_split_body_and_tail_have_no_internal_checkpoint_batch(self):
         from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             _build_prefill_checkpoint_batch,
         )
 
-        for extend_len in (768, 100):
+        for prefix_len, extend_len in ((50432, 768), (51200, 100)):
             plan = _build_prefill_checkpoint_batch(
                 self.torch.tensor([extend_len], dtype=self.torch.int32),
-                self.torch.tensor([-1], dtype=self.torch.int32),
+                self.torch.tensor([prefix_len], dtype=self.torch.int32),
+                128,
                 "cpu",
             )
             self.assertIsNone(plan)
 
-    def test_rejects_checkpoint_at_extent_endpoint(self):
+    def test_rejects_mismatched_prefix_and_extend_lengths(self):
         from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             _build_prefill_checkpoint_batch,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "strictly inside"):
+        with self.assertRaisesRegex(ValueError, "same shape"):
             _build_prefill_checkpoint_batch(
-                self.torch.tensor([100], dtype=self.torch.int32),
-                self.torch.tensor([100], dtype=self.torch.int32),
+                self.torch.tensor([7, 7]), self.torch.tensor([0]), 4, "cpu"
+            )
+
+    def test_empty_extend_batch_has_no_checkpoints(self):
+        from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+            _build_prefill_checkpoint_batch,
+        )
+
+        self.assertIsNone(
+            _build_prefill_checkpoint_batch(
+                self.torch.empty(0, dtype=self.torch.int32),
+                self.torch.empty(0, dtype=self.torch.int32),
+                128,
                 "cpu",
             )
+        )
 
     def test_conv_checkpoints_are_written_as_one_batch(self):
         torch = self.torch
@@ -413,7 +509,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.assertEqual(kwargs["seq_len"], 6)
         self.assertEqual(slab[[7, 8]].flatten().tolist(), [101, 102])
 
-    def test_single_checkpoint_uses_direct_slices(self):
+    def test_single_checkpoint_uses_the_same_pack_and_write_contract(self):
         torch = self.torch
         from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             _build_prefill_checkpoint_batch,
@@ -422,6 +518,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         plan = _build_prefill_checkpoint_batch(
             torch.tensor([5], dtype=torch.int32),
             torch.tensor([2], dtype=torch.int32),
+            4,
             "cpu",
         )
         assert plan is not None
@@ -580,10 +677,12 @@ class CacheContractMetadataTest(unittest.TestCase):
             bs=2,
             num_extends=1,
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
-            seq_lens=torch.tensor([8, 9], dtype=torch.int32),
+            seq_lens=torch.tensor([5, 9], dtype=torch.int32),
             forward_mode=self.ForwardMode.MIXED,
             block_tables={
-                "linear_attention": torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+                "linear_attention": torch.tensor(
+                    [[1, 2, 0], [0, 3, 4]], dtype=torch.int32
+                )
             },
             **_extend_kwargs(
                 torch,
@@ -598,6 +697,10 @@ class CacheContractMetadataTest(unittest.TestCase):
         self.assertEqual(md.cu_extend_seq_lens_cpu.tolist(), [0, 5, 6])
         self.assertEqual(md.extend_seq_lens_cpu.tolist(), [5, 1])
         self.assertEqual(md.query_start_loc.tolist(), [0, 5, 6])
+        self.assertEqual(md.prefill_checkpoint_batch.rows.tolist(), [0])
+        self.assertEqual(
+            md.state_checkpoint_blocks_by_group["linear_attention"].tolist(), [1, -1]
+        )
 
     def test_capture_replay_metadata(self):
         torch = self.torch
@@ -770,6 +873,116 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.assertTrue(backend.state_paging_active)
         backend.init_cuda_graph_state(max_bs=2)
         return backend
+
+    def test_unaligned_prefill_checkpoint_matches_split_and_can_resume(self):
+        """Use the published prefix with P != g, not just its metadata indices."""
+        if not self.gdn.is_available():
+            self.skipTest("sm100 GDN kernel unavailable")
+        torch = self.torch
+        h, d, prefix, total = self.H, self.D, 4, 7
+        channels = 3 * h * d
+        raw = torch.randn(total, channels, device="cuda", dtype=torch.bfloat16)
+        a = torch.randn(total, h, device="cuda", dtype=torch.float32)
+        b = torch.randn_like(a)
+        common = dict(
+            conv_weights=torch.randn(
+                channels, self.WIDTH, device="cuda", dtype=torch.bfloat16
+            )
+            * 0.1,
+            bias=torch.randn(channels, device="cuda", dtype=torch.bfloat16) * 0.1,
+            activation="silu",
+            key_dim=h * d,
+            value_dim=h * d,
+            attention_tp_size=1,
+            head_k_dim=d,
+            head_v_dim=d,
+            A_log=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            dt_bias=torch.randn(h, device="cuda", dtype=torch.float32) * 0.1,
+            layer_id=0,
+        )
+
+        def prefill(backend, before, after, row):
+            backend.init_forward_metadata(
+                bs=1,
+                num_extends=1,
+                req_pool_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+                seq_lens=torch.tensor([after], dtype=torch.int32, device="cuda"),
+                forward_mode=self.ForwardMode.EXTEND,
+                block_tables={
+                    "linear_attention": torch.tensor(
+                        [row], dtype=torch.int32, device="cuda"
+                    )
+                },
+                **_extend_kwargs(
+                    torch,
+                    torch.tensor([after - before], dtype=torch.int32),
+                    torch.tensor([before], dtype=torch.int32),
+                    "cuda",
+                ),
+            )
+            return backend.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=backend.kv_pool,
+                bs=1,
+                forward_mode=self.ForwardMode.EXTEND,
+                mixed_qkv=raw[before:after],
+                a=a[before:after],
+                b=b[before:after],
+                seq_len=after - before,
+                **common,
+            )
+
+        for granularity in (1, 2, 4):
+            with self.subTest(state_granularity=granularity):
+                states = []
+                backends = []
+                for _ in range(2):
+                    conv = torch.zeros(
+                        5, channels, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
+                    )
+                    recurrent = torch.zeros(
+                        5, h, d, d, device="cuda", dtype=torch.float32
+                    )
+                    backend = self._make_backend(
+                        conv, recurrent, spec_num_tokens=1, replay_ssm=False
+                    )
+                    pool = _ContractPool(
+                        granularity, {0: ("linear_attention", conv, recurrent)}
+                    )
+                    pool.arena.runtime_contract.prefix_granularity = prefix
+                    backend.set_kv_pool(pool)
+                    states.append((conv, recurrent))
+                    backends.append(backend)
+                candidate, reference = backends
+                row = [0] * ((total - 1) // granularity + 1)
+                checkpoint_slot = (prefix - 1) // granularity
+                row[checkpoint_slot] = 1
+                row[-1] = 3
+                full_output = prefill(candidate, 0, total, row)
+                prefill(reference, 0, prefix, row)
+                for actual, expected in zip(states[0], states[1]):
+                    torch.testing.assert_close(
+                        actual[1], expected[1], atol=1e-3, rtol=1e-3
+                    )
+                    self.assertGreater(actual[1].abs().max().item(), 0.0)
+                    self.assertEqual(actual[0].abs().max().item(), 0.0)
+
+                # Reuse the published checkpoint, writing a distinct continuation.
+                saved = tuple(state[1].clone() for state in states[0])
+                row[-1] = 4
+                resumed = prefill(candidate, prefix, total, row)
+                difference = (resumed.float() - full_output[:, prefix:].float()).abs()
+                self.assertLess(difference.mean().item(), 1e-3)
+                torch.testing.assert_close(
+                    resumed, full_output[:, prefix:], atol=1e-1, rtol=1e-2
+                )
+                for state, snapshot in zip(states[0], saved):
+                    torch.testing.assert_close(state[4], state[3], atol=1e-3, rtol=1e-2)
+                    self.assertTrue(torch.equal(state[1], snapshot))
 
     def test_verify_scratch_seeds_conv_but_omits_replayed_ssm_state(self):
         torch = self.torch

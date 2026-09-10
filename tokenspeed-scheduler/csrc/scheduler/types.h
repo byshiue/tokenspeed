@@ -64,6 +64,9 @@ struct SchedulerConfig {
     bool enable_mixed_prefill_decode{false};
     StateCheckpointPrefillMode state_checkpoint_prefill_mode{StateCheckpointPrefillMode::kSingleForward};
 
+    // Resolve the startup request for planning, capacity, and diagnostics.
+    StateCheckpointPrefillMode EffectiveStateCheckpointPrefillMode() const;
+
     // The P and D roles ARE the cache-transfer PD protocol: there is no
     // disaggregated deployment without it, so everything PD-specific
     // (transfer pins, destination layouts, transfer_policy validation) keys

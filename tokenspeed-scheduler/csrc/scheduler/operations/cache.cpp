@@ -44,8 +44,7 @@ std::int32_t AlignPrefillChunk(std::int32_t first_pos, std::int32_t unscheduled,
     return chunk_size - chunk_size % prefix_granularity;
 }
 
-StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode mode, Role role,
-                                                      bool prefix_cache_enabled, std::int32_t first_pos,
+StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode mode, std::int32_t first_pos,
                                                       std::int32_t unscheduled_tokens, std::int32_t token_budget,
                                                       std::int32_t prefix_granularity,
                                                       std::int32_t promotion_boundary_tokens) {
@@ -57,11 +56,9 @@ StateCheckpointPrefillPlan PlanStateCheckpointPrefill(StateCheckpointPrefillMode
     const bool reaches_final_extent =
         bounded_tokens == unscheduled_tokens &&
         (promotion_boundary_tokens <= first_pos || first_pos + bounded_tokens <= promotion_boundary_tokens);
-    // Only a local prefill splits off its final state checkpoint -- and outside
-    // the D role every prefill is local (a D-role admission is the peer's work,
-    // riding plan.remote_prefill).
-    if (mode == StateCheckpointPrefillMode::kSplitTail && role != Role::kD && prefix_cache_enabled &&
-        reaches_final_extent) {
+    // The effective mode permits splitting only a local, prefix-cache-enabled
+    // state prefill. A D-role admission is the peer's work, riding remote_prefill.
+    if (mode == StateCheckpointPrefillMode::kSplitTail && reaches_final_extent) {
         const std::int32_t endpoint = first_pos + bounded_tokens;
         const std::int32_t tail = endpoint % prefix_granularity;
         if (tail > 0 && bounded_tokens > tail) {
@@ -87,6 +84,11 @@ std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     const std::int32_t completed_boundary = after_tokens - after_tokens % prefix_granularity;
     return completed_boundary > before_tokens ? completed_boundary : after_tokens;
+}
+
+std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int64_t tail_tokens,
+                                        std::int64_t decode_tokens) {
+    return std::max({block_granularity, tail_tokens, decode_tokens});
 }
 
 std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {

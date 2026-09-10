@@ -45,7 +45,6 @@ from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
 from tokenspeed.runtime.engine.request_handler import RequestHandler
 from tokenspeed.runtime.engine.scheduler_utils import (
     advance_scheduler,
-    effective_state_checkpoint_prefill_mode,
     make_config,
     resolve_dspark_prefix_replay_tokens,
     scheduler_cache_group_pages,
@@ -300,12 +299,6 @@ class EventLoop:
         # (validate_scheduler_config), before CUDA-graph capture.
         self._cache_groups = cache_groups
         requested_state_checkpoint_prefill_mode = state_checkpoint_prefill_mode()
-        effective_checkpoint_mode = effective_state_checkpoint_prefill_mode(
-            requested=requested_state_checkpoint_prefill_mode,
-            cache_groups=cache_groups,
-            prefix_cache_enabled=server_args.enable_prefix_caching,
-            role=server_args.disaggregation_mode,
-        )
         scheduler_cfg = make_config(
             num_device_pages=geometry.num_device_pages,
             max_scheduled_tokens=max_scheduled_tokens,
@@ -344,7 +337,7 @@ class EventLoop:
             scheduler_cfg.disable_prefix_cache,
             scheduler_cfg.prefix_replay_tokens,
             requested_state_checkpoint_prefill_mode.value,
-            effective_checkpoint_mode.value,
+            scheduler_cfg.effective_state_checkpoint_prefill_mode.name,
             [group.group_id for group in cache_groups],
         )
         self.scheduler = Scheduler(scheduler_cfg)
