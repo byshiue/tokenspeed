@@ -118,7 +118,11 @@ def test_conv_checkpoint_fused_kernel(
 
 
 @pytest.mark.parametrize("num_rows", [1, 2])
-def test_recurrent_input_pack_is_one_semantic_path(num_rows: int) -> None:
+@pytest.mark.parametrize("row_padding", [0, 7])
+@pytest.mark.parametrize("cuda_graph", [False, True])
+def test_recurrent_input_pack_is_one_semantic_path(
+    num_rows: int, row_padding: int, cuda_graph: bool
+) -> None:
     device = _device()
     tokens = 7
     query = torch.arange(tokens * 2 * 3, dtype=torch.bfloat16, device=device).view(
@@ -143,6 +147,25 @@ def test_recurrent_input_pack_is_one_semantic_path(num_rows: int) -> None:
     f_a_out = g_raw + 30
     beta_raw = a + 40
 
+    def pad_rows(tensor: torch.Tensor, row_dim: int) -> torch.Tensor:
+        if row_padding == 0:
+            return tensor
+        strides = list(tensor.stride())
+        strides[row_dim] += row_padding
+        if row_dim == 1:
+            strides[0] = tensor.shape[1] * strides[1]
+        padded = torch.empty_strided(
+            tensor.shape, strides, dtype=tensor.dtype, device=device
+        )
+        padded.copy_(tensor)
+        assert not padded.is_contiguous()
+        return padded
+
+    query, key, value = (pad_rows(tensor, 1) for tensor in (query, key, value))
+    state, a, b, g_raw, f_a_out, beta_raw = (
+        pad_rows(tensor, 0) for tensor in (state, a, b, g_raw, f_a_out, beta_raw)
+    )
+
     packed = pack_prefill_recurrent_checkpoint_inputs(
         query,
         key,
@@ -156,6 +179,26 @@ def test_recurrent_input_pack_is_one_semantic_path(num_rows: int) -> None:
         f_a_out,
         beta_raw,
     )
+    if cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            packed = pack_prefill_recurrent_checkpoint_inputs(
+                query,
+                key,
+                value,
+                state,
+                rows,
+                token_indices,
+                a,
+                b,
+                g_raw,
+                f_a_out,
+                beta_raw,
+            )
+        # Replay must read current data through the captured strided addresses.
+        for tensor in (query, key, value, state, a, b, g_raw, f_a_out, beta_raw):
+            tensor.add_(1)
+        graph.replay()
     torch.testing.assert_close(packed.query, query.index_select(1, token_indices))
     torch.testing.assert_close(packed.key, key.index_select(1, token_indices))
     torch.testing.assert_close(packed.value, value.index_select(1, token_indices))
