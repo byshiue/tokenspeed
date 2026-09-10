@@ -224,6 +224,15 @@ def _pack_prefill_recurrent_inputs_kernel(
     beta_raw_out,
     num_tokens,
     num_rows,
+    query_stride: tl.constexpr,
+    key_stride: tl.constexpr,
+    value_stride: tl.constexpr,
+    state_stride: tl.constexpr,
+    a_stride: tl.constexpr,
+    b_stride: tl.constexpr,
+    g_stride: tl.constexpr,
+    f_a_stride: tl.constexpr,
+    beta_stride: tl.constexpr,
     query_width: tl.constexpr,
     key_width: tl.constexpr,
     value_width: tl.constexpr,
@@ -247,7 +256,7 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         query_out + token * query_width + feature,
-        tl.load(query + source_token * query_width + feature, mask=mask),
+        tl.load(query + source_token * query_stride + feature, mask=mask),
         mask=mask,
     )
 
@@ -257,7 +266,7 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         key_out + token * key_width + feature,
-        tl.load(key + source_token * key_width + feature, mask=mask),
+        tl.load(key + source_token * key_stride + feature, mask=mask),
         mask=mask,
     )
 
@@ -267,7 +276,7 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         value_out + token * value_width + feature,
-        tl.load(value + source_token * value_width + feature, mask=mask),
+        tl.load(value + source_token * value_stride + feature, mask=mask),
         mask=mask,
     )
 
@@ -277,7 +286,7 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_row = tl.load(rows + row, mask=mask, other=0)
     tl.store(
         recurrent_state_out + row * state_width + feature,
-        tl.load(recurrent_state + source_row * state_width + feature, mask=mask),
+        tl.load(recurrent_state + source_row * state_stride + feature, mask=mask),
         mask=mask,
     )
 
@@ -288,7 +297,7 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             a_out + token * a_width + feature,
-            tl.load(a + source_token * a_width + feature, mask=mask),
+            tl.load(a + source_token * a_stride + feature, mask=mask),
             mask=mask,
         )
     if HAS_B:
@@ -298,7 +307,7 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             b_out + token * b_width + feature,
-            tl.load(b + source_token * b_width + feature, mask=mask),
+            tl.load(b + source_token * b_stride + feature, mask=mask),
             mask=mask,
         )
     if HAS_G:
@@ -308,7 +317,7 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             g_raw_out + token * g_width + feature,
-            tl.load(g_raw + source_token * g_width + feature, mask=mask),
+            tl.load(g_raw + source_token * g_stride + feature, mask=mask),
             mask=mask,
         )
     if HAS_F_A:
@@ -318,7 +327,7 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             f_a_packed + token * f_a_width + feature,
-            tl.load(f_a_out + source_token * f_a_width + feature, mask=mask),
+            tl.load(f_a_out + source_token * f_a_stride + feature, mask=mask),
             mask=mask,
         )
     if HAS_BETA:
@@ -328,7 +337,7 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             beta_raw_out + token * beta_width + feature,
-            tl.load(beta_raw + source_token * beta_width + feature, mask=mask),
+            tl.load(beta_raw + source_token * beta_stride + feature, mask=mask),
             mask=mask,
         )
 
@@ -362,9 +371,11 @@ def pack_prefill_recurrent_checkpoint_inputs(
 ) -> PackedPrefillCheckpointInputs:
     """Pack every checkpoint prefix and its initial state with one GPU launch.
 
-    Token dimension is 1 for query/key/value and 0 for gate tensors. Inner
-    dimensions and recurrent-state rows must be dense; the returned tensors
-    preserve the corresponding input shapes with packed token/request counts.
+    Token dimension is 1 for query/key/value (with batch dimension 1) and 0
+    for gate tensors. Features within each token or state row must be dense,
+    but rows may have noncontiguous strides, as with fused projection slices.
+    The returned tensors are contiguous and preserve the corresponding input
+    shapes with packed token/request counts.
 
     Args:
         query: Query tensor with token dimension 1.
@@ -415,9 +426,18 @@ def pack_prefill_recurrent_checkpoint_inputs(
     )
 
     tensors = (query, key, value, recurrent_state, *optional_inputs)
-    for tensor in tensors:
-        if tensor is not None and not tensor.is_contiguous():
-            raise ValueError("checkpoint pack inputs must be contiguous")
+    token_dims = (1, 1, 1, 0, 0, 0, 0, 0, 0)
+    for tensor, token_dim in zip(tensors, token_dims):
+        if tensor is None:
+            continue
+        if token_dim == 1 and tensor.shape[0] != 1:
+            raise ValueError("checkpoint pack query/key/value batch size must be 1")
+        if not tensor.select(token_dim, 0).is_contiguous():
+            raise ValueError("checkpoint pack inputs must have dense row features")
+    strides = tuple(
+        1 if tensor is None else tensor.stride(token_dim)
+        for tensor, token_dim in zip(tensors, token_dims)
+    )
     widths = (
         _token_width(query, 1),
         _token_width(key, 1),
@@ -463,6 +483,15 @@ def pack_prefill_recurrent_checkpoint_inputs(
         kernel_outputs[4],
         num_tokens,
         num_rows,
+        query_stride=strides[0],
+        key_stride=strides[1],
+        value_stride=strides[2],
+        state_stride=strides[3],
+        a_stride=strides[4],
+        b_stride=strides[5],
+        g_stride=strides[6],
+        f_a_stride=strides[7],
+        beta_stride=strides[8],
         query_width=widths[0],
         key_width=widths[1],
         value_width=widths[2],
