@@ -25,10 +25,10 @@ convention (FLA-native ``[N, HV, K, V]`` states) so the runtime can swap the
 two calls behind a policy flag. FlashKDA (MoonshotAI, two CUTLASS kernels)
 applies sigmoid(beta), the safe gate, and QK L2 normalization in-kernel like
 the FLA path, but has an order of magnitude less fixed overhead at short
-extend lengths and no shape specialization. Its state ABI is
-``[N, HV, V, K]``. The public compatibility wrapper converts FLA-native state,
-while the registered runtime adapter accepts the NVIDIA state slab's V-major
-layout directly and performs no state relayout.
+extend lengths and no shape specialization. Its state ABI is ``[N, HV, V, K]``,
+so this wrapper transposes the square 128x128 state on entry and returns the
+final state transposed back to the FLA convention (a per-layer ~1 MB copy,
+microseconds against a multi-ms forward).
 """
 
 from __future__ import annotations
@@ -48,78 +48,7 @@ from tokenspeed_kernel.thirdparty.flash_kda import (
     is_flash_kda_installed,
 )
 
-__all__ = [
-    "flash_kda_chunk_prefill",
-    "flash_kda_chunk_prefill_v_major",
-    "is_flash_kda_installed",
-]
-
-
-def _flash_kda_chunk_prefill(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_raw: torch.Tensor,
-    beta: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor | None,
-    *,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-    cu_seqlens_cpu: torch.Tensor | None,
-    lower_bound: float | None,
-    beta_is_logit: bool,
-    state_is_v_major: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del cu_seqlens_cpu
-    if not beta_is_logit:
-        raise ValueError("flash_kda_chunk_prefill requires raw beta logits")
-    if lower_bound is None:
-        raise ValueError("flash_kda_chunk_prefill requires a safe-gate bound")
-    if dt_bias is None:
-        raise ValueError("flash_kda_chunk_prefill requires dt_bias")
-    key_dim = q.shape[-1]
-    num_value_heads = v.shape[2]
-    if cu_seqlens is not None:
-        num_sequences = cu_seqlens.numel() - 1
-        boundaries = (
-            cu_seqlens
-            if cu_seqlens.dtype == torch.int64
-            else cu_seqlens.to(dtype=torch.int64)
-        )
-    else:
-        num_sequences = q.shape[0]
-        boundaries = None
-    state_in = initial_state
-    if state_in is not None and not state_is_v_major:
-        state_in = state_in.transpose(-1, -2).contiguous()
-    final_state = torch.empty(
-        num_sequences,
-        num_value_heads,
-        v.shape[-1],
-        key_dim,
-        dtype=torch.float32,
-        device=q.device,
-    )
-    out = torch.empty_like(v)
-    flash_kda_fwd()(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        g_raw.contiguous(),
-        beta.contiguous(),
-        1.0 / math.sqrt(key_dim),
-        out,
-        A_log.contiguous(),
-        dt_bias.reshape(num_value_heads, key_dim).contiguous(),
-        float(lower_bound),
-        initial_state=state_in,
-        final_state=final_state,
-        cu_seqlens=boundaries,
-    )
-    return (
-        (out, final_state) if state_is_v_major else (out, final_state.transpose(-1, -2))
-    )
+__all__ = ["flash_kda_chunk_prefill", "is_flash_kda_installed"]
 
 
 @register_kernel(
@@ -179,57 +108,48 @@ def flash_kda_chunk_prefill(
         ``(o [B, T, HV, V], final_state [N, HV, K, V])`` matching the FLA
         wrapper's convention.
     """
-    return _flash_kda_chunk_prefill(
-        q,
-        k,
-        v,
-        g_raw,
-        beta,
-        A_log,
-        dt_bias,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        lower_bound=lower_bound,
-        beta_is_logit=beta_is_logit,
-        state_is_v_major=False,
+    if not beta_is_logit:
+        raise ValueError("flash_kda_chunk_prefill requires raw beta logits")
+    if lower_bound is None:
+        raise ValueError("flash_kda_chunk_prefill requires a safe-gate bound")
+    if dt_bias is None:
+        raise ValueError("flash_kda_chunk_prefill requires dt_bias")
+    key_dim = q.shape[-1]
+    num_value_heads = v.shape[2]
+    if cu_seqlens is not None:
+        num_sequences = cu_seqlens.numel() - 1
+        boundaries = cu_seqlens.to(dtype=torch.int64)
+    else:
+        num_sequences = q.shape[0]
+        boundaries = None
+    # FLA-native [N, HV, K, V] -> FlashKDA [N, HV, V, K].
+    state_in = (
+        initial_state.transpose(-1, -2).contiguous()
+        if initial_state is not None
+        else None
     )
-
-
-def flash_kda_chunk_prefill_v_major(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g_raw: torch.Tensor,
-    beta: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor | None,
-    *,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-    cu_seqlens_cpu: torch.Tensor | None,
-    lower_bound: float | None,
-    beta_is_logit: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run FlashKDA with native ``[N, HV, V, K]`` recurrent states.
-
-    This adapter is for the registered paged runtime path, whose NVIDIA state
-    slab is already V-major. Keeping the state native avoids two redundant
-    transpose-and-copy operations per scan. Activations and return values
-    otherwise match :func:`flash_kda_chunk_prefill`.
-    """
-    return _flash_kda_chunk_prefill(
-        q,
-        k,
-        v,
-        g_raw,
-        beta,
-        A_log,
-        dt_bias,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        lower_bound=lower_bound,
-        beta_is_logit=beta_is_logit,
-        state_is_v_major=True,
+    final_state = torch.empty(
+        num_sequences,
+        num_value_heads,
+        v.shape[-1],
+        key_dim,
+        dtype=torch.float32,
+        device=q.device,
     )
+    out = torch.empty_like(v)
+    flash_kda_fwd()(
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
+        g_raw.contiguous(),
+        beta.contiguous(),
+        1.0 / math.sqrt(key_dim),
+        out,
+        A_log.contiguous(),
+        dt_bias.reshape(num_value_heads, key_dim).contiguous(),
+        float(lower_bound),
+        initial_state=state_in,
+        final_state=final_state,
+        cu_seqlens=boundaries,
+    )
+    return out, final_state.transpose(-1, -2)
