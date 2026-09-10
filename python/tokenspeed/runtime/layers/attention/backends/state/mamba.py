@@ -120,13 +120,12 @@ class _StateBlockIndexPlan:
 
 @dataclass(frozen=True)
 class _PrefillCheckpointBatch:
-    """One packed varlen batch containing every internal checkpoint prefix."""
+    """The last internal prefix-boundary checkpoint of each eligible request."""
 
     rows: torch.Tensor
-    rows_cpu: torch.Tensor
     sequence_starts: torch.Tensor
-    sequence_starts_cpu: torch.Tensor
     checkpoint_seq_lens: torch.Tensor
+    checkpoint_positions: torch.Tensor
     token_indices: torch.Tensor
     query_start_loc: torch.Tensor
     checkpoint_seq_lens_cpu: torch.Tensor
@@ -235,7 +234,8 @@ def compute_state_block_indices(
 
     Args:
         rows: ``[bs, max_slots]`` int32 page-id table of one state group.
-        checkpoint_granularity: Tokens between two state checkpoints (``P``).
+        checkpoint_granularity: Token span of a state-block slot (``g``),
+            independent of the prefix identity granularity.
         seq_lens_before: Per-request token count before this forward.
         seq_lens_after: Per-request token count after this forward.
         validate: Run the host-synchronizing write-side checks.
@@ -330,17 +330,23 @@ def _build_cu_extend_seq_lens_cpu(
 
 def _build_prefill_checkpoint_batch(
     extend_seq_lens_cpu: torch.Tensor,
-    checkpoint_seq_lens_cpu: torch.Tensor | None,
+    extend_prefix_lens_cpu: torch.Tensor,
+    prefix_granularity: int,
     device: torch.device | str,
 ) -> _PrefillCheckpointBatch | None:
-    """Pack all request-local checkpoint prefixes without a Python row loop."""
-    if checkpoint_seq_lens_cpu is None:
-        return None
-    if checkpoint_seq_lens_cpu.shape != extend_seq_lens_cpu.shape:
-        raise RuntimeError(
-            "checkpoint lengths disagree with extend lengths on the sequence count"
-        )
-    rows_cpu = torch.nonzero(checkpoint_seq_lens_cpu > 0).flatten()
+    """Select reusable prefix boundaries once on the host and pack their metadata.
+
+    Only extend rows participate. Prefix granularity chooses the snapshot token;
+    the state group's independent granularity maps that token to a block later.
+    """
+    if extend_seq_lens_cpu.shape != extend_prefix_lens_cpu.shape:
+        raise ValueError("extend lengths and prefix lengths must have the same shape")
+    after_cpu = extend_prefix_lens_cpu + extend_seq_lens_cpu
+    checkpoint_positions_cpu = after_cpu - after_cpu.remainder(prefix_granularity)
+    valid = (checkpoint_positions_cpu > extend_prefix_lens_cpu) & (
+        checkpoint_positions_cpu < after_cpu
+    )
+    rows_cpu = torch.nonzero(valid).flatten()
     if rows_cpu.numel() == 0:
         return None
 
@@ -352,12 +358,10 @@ def _build_prefill_checkpoint_batch(
             out=sequence_starts_cpu[1:],
         )
     selected_starts_cpu = sequence_starts_cpu.index_select(0, rows_cpu)
-    selected_lens_cpu = checkpoint_seq_lens_cpu.index_select(0, rows_cpu)
-    selected_extend_lens_cpu = extend_seq_lens_cpu.index_select(0, rows_cpu)
-    if bool((selected_lens_cpu >= selected_extend_lens_cpu).any()):
-        raise RuntimeError(
-            "prefill checkpoint prefixes must end strictly inside their extents"
-        )
+    selected_positions_cpu = checkpoint_positions_cpu.index_select(0, rows_cpu)
+    selected_lens_cpu = (
+        checkpoint_positions_cpu - extend_prefix_lens_cpu
+    ).index_select(0, rows_cpu)
     cu_seqlens_cpu = torch.zeros(selected_lens_cpu.numel() + 1, dtype=torch.int64)
     torch.cumsum(
         selected_lens_cpu.to(torch.int64),
@@ -375,14 +379,33 @@ def _build_prefill_checkpoint_batch(
         )
         + packed_offsets_cpu
     )
-    query_start_loc = cu_seqlens_cpu.to(device=device, dtype=torch.int32)
+    # One pinned upload, with typed views over its immutable per-forward storage.
+    # The host mirrors below remain necessary for scan planning without D2H reads.
+    parts = (
+        rows_cpu.to(torch.int64),
+        selected_starts_cpu.to(torch.int64),
+        selected_lens_cpu.to(torch.int64),
+        selected_positions_cpu.to(torch.int64),
+        token_indices_cpu,
+        cu_seqlens_cpu.to(torch.int32),
+    )
+    byte_sizes = tuple(part.numel() * part.element_size() for part in parts)
+    host_metadata = torch.empty(
+        sum(byte_sizes),
+        dtype=torch.uint8,
+        pin_memory=torch.device(device).type == "cuda",
+    )
+    torch.cat(tuple(part.view(torch.uint8) for part in parts), out=host_metadata)
+    uploaded = host_metadata.to(device=device, non_blocking=True)
+    rows, starts, lengths, positions, indices, query_start_loc = (
+        view.view(part.dtype) for view, part in zip(uploaded.split(byte_sizes), parts)
+    )
     return _PrefillCheckpointBatch(
-        rows=rows_cpu.to(device=device, dtype=torch.int64),
-        rows_cpu=rows_cpu,
-        sequence_starts=selected_starts_cpu.to(device=device, dtype=torch.int64),
-        sequence_starts_cpu=selected_starts_cpu,
-        checkpoint_seq_lens=selected_lens_cpu.to(device=device, dtype=torch.int64),
-        token_indices=token_indices_cpu.to(device=device, dtype=torch.int64),
+        rows=rows,
+        sequence_starts=starts,
+        checkpoint_seq_lens=lengths,
+        checkpoint_positions=positions,
+        token_indices=indices,
         query_start_loc=query_start_loc,
         checkpoint_seq_lens_cpu=selected_lens_cpu,
         cu_seqlens_cpu=cu_seqlens_cpu,
@@ -405,7 +428,6 @@ class MambaForwardMetadata:
     state_in_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_out_blocks_by_group: dict[str, torch.Tensor] | None = None
     state_checkpoint_blocks_by_group: dict[str, torch.Tensor] | None = None
-    state_checkpoint_seq_lens_cpu: torch.Tensor | None = None
     prefill_checkpoint_batch: _PrefillCheckpointBatch | None = None
 
 
@@ -555,6 +577,11 @@ class MambaAttnBackend(AttentionBackend):
         self._state_group_ids = state_group_ids
         self.state_paging_active = True
         self._checkpoint_granularity = checkpoint_granularity
+        # Prefix identity chooses which snapshot to publish; state geometry
+        # only determines its block-table slot. They need not have equal spans.
+        self._prefix_granularity = int(
+            cache_pool.arena.runtime_contract.prefix_granularity
+        )
         self._state_layer_geometry = layer_geometry
         # init_cuda_graph_state and preallocate_verify_workspace rebuild these for the new pool.
         self._verify_scratch = None
@@ -1002,10 +1029,10 @@ class MambaAttnBackend(AttentionBackend):
         after: torch.Tensor,
         block_tables: Mapping[str, torch.Tensor],
         *,
-        validate: bool | None = None,
-        checkpoint_mask: torch.Tensor,
+        validate: bool | None,
+        checkpoint_batch: _PrefillCheckpointBatch | None,
     ) -> tuple[
-        dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor]
+        dict[str, torch.Tensor], dict[str, torch.Tensor], dict[str, torch.Tensor] | None
     ]:
         """Per-state-group (state_in, state_out) page-id mappings for this
         forward from the delivered per-group tables.
@@ -1016,14 +1043,16 @@ class MambaAttnBackend(AttentionBackend):
         layers select their group's entry via
         ``pool.state_group_by_layer[layer_id]`` at forward time.
 
-        validate: explicit True/False wins; None (the hot-path default)
+        validate: explicit True/False wins; None on the hot path
         validates only under TOKENSPEED_CACHE_DEBUG=1 (the checks host-sync).
 
         Returns:
             ``(state_in_blocks, state_out_blocks, checkpoint_blocks)`` mappings
             keyed by state group id, each value an int32 ``[bs]`` page-id tensor.
             ``checkpoint_blocks`` is -1 when no additional aligned checkpoint
-            falls inside that row's prefill extent.
+            falls inside that row's prefill extent, or None when the batch has
+            no internal checkpoints (including decode). Only declared snapshot
+            positions are gathered; decode performs no checkpoint work.
         """
         if validate is None:
             validate = cache_debug_enabled()
@@ -1033,14 +1062,14 @@ class MambaAttnBackend(AttentionBackend):
         out_slots_by_width: dict[int, torch.Tensor] = {}
         state_in_blocks: dict[str, torch.Tensor] = {}
         state_out_blocks: dict[str, torch.Tensor] = {}
-        checkpoint_blocks: dict[str, torch.Tensor] = {}
-        checkpoint_after = after - torch.remainder(after, self._checkpoint_granularity)
-        has_checkpoint = (
-            checkpoint_mask & (checkpoint_after > before) & (checkpoint_after < after)
-        )
-        checkpoint_slots = torch.div(
-            checkpoint_after - 1, self._checkpoint_granularity, rounding_mode="floor"
-        ).clamp_(min=0)
+        checkpoint_blocks = None
+        if checkpoint_batch is not None:
+            checkpoint_blocks = {}
+            checkpoint_slots = torch.div(
+                checkpoint_batch.checkpoint_positions - 1,
+                self._checkpoint_granularity,
+                rounding_mode="floor",
+            )
         for group_id in self._state_group_ids:
             rows = self._state_rows(block_tables, group_id)
             table_width = rows.shape[1]
@@ -1057,20 +1086,20 @@ class MambaAttnBackend(AttentionBackend):
             )
             state_in_blocks[group_id] = state_in
             state_out_blocks[group_id] = state_out
-            checkpoint_slots_safe = checkpoint_slots.clamp(max=table_width - 1)
-            checkpoint_pages = rows.gather(
-                1, checkpoint_slots_safe.unsqueeze(1)
-            ).squeeze(1)
-            if validate and bool((checkpoint_pages[has_checkpoint] <= 0).any()):
-                raise ValueError(
-                    "state paging: aligned prefill checkpoint is a pad (-1) or hole (0) "
-                    f"({group_id!r} table)"
+            if checkpoint_batch is not None:
+                checkpoint_pages = rows[
+                    checkpoint_batch.rows, checkpoint_slots.clamp(max=table_width - 1)
+                ]
+                if validate and bool((checkpoint_pages <= 0).any()):
+                    raise ValueError(
+                        "state paging: aligned prefill checkpoint is a pad (-1) or hole (0) "
+                        f"({group_id!r} table)"
+                    )
+                checkpoint_blocks[group_id] = torch.full_like(
+                    state_out, self.pad_slot_id
+                ).index_copy_(
+                    0, checkpoint_batch.rows, checkpoint_pages.to(torch.int32)
                 )
-            checkpoint_blocks[group_id] = torch.where(
-                has_checkpoint,
-                checkpoint_pages,
-                torch.full_like(checkpoint_pages, self.pad_slot_id),
-            ).to(torch.int32)
         return state_in_blocks, state_out_blocks, checkpoint_blocks
 
     def init_forward_metadata(
@@ -1141,8 +1170,12 @@ class MambaAttnBackend(AttentionBackend):
         state_in_blocks_by_group = None
         state_out_blocks_by_group = None
         state_checkpoint_blocks_by_group = None
-        state_checkpoint_seq_lens_cpu = None
-        prefill_checkpoint_batch = None
+        prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
+            extend_seq_lens_cpu[:num_extends],
+            extend_prefix_lens_cpu[:num_extends],
+            self._prefix_granularity,
+            self.device,
+        )
         if bs > 0:
             before, after = self._extend_state_block_bounds(
                 bs, seq_lens, num_extends, extend_prefix_lens
@@ -1155,25 +1188,8 @@ class MambaAttnBackend(AttentionBackend):
                 before,
                 after,
                 block_tables,
-                checkpoint_mask=torch.arange(bs, device=after.device) < num_extends,
-            )
-            state_checkpoint_seq_lens_cpu = torch.full((bs,), -1, dtype=torch.int32)
-            if num_extends > 0:
-                prefix_cpu = extend_prefix_lens_cpu[:num_extends]
-                after_cpu = prefix_cpu + extend_seq_lens_cpu[:num_extends]
-                checkpoint_cpu = after_cpu - torch.remainder(
-                    after_cpu, self._checkpoint_granularity
-                )
-                valid = (checkpoint_cpu > prefix_cpu) & (checkpoint_cpu < after_cpu)
-                state_checkpoint_seq_lens_cpu[:num_extends] = torch.where(
-                    valid,
-                    checkpoint_cpu - prefix_cpu,
-                    torch.full_like(checkpoint_cpu, -1),
-                )
-            prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
-                extend_seq_lens_cpu,
-                state_checkpoint_seq_lens_cpu,
-                self.device,
+                validate=None,
+                checkpoint_batch=prefill_checkpoint_batch,
             )
 
         self.forward_metadata = MambaForwardMetadata(
@@ -1183,7 +1199,6 @@ class MambaAttnBackend(AttentionBackend):
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
             state_checkpoint_blocks_by_group=state_checkpoint_blocks_by_group,
-            state_checkpoint_seq_lens_cpu=state_checkpoint_seq_lens_cpu,
             prefill_checkpoint_batch=prefill_checkpoint_batch,
         )
 
@@ -1492,9 +1507,7 @@ class MambaAttnBackend(AttentionBackend):
                 *self._decode_state_block_bounds(real_bs, seq_lens),
                 block_tables,
                 validate=None,
-                checkpoint_mask=torch.zeros(
-                    real_bs, dtype=torch.bool, device=seq_lens.device
-                ),
+                checkpoint_batch=None,
             )
         in_by_group: dict[str, torch.Tensor] = {}
         out_by_group: dict[str, torch.Tensor] = {}
@@ -1588,12 +1601,13 @@ class MambaAttnBackend(AttentionBackend):
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
     ) -> None:
-        """Materialize every aligned checkpoint with one packed varlen scan.
+        """Materialize the last internal prefix checkpoint per eligible request.
 
         This correctness path reuses the selected prefill scan for the prefix
         of every eligible row, so it works for both GDN and KDA implementations.
-        All request prefixes share one kernel call rather than launching once
-        per request. A native
+        All selected request prefixes share one scan invocation rather than
+        launching a scan per request. The ordinary full-prefill scan still runs
+        separately: this is one model forward, not one recurrent scan. A native
         multi-tap kernel can replace this helper without changing the cache or
         scheduler contract.
         """

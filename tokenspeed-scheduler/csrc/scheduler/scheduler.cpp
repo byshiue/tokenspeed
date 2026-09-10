@@ -119,16 +119,13 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
     // A final sub-page tail can follow the first aligned body, or a later body
     // that also retains an input checkpoint. Bound both cases independently.
     const bool splits_final_state_checkpoint =
-        config_.state_checkpoint_prefill_mode == StateCheckpointPrefillMode::kSplitTail && config_.role != Role::kD &&
-        !config_.disable_prefix_cache;
-    const auto max_split_tail_after = [&](std::int64_t minimum_body_end) {
-        return splits_final_state_checkpoint
-                   ? std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
-                                                         max_prompt_tokens - minimum_body_end}))
-                   : 0;
+        config_.EffectiveStateCheckpointPrefillMode() == StateCheckpointPrefillMode::kSplitTail;
+    const auto max_tail_after = [&](std::int64_t minimum_body_end) {
+        return std::max<std::int64_t>(0, std::min({prefix_granularity - 1, chunk_tokens - prefix_granularity,
+                                                   max_prompt_tokens - minimum_body_end}));
     };
-    const std::int64_t max_first_chunk_tail_tokens = max_split_tail_after(prefix_granularity);
-    const std::int64_t max_later_chunk_tail_tokens = max_split_tail_after(2 * prefix_granularity);
+    const std::int64_t max_first_chunk_tail_tokens = max_tail_after(prefix_granularity);
+    const std::int64_t max_later_chunk_tail_tokens = max_tail_after(2 * prefix_granularity);
 
     std::vector<std::int64_t> group_pages(static_cast<std::size_t>(coordinator_.NumGroups()));
     for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
@@ -138,22 +135,25 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             if (group.IsSnapshotStateGroup()) {
                 if (token_limit == 0) return std::int64_t{0};
                 // Peak = retained input checkpoint (a later chunk's, or a prefix-cache hit)
-                // + endpoint + max(growth, tail). P banks no growth; overlap keeps one more
-                // decode step live. A rebased recovery prompt may exceed max_prompt_tokens.
-                const std::int64_t growth_blocks =
-                    config_.role == Role::kP
-                        ? 0
-                        : ceilDiv(std::max<std::int64_t>(block_granularity, decode_width + protected_tokens),
-                                  block_granularity);
+                // + aligned checkpoint + its materialized suffix/reserve. A split body
+                // banks max(growth, tail); a single forward holds tail AND growth.
+                // P banks no decode growth; overlap keeps one more decode step live.
+                // A rebased recovery prompt may exceed max_prompt_tokens.
+                const auto output_blocks = [&](std::int64_t tail_tokens) {
+                    const std::int64_t reserve_tokens =
+                        config_.role == Role::kP
+                            ? (splits_final_state_checkpoint ? tail_tokens : 0)
+                            : SnapshotStateReserveTokens(block_granularity,
+                                                         splits_final_state_checkpoint ? tail_tokens : 0,
+                                                         decode_width + protected_tokens);
+                    const std::int64_t suffix_tokens = splits_final_state_checkpoint ? 0 : tail_tokens;
+                    return 1 + ceilDiv(suffix_tokens + reserve_tokens, block_granularity);
+                };
                 const std::int64_t lookback = coordinator_.GroupBoundaryLookbackPages(i);
                 const std::int64_t first_chunk_peak =
-                    (config_.disable_prefix_cache ? 0 : lookback) + 1 +
-                    std::max(growth_blocks, ceilDiv(max_first_chunk_tail_tokens, block_granularity));
+                    (config_.disable_prefix_cache ? 0 : lookback) + output_blocks(max_first_chunk_tail_tokens);
                 const std::int64_t later_chunk_peak =
-                    max_prompt_tokens > chunk_tokens
-                        ? lookback + 1 +
-                              std::max(growth_blocks, ceilDiv(max_later_chunk_tail_tokens, block_granularity))
-                        : 0;
+                    max_prompt_tokens > chunk_tokens ? lookback + output_blocks(max_later_chunk_tail_tokens) : 0;
                 return std::max(first_chunk_peak, later_chunk_peak);
             }
             // Across every prompt up to max_prompt_tokens, retain the largest

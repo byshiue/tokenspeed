@@ -101,6 +101,11 @@ For example, after a 50,432-token cache hit with an 868-token extent and
 `split_tail` schedules `[768, 100]`. The switch is process-wide and requires a
 restart; invalid or empty values fail startup.
 
+`SchedulerConfig::EffectiveStateCheckpointPrefillMode()` is the single resolver
+for role, prefix-cache, and snapshot-group eligibility. Planning, the startup
+capacity bound, and the Python startup log use that same result; the log retains
+both requested and effective modes without duplicating the eligibility rules.
+
 Admission allocates the sparse state suffix beginning at the aligned checkpoint
 when one falls inside the chunk. In `single_forward` it includes the final
 state page and ordinary decode reserve atomically. In `split_tail`, the body
@@ -129,8 +134,8 @@ The capacity guarantees still apply in both modes:
   the history group's to the prompt headroom) and the state groups
   `max(block_granularity, tail, decode)` — never less than the tail, never a
   headroom-sized token reserve.
-- **Tail splitting is bound to snapshot-state groups.** Without
-  `HasMambaStateGroup()`, the caller passes `kSingleForward` to the planner;
+- **Tail splitting is bound to snapshot-state groups.** Without snapshot-state
+  groups, the effective mode passed to the planner is `kSingleForward`;
   a pure-KV model never banks a tail and holds the head of line until its final
   chunk. Extending tail reservation there would need its own capacity bound.
 - **Every state group banks one growth block at the admission that finishes
@@ -158,6 +163,19 @@ recovery the retained input checkpoint (and, with the prefix cache on, a first
 chunk's cached one) — fits the pool. It is not a live
 check against currently free capacity; a prompt within the bound can still fail
 admission right now and simply waits.
+
+For an internal checkpoint followed by `tail` tokens, `single_forward` holds
+both the tail and the ordinary growth reserve: the output working set is
+`1 + ceil((tail + reserve) / block_granularity)` blocks. A `split_tail` body
+instead banks `max(tail, growth)` beyond its checkpoint. Admission and the
+capacity bound share `SnapshotStateReserveTokens` for that reservation rule.
+The retained input is additional. With ordinary decode and equal prefix/state
+grains, an unaligned finishing chunk can therefore need four state blocks,
+not three. This also applies to local recovery on a decode node, and to
+single-forward execution with prefix caching disabled. Narrower state blocks
+must count the entire materialized suffix, not assume that two outputs always
+occupy two adjacent slots. Tests cover small pools that must reject an oversized
+request instead of accepting a request that can never produce a forward.
 
 ## 2. Retraction: when admission fails
 

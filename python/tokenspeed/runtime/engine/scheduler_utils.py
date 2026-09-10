@@ -77,23 +77,6 @@ class SchedulerCacheGeometry:
     token_capacity: int
 
 
-def effective_state_checkpoint_prefill_mode(
-    requested: StateCheckpointPrefillMode,
-    cache_groups: Sequence["CacheGroupConfig"],
-    prefix_cache_enabled: bool,
-    role: str,
-) -> StateCheckpointPrefillMode:
-    """Resolve whether split-tail planning can affect this scheduler."""
-    has_snapshot_state_group = any(
-        group.family == CacheGroupFamily.State
-        and group.retention == CacheRetention.FullHistory
-        for group in cache_groups
-    )
-    if has_snapshot_state_group and prefix_cache_enabled and role != "decode":
-        return requested
-    return StateCheckpointPrefillMode.SINGLE_FORWARD
-
-
 def scheduler_cache_geometry_from_pool(pool: Any) -> SchedulerCacheGeometry:
     """Project the arena's published contract onto scheduler page counts.
 
