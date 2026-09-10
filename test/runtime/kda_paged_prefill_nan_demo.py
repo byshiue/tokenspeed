@@ -122,6 +122,7 @@ def _run_case(
     result = kda_paged_prefill(
         *operator_inputs,
         *parameters,
+        out=None,
         initial_state=recurrent_state,
         cu_seqlens=cu_seqlens,
         lower_bound=LOWER_BOUND,

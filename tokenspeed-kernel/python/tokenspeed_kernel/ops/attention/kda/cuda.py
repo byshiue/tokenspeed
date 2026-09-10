@@ -63,7 +63,9 @@ __all__ = ["flash_kda_chunk_prefill", "is_flash_kda_installed"]
     tags={"nvidia", "paged_cache"},
 )
 def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
-    return _nvidia_kda_prefill(flash_kda_chunk_prefill, **kwargs)
+    return _nvidia_kda_prefill(
+        flash_kda_chunk_prefill, implementation_kwargs={}, **kwargs
+    )
 
 
 def flash_kda_chunk_prefill(
