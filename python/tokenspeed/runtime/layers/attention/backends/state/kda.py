@@ -53,6 +53,7 @@ from tokenspeed_kernel.ops.attention.triton.verify_state_blocks import (
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
+from tokenspeed.runtime.execution.breakable_cuda_graph import current_break_output
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     logger,
@@ -912,6 +913,23 @@ class KdaAttnBackend(MambaAttnBackend):
                 "batch"
             )
 
+        scan_boundaries = self.forward_metadata.query_start_loc_int64
+        if scan_boundaries is None:
+            raise RuntimeError("KDA prefill requires metadata-built int64 boundaries")
+        # The scan is the terminal producer of this attention break. Its live
+        # token prefix can land directly in the following graph's stable input.
+        # Other enclosing breaks may have a different output geometry; retain
+        # their ordinary copy handoff rather than borrowing an incompatible view.
+        handoff = current_break_output()
+        out = None
+        if (
+            handoff is not None
+            and handoff.shape == (seq_len, num_value_heads, value.shape[-1])
+            and handoff.dtype == value.dtype
+            and handoff.device == value.device
+            and handoff.is_contiguous()
+        ):
+            out = handoff[:num_real_tokens].unsqueeze(0)
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -921,11 +939,12 @@ class KdaAttnBackend(MambaAttnBackend):
             A_log,
             dt_bias,
             initial_state=recurrent_state,
-            cu_seqlens=query_start_loc,
+            cu_seqlens=scan_boundaries,
             cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
             recurrent_layout=self.kda_recurrent_layout,
+            out=out,
         )
 
         return kda_result.out.squeeze(0), kda_result.final_state

@@ -480,6 +480,71 @@ round can never be armed on one side and drained on the other. Model-side
 capture wiring (`set_dflash_layers_to_capture`) is static — which layers,
 in which tap order — and carries no per-round state.
 
+## Shared prefill convolution preparation
+
+Mamba/KDA extend metadata owns one immutable `CausalConv1dPrefillMetadata`
+per forward. Its two int32 maps associate convolution programs with request
+rows and local token chunks. The builder sizes them from the existing host
+length mirror and fills both directly from device query boundaries in one
+Triton launch. Every layer reads the same tensors and block size; the conv
+wrapper neither rebuilds them nor initializes/uploads per-layer scratch.
+This is transient execution metadata, not a new cache group or model state.
+
+The same extend/mixed metadata owns a device int64 mirror of the int32
+query boundaries. KDA layers share it for scan ABIs instead of casting
+per layer; the host int64 mirror still supplies launch planning without
+D2H. Decode refresh/capture does not allocate this prefill-only mirror.
+
+Each metadata build allocates fresh index storage, including when two
+forwards have the same total token count but different request partitions.
+No subsequent forward refills a buffer an earlier forward may still read.
+Mixed batches include the decode rows' verify-token lengths in this same
+builder. Decode-only refresh/capture remains unchanged and carries no
+prefill convolution schedule. Breakable prefill graphs consume the live
+metadata in the eager attention break, as ordinary eager forwards do.
+
+Prefill state staging fuses resumed conv-window copying, recurrent-state
+gather/zero, and history flags in one kernel. It preserves scheduler-owned
+block ids and arbitrary cache strides. Fresh rows never read null or stale
+recurrent state; their conv working windows remain unchanged. Shared input
+snapshots are read-only, output blocks are unique, and a private in-place
+source/destination is legal. This changes neither scan arithmetic nor cache
+allocation, retention, or checkpoint identity.
+
+The NVIDIA CuteDSL prefill adapter declares its native `v_major`
+(`[N, H, V, K]`) state layout. The dispatch facade alone adapts a caller
+with another layout; the wrapper must not round-trip native state through
+FLA's `[N, H, K, V]` convention. Direct wrapper callers use the native
+layout for both initial and final state. Token-major gate conversion to
+FP32 and strided beta packing share one kernel, preserving their values.
+Neither change modifies the native scan, its gate math, or GEMM arithmetic.
+
+## Prefill graph output destinations
+
+The breakable graph owns each eager break's stable handoff buffer. During
+replay it publishes that destination only for the duration of the break,
+through `current_break_output()`; first capture and ordinary eager execution
+return None. Attention backends do not cache it or allocate another persistent
+output pool. A terminal producer may use a compatible leading view as its
+output, never as intermediate storage. An incompatible enclosing break retains
+the existing result-copy handoff. A nested decorated break masks its parent's
+destination even when their output geometries match: an inner result may still
+be live when another inner producer runs.
+
+KDA prefill passes a contiguous live-token view through the same dispatch API
+used without graphs. The CuteDSL adapter can pass that destination to an
+output-buffer-capable native Python wrapper; older wheels and other selected
+solutions retain a copy fallback. The wrapper extension changes allocation
+and output-pointer plumbing only, not scan arithmetic or native binaries.
+
+The graph's landing check recognizes an exact leading alias by shape, dtype,
+device, strides and pointer, not Python identity alone. It must not skip a
+copy for a transpose or dtype reinterpretation at the same address. Padding
+cleanup remains graph-owned and runs after the producer, including the direct
+write case. Same-shaped breaks may share a destination only with the existing
+strictly sequential output lifetimes; graph-pool reuse and bucket switching
+must not extend a borrowed view's lifetime beyond its break.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path

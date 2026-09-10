@@ -84,6 +84,7 @@ def test_kda_prefill_relayouts_only_for_declaring_kernels(
         cu_seqlens=torch.tensor([0, 1]),
         cu_seqlens_cpu=torch.tensor([0, 1], dtype=torch.int64),
         recurrent_layout="v_major",
+        out=None,
     )
 
     if expect_relayout:
@@ -683,19 +684,22 @@ def test_nvidia_kda_verify_and_decode_registration_traits(
 
 
 @pytest.mark.parametrize(
-    "kernel_name",
+    ("kernel_name", "layout", "output_buffer"),
     [
-        "triton_nvidia_kda_paged_prefill",
-        "flashkda_nvidia_kda_paged_prefill",
-        "cutedsl_kda_nvidia_paged_prefill",
+        ("triton_nvidia_kda_paged_prefill", "k_major", False),
+        ("flashkda_nvidia_kda_paged_prefill", "k_major", False),
+        ("cutedsl_kda_nvidia_paged_prefill", "v_major", True),
     ],
 )
-def test_nvidia_kda_prefill_kernels_declare_k_major(kernel_name) -> None:
+def test_nvidia_kda_prefill_kernels_declare_native_contract(
+    kernel_name, layout, output_buffer
+) -> None:
     """kda_paged_prefill relayouts only for kernels that declare a layout;
     a dropped declaration silently hands them the V-major state as-is."""
     spec = KernelRegistry.get().get_by_name(kernel_name)
     assert spec is not None, kernel_name
-    assert spec.traits.get("recurrent_layout") == frozenset({"k_major"}), kernel_name
+    assert spec.traits.get("recurrent_layout") == frozenset({layout}), kernel_name
+    assert (True in spec.traits.get("output_buffer", ())) == output_buffer
 
 
 def test_kda_replay_supported_on_the_nvidia_serving_platform(b300_platform) -> None:
@@ -965,6 +969,7 @@ def test_kda_paged_prefill_preserves_native_state_layout() -> None:
         initial_state=state,
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens.to("cpu", torch.int64),
+        out=None,
     )
 
     torch.testing.assert_close(

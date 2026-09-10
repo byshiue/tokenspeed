@@ -449,6 +449,7 @@ def _nvidia_kda_prefill(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
     lower_bound: float | None,
+    implementation_kwargs: dict,
 ) -> KdaPrefillResult:
     out, final_state = implementation(
         q,
@@ -463,6 +464,7 @@ def _nvidia_kda_prefill(
         cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
         beta_is_logit=True,
+        **implementation_kwargs,
     )
     return KdaPrefillResult(out, final_state)
 
@@ -633,7 +635,7 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
 
     # The host boundaries feed FLA's chunk-index prep so it plans without a
     # stream-synchronizing D2H read of the varlen boundaries.
-    return _nvidia_kda_prefill(kda_chunk_prefill, **kwargs)
+    return _nvidia_kda_prefill(kda_chunk_prefill, implementation_kwargs={}, **kwargs)
 
 
 @register_kernel(
@@ -650,7 +652,9 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
 def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.flash_kda import flash_kda_chunk_prefill
 
-    return _nvidia_kda_prefill(flash_kda_chunk_prefill, **kwargs)
+    return _nvidia_kda_prefill(
+        flash_kda_chunk_prefill, implementation_kwargs={}, **kwargs
+    )
 
 
 @register_kernel(
@@ -661,10 +665,17 @@ def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
+    traits={
+        "recurrent_layout": frozenset({"v_major"}),
+        "output_buffer": frozenset({True}),
+    },
     tags={"nvidia", "paged_cache"},
 )
-def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
+def cutedsl_kda_nvidia_paged_prefill(
+    *, out: torch.Tensor | None, **kwargs
+) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.cutedsl_kda import cutedsl_kda_chunk_prefill
 
-    return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill, **kwargs)
+    return _nvidia_kda_prefill(
+        cutedsl_kda_chunk_prefill, implementation_kwargs={"out": out}, **kwargs
+    )

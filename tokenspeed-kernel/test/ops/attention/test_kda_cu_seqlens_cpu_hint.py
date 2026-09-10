@@ -91,6 +91,7 @@ def test_hint_reaches_wrapper_calls(stubbed_wrapper):
         a_log,
         dt_bias,
         initial_state=None,
+        out=None,
         cu_seqlens=cu,
         cu_seqlens_cpu=hint,
         lower_bound=-5.0,
@@ -115,6 +116,7 @@ def test_hint_length_mismatch_raises(stubbed_wrapper):
             a_log,
             dt_bias,
             initial_state=None,
+            out=None,
             cu_seqlens=cu,
             cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int64),
             lower_bound=-5.0,
@@ -133,6 +135,7 @@ def test_batch_fallback_synthesizes_hint(stubbed_wrapper):
         a_log,
         dt_bias,
         initial_state=None,
+        out=None,
         cu_seqlens=None,
         lower_bound=-5.0,
     )
@@ -168,6 +171,7 @@ def test_dispatch_always_forwards_host_boundaries():
         cu_seqlens=cu,
         cu_seqlens_cpu=cu_cpu,
         lower_bound=-5.0,
+        implementation_kwargs={},
     )
     assert calls[-1]["cu_seqlens_cpu"] is cu_cpu
 
@@ -190,7 +194,10 @@ def test_facade_requires_host_boundaries(monkeypatch):
     cu = torch.tensor([0, T], dtype=torch.int32)
     cu_cpu = torch.tensor([0, T], dtype=torch.int64)
     common = dict(
-        initial_state=torch.zeros(1, HV, K, V), cu_seqlens=cu, lower_bound=-5.0
+        initial_state=torch.zeros(1, HV, K, V),
+        cu_seqlens=cu,
+        lower_bound=-5.0,
+        out=None,
     )
 
     with pytest.raises(TypeError):
