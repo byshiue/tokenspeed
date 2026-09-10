@@ -32,6 +32,7 @@ wrapper call, entirely on CPU with the wrapper entry points stubbed out.
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.attention.kda.cuda as flash_op
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
@@ -69,7 +70,8 @@ def stubbed_wrapper(monkeypatch):
     def fake_forward(q, k, v, g, a_log, dt_bias, beta, boundaries, state, **kw):
         seen["fwd_cu_seqlens_cpu"] = kw.get("cu_seqlens_cpu")
         seen["boundaries"] = boundaries
-        return v.clone(), state.transpose(-1, -2).clone()
+        seen["state"] = state
+        return v.clone(), state.clone()
 
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_check_config", fake_check_config)
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_workspace_size", fake_workspace_size)
@@ -99,6 +101,67 @@ def test_hint_reaches_wrapper_calls(stubbed_wrapper):
     assert stubbed_wrapper["ws_cu_seqlens_cpu"] is hint
     assert stubbed_wrapper["fwd_cu_seqlens_cpu"] is hint
     assert stubbed_wrapper["boundaries"].dtype == torch.int64
+
+
+def test_native_v_major_wrapper_reuses_state_and_int64_boundaries(stubbed_wrapper):
+    q, k, v, g, beta, a_log, dt_bias = _inputs()
+    boundaries = torch.tensor([0, T], dtype=torch.int64)
+    host_boundaries = torch.tensor([0, T], dtype=torch.int64)
+    state = torch.zeros(1, HV, V, K, dtype=torch.float32)
+
+    cutedsl_op.cutedsl_kda_chunk_prefill_v_major(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a_log,
+        dt_bias,
+        initial_state=state,
+        cu_seqlens=boundaries,
+        cu_seqlens_cpu=host_boundaries,
+        lower_bound=-5.0,
+        beta_is_logit=True,
+    )
+
+    assert stubbed_wrapper["boundaries"] is boundaries
+    assert stubbed_wrapper["state"] is state
+
+
+def test_flash_native_v_major_wrapper_reuses_state_and_int64_boundaries(monkeypatch):
+    seen: dict = {}
+
+    def fake_flash_kda_fwd():
+        def fake_forward(*args, **kwargs):
+            seen["state"] = kwargs["initial_state"]
+            seen["boundaries"] = kwargs["cu_seqlens"]
+
+        return fake_forward
+
+    monkeypatch.setattr(flash_op, "flash_kda_fwd", fake_flash_kda_fwd)
+    q, k, v, g, beta, a_log, dt_bias = _inputs()
+    boundaries = torch.tensor([0, T], dtype=torch.int64)
+    host_boundaries = torch.tensor([0, T], dtype=torch.int64)
+    state = torch.zeros(1, HV, V, K, dtype=torch.float32)
+
+    _, final_state = flash_op.flash_kda_chunk_prefill_v_major(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        a_log,
+        dt_bias,
+        initial_state=state,
+        cu_seqlens=boundaries,
+        cu_seqlens_cpu=host_boundaries,
+        lower_bound=-5.0,
+        beta_is_logit=True,
+    )
+
+    assert seen["state"] is state
+    assert seen["boundaries"] is boundaries
+    assert final_state.shape == state.shape
 
 
 def test_hint_length_mismatch_raises(stubbed_wrapper):
@@ -212,8 +275,10 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     import tokenspeed_kernel.ops.attention.kda.triton as kd_triton
 
     received = []
+    implementations = []
 
     def fake_prefill(implementation, *args, **kwargs):
+        implementations.append(implementation.__name__)
         received.append(kwargs)
         return KdaPrefillResult(
             out=torch.zeros(1, T, HV, V), final_state=torch.zeros(1, HV, K, V)
@@ -243,3 +308,8 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
 
     kd_cuda.flashkda_nvidia_kda_paged_prefill(**dict(kwargs))
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
+    assert implementations[-1] == "flash_kda_chunk_prefill_v_major"
+
+    kd.cutedsl_kda_nvidia_paged_prefill(**dict(kwargs))
+    assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
+    assert implementations[-1] == "cutedsl_kda_chunk_prefill_v_major"
