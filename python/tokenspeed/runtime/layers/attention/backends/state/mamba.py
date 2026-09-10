@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -293,6 +293,8 @@ def _build_cu_extend_seq_lens_cpu(
         RuntimeError: the lengths disagree with ``query_start_loc`` on the
             sequence count.
     """
+    if extend_seq_lens_cpu is None:
+        raise RuntimeError("host extend lengths are required for prefill")
     if extend_seq_lens_cpu.numel() + 1 != expected_len:
         raise RuntimeError(
             "host extend lengths disagree with query_start_loc on the "
@@ -391,6 +393,10 @@ def _build_prefill_checkpoint_batch(
 @dataclass
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
+    # Boundary tensor used by the recurrent prefill scan. It aliases the
+    # int32 convolution boundary for GDN and is a once-per-forward int64 copy
+    # for KDA backends whose native wrapper and launch-plan memo use int64.
+    scan_query_start_loc: torch.Tensor | None
     mamba_output_indices: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
     # Host int64 prefix sum of extend_seq_lens_cpu, equal to
@@ -1031,7 +1037,8 @@ class MambaAttnBackend(AttentionBackend):
             if tokens_per_req > 1:
                 set_total_chunks_hint_uniform(bs, tokens_per_req, query_start_loc)
             self.forward_metadata = MambaForwardMetadata(
-                query_start_loc=query_start_loc
+                query_start_loc=query_start_loc,
+                scan_query_start_loc=query_start_loc,
             )
             return
 
@@ -1065,6 +1072,16 @@ class MambaAttnBackend(AttentionBackend):
             self._prefix_granularity,
             self.device,
         )
+        scan_query_start_loc = self._prepare_prefill_scan_query_start_loc(
+            query_start_loc
+        )
+        if prefill_checkpoint_batch is not None:
+            prefill_checkpoint_batch = replace(
+                prefill_checkpoint_batch,
+                query_start_loc=self._prepare_prefill_scan_query_start_loc(
+                    prefill_checkpoint_batch.query_start_loc
+                ),
+            )
         if bs > 0:
             before, after = self._extend_state_block_bounds(
                 bs, seq_lens, num_extends, extend_prefix_lens
@@ -1083,6 +1100,7 @@ class MambaAttnBackend(AttentionBackend):
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
+            scan_query_start_loc=scan_query_start_loc,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             state_in_blocks_by_group=state_in_blocks_by_group,
@@ -1191,6 +1209,7 @@ class MambaAttnBackend(AttentionBackend):
         self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
+            scan_query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_output_indices=mamba_output_indices,
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
@@ -1322,6 +1341,7 @@ class MambaAttnBackend(AttentionBackend):
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
+            scan_query_start_loc=self.query_start_loc_list[bs - 1],
             mamba_output_indices=mamba_output_indices,
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
@@ -1864,6 +1884,7 @@ class MambaAttnBackend(AttentionBackend):
         )
 
         query_start_loc = self.forward_metadata.query_start_loc
+        scan_query_start_loc = self.forward_metadata.scan_query_start_loc
 
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
@@ -2036,13 +2057,13 @@ class MambaAttnBackend(AttentionBackend):
                 lower_bound=gate_lower_bound,
             )
             if extend_seq_lens_cpu is not None:
-                set_total_chunks_hint(extend_seq_lens_cpu, query_start_loc)
+                set_total_chunks_hint(extend_seq_lens_cpu, scan_query_start_loc)
             core_attn_out, last_recurrent_state = self._prefill_scan(
                 query,
                 key,
                 value,
                 recurrent_state,
-                query_start_loc,
+                scan_query_start_loc,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 a=a,
@@ -2302,3 +2323,9 @@ class MambaAttnBackend(AttentionBackend):
             output_h=False,
         )
         return gdn_result.out, gdn_result.final_state
+
+    def _prepare_prefill_scan_query_start_loc(
+        self, query_start_loc: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the device boundary tensor consumed by prefill scans."""
+        return query_start_loc

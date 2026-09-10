@@ -591,13 +591,15 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
+    traits={"recurrent_layout": frozenset({"v_major"})},
     tags={"nvidia", "paged_cache"},
 )
 def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
-    from tokenspeed_kernel.ops.attention.flash_kda import flash_kda_chunk_prefill
+    from tokenspeed_kernel.ops.attention.flash_kda import (
+        flash_kda_chunk_prefill_v_major,
+    )
 
-    return _nvidia_kda_prefill(flash_kda_chunk_prefill, **kwargs)
+    return _nvidia_kda_prefill(flash_kda_chunk_prefill_v_major, **kwargs)
 
 
 @register_kernel(
@@ -608,10 +610,12 @@ def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"k_major"})},
+    traits={"recurrent_layout": frozenset({"v_major"})},
     tags={"nvidia", "paged_cache"},
 )
 def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
-    from tokenspeed_kernel.ops.attention.cutedsl_kda import cutedsl_kda_chunk_prefill
+    from tokenspeed_kernel.ops.attention.cutedsl_kda import (
+        cutedsl_kda_chunk_prefill_v_major,
+    )
 
-    return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill, **kwargs)
+    return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill_v_major, **kwargs)

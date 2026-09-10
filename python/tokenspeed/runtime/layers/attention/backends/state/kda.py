@@ -864,3 +864,12 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
         return kda_result.out.squeeze(0), kda_result.final_state
+
+    @override
+    def _prepare_prefill_scan_query_start_loc(
+        self, query_start_loc: torch.Tensor
+    ) -> torch.Tensor:
+        """Materialize one reusable native KDA boundary per forward."""
+        if query_start_loc.dtype == torch.int64:
+            return query_start_loc
+        return query_start_loc.to(torch.int64)

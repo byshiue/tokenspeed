@@ -384,6 +384,22 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.assertEqual(len({part.untyped_storage().data_ptr() for part in parts}), 1)
         self.assertEqual(self.plan.query_start_loc.dtype, self.torch.int32)
 
+    def test_kda_boundary_preparation_reuses_int64_input(self):
+        from tokenspeed.runtime.layers.attention.backends.state.kda import (
+            KdaAttnBackend,
+        )
+
+        boundary = self.torch.tensor([0, 2, 6], dtype=self.torch.int32)
+        converted = KdaAttnBackend._prepare_prefill_scan_query_start_loc(
+            object(), boundary
+        )
+        self.assertEqual(converted.dtype, self.torch.int64)
+        self.assertEqual(converted.tolist(), boundary.tolist())
+        self.assertIs(
+            KdaAttnBackend._prepare_prefill_scan_query_start_loc(object(), converted),
+            converted,
+        )
+
     def test_cuda_metadata_upload_does_not_synchronize(self):
         from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             _build_prefill_checkpoint_batch,
