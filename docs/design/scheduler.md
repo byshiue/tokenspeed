@@ -113,12 +113,15 @@ secures the dependent endpoint and the tail consumes it without reshaping the
 sparse table. Only materialized aligned checkpoints are cached; an off-page
 endpoint is never keyed as a complete prefix.
 
-Within one forward, the runtime packs every request's aligned prefix into one
-variable-length checkpoint batch. Conv snapshots use one batched gather/write,
-and recurrent snapshots use one checkpoint scan for the whole batch; the
-ordinary full-prefill scan still produces final outputs and continuation state.
-The checkpoint work is therefore intentionally recomputed, but its kernel count
-does not grow with the number of requests.
+Within one forward, the runtime prepares one variable-length body/tail plan for
+the whole batch. Conv snapshots use one batched gather/write, while recurrent
+execution uses two batched phases: a body scan stops crossing rows at the
+aligned checkpoint (and completes all other rows), then a tail scan continues
+only crossing rows from the body final state. Their outputs are merged in
+original token order. Thus every recurrent token is evaluated once: the
+50,432 + 868 example scans 768 body tokens plus 100 tail tokens, rather than a
+768-token checkpoint prefix plus a repeated 868-token full scan. The scheduler
+still submits one 868-token forward and carries no body/tail execution metadata.
 
 The two modes share admission, operation construction, dispatch, and result
 handling. A normal incomplete prefill holds the head of line. A split body may
