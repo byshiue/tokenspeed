@@ -112,6 +112,16 @@ folder.
 - **PyTorch reference** — under `numerics/reference/`; never auto-selects
   over a real backend but always available as ground truth
 
+### FP8 prepared-scale numerics
+
+The FlashInfer block-FP8 prepared-scale quantizer uses FP32 round-to-nearest
+divisions in its padded path, matching the aligned CUDA path. This avoids
+rounding-induced changes at FP8 bin boundaries when the row count switches
+implementations. Backend zero/small-group scale floors can still differ;
+all-zero groups dequantize to zero with either positive scale. This local
+fix does not guarantee bitwise equivalence of different GEMM or
+attention-reduction algorithms.
+
 Overall we carefully curate external dependencies and actively re-evaluate
 their inclusion, in order to maintain minimal dependencies and enable faster
 iteration.

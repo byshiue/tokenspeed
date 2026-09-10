@@ -201,10 +201,12 @@ def _per_token_group_quant_8bit_padded_colmajor(
 
     y = tl.load(y_ptr + offsets, mask=col_mask, other=0.0).to(tl.float32)
     amax = tl.max(tl.abs(y))
-    # Match TRT-LLM's scale_1x128_kernel: an all-zero group uses a neutral
-    # scale of one, while every other group uses amax / FP8_MAX.
-    y_s_inv = tl.where(amax == 0.0, 1.0, bit8_max / amax)
-    y_s = 1.0 / y_s_inv
+    # All-zero groups retain a neutral scale of one. For nonzero groups,
+    # the aligned-row CUDA path uses round-to-nearest FP32 division. Triton's
+    # approximate division can cross an FP8 rounding boundary for identical
+    # input groups, making quantization depend on whether M needs padding.
+    y_s_inv = tl.where(amax == 0.0, 1.0, tl.div_rn(bit8_max, amax))
+    y_s = tl.div_rn(1.0, y_s_inv)
     y_q = tl.clamp(y * y_s_inv, bit8_min, bit8_max).to(y_q_ptr.dtype.element_ty)
 
     tl.store(y_q_ptr + offsets, y_q, mask=col_mask)
