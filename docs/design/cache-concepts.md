@@ -181,6 +181,13 @@ and final states are both retained. Batch size one uses zero-copy body/tail
 views; larger batches use the same batched pack/scatter contract. This split
 does not change cache ownership or scheduler metadata.
 
+The body/tail split uses the existing prefill-op state-layout contract. KDA
+solutions may retain their original K-major Python adapters; the kernel facade
+converts between that layout and the runtime's V-major state slab on both scans.
+Native-layout adapter entry points are not required for checkpoint continuation.
+KDA's int64 sequence boundaries are still prepared once in runtime metadata and
+reused by the original adapters.
+
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
 replaying the accepted prefix from the committed page. The Kimi-K3 recipe
