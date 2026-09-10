@@ -157,6 +157,18 @@ checkpoints as null holes (`0`). State consumers may gather only the declared
 input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
+Publication requires provenance, not just an allocated block or completed hash.
+The request's cache progress records the last aligned boundary materialized by
+local prefill, carried through the same ordered-forward contract as its token
+progress. Decode does not advance that record: verification commits only the
+accepted endpoint and may skip an aligned boundary. Admission, finish and
+retraction pass this provenance to the coordinator. A snapshot is publishable
+only when the exact accepted endpoint equals the hashed boundary, or that exact
+boundary has prefill materialization provenance. The conservative admission
+frontier (which subtracts the verify width) is not an exact state endpoint.
+Remote endpoint-only landings
+do not claim an internal prefill checkpoint.
+
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at
 `floor(after / prefix_granularity) * prefix_granularity`, strictly between
@@ -187,6 +199,11 @@ converts between that layout and the runtime's V-major state slab on both scans.
 Native-layout adapter entry points are not required for checkpoint continuation.
 KDA's int64 sequence boundaries are still prepared once in runtime metadata and
 reused by the original adapters.
+
+Scan results may be transposed views in that public state layout. The batched
+input packer addresses recurrent-state rows and features using their actual
+strides, including on CUDA graph replay; it does not require an extra
+contiguous copy or a different kernel adapter.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by

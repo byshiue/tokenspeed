@@ -113,6 +113,16 @@ secures the dependent endpoint and the tail consumes it without reshaping the
 sparse table. Only materialized aligned checkpoints are cached; an off-page
 endpoint is never keyed as a complete prefix.
 
+`CacheProgress::materialized_state_boundary_tokens` records the aligned
+boundary produced by the admitted local prefill. Publication of the preceding
+forward uses the old record before the next prefill advances it. Speculative
+decode preserves the record rather than claiming every crossed token boundary.
+The coordinator checks this exact boundary on admission, finish and retraction;
+an aligned accepted endpoint remains publishable without an internal snapshot.
+`Request::MaterializedStateBoundaryTokens()` resolves that endpoint from
+accepted feedback, not the conservative admission frontier. Capacity and
+retention continue to use their existing conservative token progress.
+
 Within one forward, the runtime prepares one variable-length body/tail plan for
 the whole batch. Conv snapshots use one batched gather/write, while recurrent
 execution uses two batched phases: a body scan stops crossing rows at the

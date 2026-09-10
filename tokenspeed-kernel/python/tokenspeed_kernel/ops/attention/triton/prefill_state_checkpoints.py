@@ -228,6 +228,8 @@ def _pack_prefill_recurrent_inputs_kernel(
     key_stride: tl.constexpr,
     value_stride: tl.constexpr,
     state_stride: tl.constexpr,
+    state_shape: tl.constexpr,
+    state_feature_strides: tl.constexpr,
     a_stride: tl.constexpr,
     b_stride: tl.constexpr,
     g_stride: tl.constexpr,
@@ -284,9 +286,19 @@ def _pack_prefill_recurrent_inputs_kernel(
     feature = offsets % state_width
     mask = (row < num_rows) & (feature < state_width)
     source_row = tl.load(rows + row, mask=mask, other=0)
+    state_feature_offset = tl.full((BLOCK,), 0, tl.int32)
+    remaining_feature = feature
+    for dim in tl.static_range(len(state_shape) - 1, -1, -1):
+        state_feature_offset += (
+            remaining_feature % state_shape[dim]
+        ) * state_feature_strides[dim]
+        remaining_feature = remaining_feature // state_shape[dim]
     tl.store(
         recurrent_state_out + row * state_width + feature,
-        tl.load(recurrent_state + source_row * state_stride + feature, mask=mask),
+        tl.load(
+            recurrent_state + source_row * state_stride + state_feature_offset,
+            mask=mask,
+        ),
         mask=mask,
     )
 
@@ -381,7 +393,8 @@ def pack_prefill_recurrent_checkpoint_inputs(
         query: Query tensor with token dimension 1.
         key: Key tensor with token dimension 1.
         value: Value tensor with token dimension 1.
-        recurrent_state: Per-request initial recurrent states.
+        recurrent_state: Per-request initial recurrent states. Row and feature
+            strides may be noncontiguous, including transposed scan results.
         rows: Request rows selected for checkpoint scans.
         token_indices: Source-token indices for all selected checkpoint prefixes.
         a: Optional token-major GDN scan input.
@@ -427,12 +440,12 @@ def pack_prefill_recurrent_checkpoint_inputs(
 
     tensors = (query, key, value, recurrent_state, *optional_inputs)
     token_dims = (1, 1, 1, 0, 0, 0, 0, 0, 0)
-    for tensor, token_dim in zip(tensors, token_dims):
+    for index, (tensor, token_dim) in enumerate(zip(tensors, token_dims)):
         if tensor is None:
             continue
         if token_dim == 1 and tensor.shape[0] != 1:
             raise ValueError("checkpoint pack query/key/value batch size must be 1")
-        if not tensor.select(token_dim, 0).is_contiguous():
+        if index != 3 and not tensor.select(token_dim, 0).is_contiguous():
             raise ValueError("checkpoint pack inputs must have dense row features")
     strides = tuple(
         1 if tensor is None else tensor.stride(token_dim)
@@ -487,6 +500,8 @@ def pack_prefill_recurrent_checkpoint_inputs(
         key_stride=strides[1],
         value_stride=strides[2],
         state_stride=strides[3],
+        state_shape=tuple(recurrent_state.shape[1:]),
+        state_feature_strides=tuple(recurrent_state.stride()[1:]),
         a_stride=strides[4],
         b_stride=strides[5],
         g_stride=strides[6],

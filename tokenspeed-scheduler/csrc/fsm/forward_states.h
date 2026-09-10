@@ -47,6 +47,10 @@ struct CacheProgress {
     // Storage for the final request-local state tail was secured atomically
     // with the preceding aligned body.
     bool state_checkpoint_tail_pending{false};
+    // Last aligned state boundary produced by scheduled local prefill. The
+    // ordered forward stream materializes it before subsequent publication.
+    // Decode must not advance this: verify commits only its accepted endpoint.
+    std::int32_t materialized_state_boundary_tokens{0};
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

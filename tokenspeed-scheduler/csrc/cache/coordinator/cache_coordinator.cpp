@@ -486,7 +486,8 @@ void CacheCoordinator::QueueLatestSnapshotBlocksForStore(std::span<const std::st
 void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::span<const std::string> prefix_hashes,
                                             std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
                                             std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
-                                            bool stream_completed_to_host) {
+                                            bool stream_completed_to_host,
+                                            std::int32_t materialized_state_boundary_tokens) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -498,6 +499,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
             .completed_boundary_kind = boundary_kind,
             .num_computed_tokens = num_computed_tokens,
             .stream_completed_to_host = stream_completed_to_host,
+            .materialized_state_boundary_tokens = materialized_state_boundary_tokens,
         };
         cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
     }
@@ -709,10 +711,14 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
     if (demand.num_computed_tokens < 0) {
         return;
     }
-    // Snapshot-state prefill materializes the last completed prefix boundary
-    // and the final continuation state in one forward. An unaligned endpoint
-    // may therefore publish its preceding full prefix page; the endpoint
-    // state itself remains request-local and is never keyed here.
+    // Prefill can produce an internal snapshot, but speculative decode commits
+    // only the accepted endpoint. Never infer a written snapshot from an
+    // allocated slot or a completed token hash (including finish/retraction).
+    const std::int32_t boundary_tokens = static_cast<std::int32_t>(demand.prefix_hashes.size()) * prefix_granularity_;
+    if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
+        demand.materialized_state_boundary_tokens != boundary_tokens) {
+        return;
+    }
 
     const std::int32_t boundary_cache_block =
         static_cast<std::int32_t>(demand.prefix_hashes.size()) * pages_per_prefix_hash;
