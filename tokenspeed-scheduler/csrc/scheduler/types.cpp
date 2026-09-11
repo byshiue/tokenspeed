@@ -20,7 +20,6 @@
 
 #include "scheduler/types.h"
 
-#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -51,17 +50,7 @@ void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group)
 
 }  // namespace
 
-StateCheckpointPrefillMode SchedulerConfig::EffectiveStateCheckpointPrefillMode() const {
-    const bool has_snapshot_state = std::ranges::any_of(cache_groups, &CacheGroupConfig::IsSnapshotStateGroup);
-    return has_snapshot_state && !disable_prefix_cache && role != Role::kD ? state_checkpoint_prefill_mode
-                                                                           : StateCheckpointPrefillMode::kSingleForward;
-}
-
 void SchedulerConfig::Validate() const {
-    if (state_checkpoint_prefill_mode != StateCheckpointPrefillMode::kSingleForward &&
-        state_checkpoint_prefill_mode != StateCheckpointPrefillMode::kSplitTail) {
-        throw std::invalid_argument("Scheduler: invalid state_checkpoint_prefill_mode");
-    }
     if (prefix_granularity <= 0) {
         throw std::invalid_argument("Scheduler: prefix_granularity must be > 0");
     }

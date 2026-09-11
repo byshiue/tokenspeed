@@ -43,7 +43,6 @@ from tokenspeed_scheduler import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
-from tokenspeed.runtime.utils.env import StateCheckpointPrefillMode
 
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
@@ -160,7 +159,6 @@ def make_config(
     disable_l2_cache: bool,
     enable_l3_storage: bool,
     role: str,
-    state_checkpoint_prefill_mode: StateCheckpointPrefillMode,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
@@ -195,18 +193,6 @@ def make_config(
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
     cfg.disable_l2_cache = disable_l2_cache
-
-    mode_map = {
-        StateCheckpointPrefillMode.SINGLE_FORWARD: SchedulerConfig.StateCheckpointPrefillMode.SingleForward,
-        StateCheckpointPrefillMode.SPLIT_TAIL: SchedulerConfig.StateCheckpointPrefillMode.SplitTail,
-    }
-    try:
-        cfg.state_checkpoint_prefill_mode = mode_map[state_checkpoint_prefill_mode]
-    except KeyError as error:
-        raise ValueError(
-            "state_checkpoint_prefill_mode must be a StateCheckpointPrefillMode, "
-            f"got {state_checkpoint_prefill_mode!r}"
-        ) from error
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if cache_groups:

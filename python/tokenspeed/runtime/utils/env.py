@@ -21,7 +21,6 @@
 import os
 import warnings
 from contextlib import contextmanager
-from enum import Enum
 from typing import Any
 
 from tokenspeed_kernel.platform import pdl_enabled
@@ -68,24 +67,6 @@ global_server_args_dict: dict = {
     "all2all_backend": ServerArgs.all2all_backend,
     "deepep_mode": ServerArgs.deepep_mode,
 }
-
-
-class StateCheckpointPrefillMode(str, Enum):
-    SINGLE_FORWARD = "single_forward"
-    SPLIT_TAIL = "split_tail"
-
-
-def state_checkpoint_prefill_mode() -> StateCheckpointPrefillMode:
-    """Read and strictly validate the process-wide checkpoint prefill mode."""
-    value = envs.TOKENSPEED_STATE_CHECKPOINT_PREFILL_MODE.get()
-    try:
-        return StateCheckpointPrefillMode(value)
-    except ValueError as error:
-        accepted = ", ".join(mode.value for mode in StateCheckpointPrefillMode)
-        raise ValueError(
-            "TOKENSPEED_STATE_CHECKPOINT_PREFILL_MODE must be one of "
-            f"[{accepted}], got {value!r}"
-        ) from error
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
@@ -267,7 +248,6 @@ class Envs:
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
-    TOKENSPEED_STATE_CHECKPOINT_PREFILL_MODE = EnvStr("single_forward")
 
     # Mooncake
     TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH = EnvStr(None)

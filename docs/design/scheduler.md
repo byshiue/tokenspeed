@@ -27,20 +27,20 @@ matched. A chunk that *completes* the prompt is exempt: there is no next chunk
 to align for.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
-once per round (`PrefillReserve`: split tail, decode width, prompt headroom,
+once per round (`PrefillReserve`: decode width, prompt headroom,
 whether the round finishes shaping the state groups) and turned into each
 group's page demand by `reservePrefillDemands` — the only writer of
 `GroupDemand::reserve_tokens`. `groupReserveTokens` picks the rule by the
 group's retention, never by call site:
 
-- *Full-history* groups hold the tail and decode slot — the chunk that
+- *Full-history* groups hold the decode slot — the chunk that
   completes the prompt reserves `decode_input_tokens`, so the first decode step
   is guaranteed a slot; intermediate chunks reserve nothing, they are not about
   to decode — raised on a decoding role's first chunk to the rest of the prompt
   plus the admission headroom (§4), so a partially prefetched request is never
   stranded.
 - *Sliding-window* groups (either family) recycle slid-out pages, so the rest
-  of the prompt costs them nothing: they hold only the tail and decode slot.
+  of the prompt costs them nothing: they hold only the decode slot.
   Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
   waiting on a pool that had room for it.
 - *Snapshot-state* groups bank one growth block at the admission that finishes
@@ -81,37 +81,24 @@ Outside mixed mode, prefill and decode never share a round at all — decodes
 get the round only when no prefill scheduled — so head-of-line only ever
 orders prefills against each other, never a decode behind a prefill.
 
-### 1.2 State checkpoints: one planner, two startup modes
+### 1.2 State checkpoints: one forward
 
 A stateful prompt may finish off a prefix boundary. Its final state is needed
 to continue decode, while the preceding aligned state is needed to publish the
-last reusable prefix page. `PlanStateCheckpointPrefill` is the one planner for
-this extent. Its behavior is selected once at scheduler startup by
-`TOKENSPEED_STATE_CHECKPOINT_PREFILL_MODE`:
-
-* `single_forward` (the default) schedules the whole final extent in one
-  forward and materializes both the aligned checkpoint and the final,
-  request-local continuation state.
-* `split_tail` schedules an aligned body followed by the off-boundary tail.
-  The body atomically reserves the tail's dependent storage; the following
-  round consumes that reservation and must complete the prompt.
+last reusable prefix page. The scheduler schedules the whole final extent in
+one forward, materializing both the aligned checkpoint and the final,
+request-local continuation state. `AlignPrefillChunk` still enforces token
+budget and prefix-promotion boundaries; checkpoint output alone never creates
+an extra forward.
 
 For example, after a 50,432-token cache hit with an 868-token extent and
-128-token prefix granularity, `single_forward` schedules `[868]`, while
-`split_tail` schedules `[768, 100]`. The switch is process-wide and requires a
-restart; invalid or empty values fail startup.
-
-`SchedulerConfig::EffectiveStateCheckpointPrefillMode()` is the single resolver
-for role, prefix-cache, and snapshot-group eligibility. Planning, the startup
-capacity bound, and the Python startup log use that same result; the log retains
-both requested and effective modes without duplicating the eligibility rules.
+128-token prefix granularity, the scheduler submits `[868]`. This produces an
+aligned checkpoint at token 51,200 and a final state at token 51,300.
 
 Admission allocates the sparse state suffix beginning at the aligned checkpoint
-when one falls inside the chunk. In `single_forward` it includes the final
-state page and ordinary decode reserve atomically. In `split_tail`, the body
-secures the dependent endpoint and the tail consumes it without reshaping the
-sparse table. Only materialized aligned checkpoints are cached; an off-page
-endpoint is never keyed as a complete prefix.
+when one falls inside the chunk. It includes the final state page and ordinary
+decode reserve atomically. Only materialized aligned checkpoints are cached;
+an off-page endpoint is never keyed as a complete prefix.
 
 `CacheProgress::materialized_state_boundary_tokens` records the aligned
 boundary produced by the admitted local prefill. Publication of the preceding
@@ -133,38 +120,29 @@ original token order. Thus every recurrent token is evaluated once: the
 768-token checkpoint prefix plus a repeated 868-token full scan. The scheduler
 still submits one 868-token forward and carries no body/tail execution metadata.
 
-The two modes share admission, operation construction, dispatch, and result
-handling. A normal incomplete prefill holds the head of line. A split body may
-release it because the dependent tail is already secured; that pending tail is
-not eligible for retraction and cannot reserve another tail. Decode-role remote
-admission and prefix-disabled execution always keep the final extent whole.
+An incomplete prefill holds the head of line; a completing prefill releases
+it within the same plan build. The same rule applies with prefix caching
+disabled and during local recovery on a decode node. Remote decode-role
+admission keeps its endpoint-only landing layout.
 
-The capacity guarantees still apply in both modes:
+The capacity guarantees are retention-specific:
 
-- **In hybrid architectures the split tail is banked in every cache group,
-  not just the state group.** `groupReserveTokens` gives the history/KV and
-  sliding-window groups `tail + decode` (a decoding role's first chunk raises
-  the history group's to the prompt headroom) and the state groups
-  `max(block_granularity, tail, decode)` — never less than the tail, never a
-  headroom-sized token reserve.
-- **Tail splitting is bound to snapshot-state groups.** Without snapshot-state
-  groups, the effective mode passed to the planner is `kSingleForward`;
-  a pure-KV model never banks a tail and holds the head of line until its final
-  chunk. Extending tail reservation there would need its own capacity bound.
+- **History and sliding-window groups reserve decode tokens.** A decoding
+  role's first chunk additionally raises full-history reserve to the remaining
+  prompt plus admission headroom; sliding-window groups do not hold headroom.
 - **Every state group banks one growth block at the admission that finishes
-  shaping it** (completing chunk, split body, or remote landing):
-  `groupReserveTokens` reserves `max(block_granularity, tail,
-  decode_input_tokens)`, one block beyond the endpoint for every prompt length.
+  shaping it** (completing chunk or remote landing): `groupReserveTokens`
+  reserves `max(block_granularity, decode_input_tokens)`, at least one block
+  beyond the endpoint for every prompt length.
   Without it an endpoint that lands alone in its block (aligned prompt, remote
   landing, `disable_prefix_cache`) needs a fresh **empty** parent per state
   group at its first boundary crossing, and a full pool deadlocks because
   residents are retraction-exempt. Invariant: *no request needs an empty parent
-  for its first crossing* — it either owns the block or recycles its expired
-  body checkpoint (split-tail path). Later crossings re-acquire from the shared
-  pool and depend on the capacity bound (§1.3) and admission back-pressure.
-  The P role banks only the split tail; intermediate chunks and the
-  tail-spending round reserve nothing (the next sparse re-shaping requires
-  `AvailableTokens() == 0`).
+  for its first crossing* — it already owns the block. Later crossings
+  re-acquire from the shared pool and depend on the capacity bound (§1.3) and
+  admission back-pressure.
+  The P role and intermediate local chunks reserve no growth block (the next
+  sparse re-shaping requires `AvailableTokens() == 0`).
 
 ### 1.3 What bounds a single request
 
@@ -177,11 +155,10 @@ chunk's cached one) — fits the pool. It is not a live
 check against currently free capacity; a prompt within the bound can still fail
 admission right now and simply waits.
 
-For an internal checkpoint followed by `tail` tokens, `single_forward` holds
+For an internal checkpoint followed by `tail` tokens, the forward holds
 both the tail and the ordinary growth reserve: the output working set is
-`1 + ceil((tail + reserve) / block_granularity)` blocks. A `split_tail` body
-instead banks `max(tail, growth)` beyond its checkpoint. Admission and the
-capacity bound share `SnapshotStateReserveTokens` for that reservation rule.
+`1 + ceil((tail + reserve) / block_granularity)` blocks. Admission and the
+capacity bound share `SnapshotStateReserveTokens` for the growth reservation.
 The retained input is additional. With ordinary decode and equal prefix/state
 grains, an unaligned finishing chunk can therefore need four state blocks,
 not three. This also applies to local recovery on a decode node, and to
@@ -431,18 +408,15 @@ no victim and nothing could free that page.
 ## 5. Invariants a change must preserve
 
 - Admission never grants pages for tokens beyond the chunk being scheduled,
-  except the decode reserve on the completing chunk (1), the state-checkpoint
-  tail (1.2), which is banked for exactly one round and asserted against
-  nesting, the snapshot-state growth block banked by the admission that
-  finishes shaping a state group (1.2), and the admission headroom (4) — which
-  only full-history groups hold.
+  except the decode reserve on the completing chunk (1), the snapshot-state
+  growth block banked by the admission that finishes shaping a state group
+  (1.2), and the admission headroom (4) — which only full-history groups hold.
 - A prefill demand's reserve is decided once per group, by retention, in
   `reservePrefillDemands` (1); no later step rewrites `reserve_tokens`, and the
   helper asserts it found none set.
-- An incomplete local prefill is not overtaken (1.1) — unless its tail is
-  already banked. Decodes are never hostage to it: they consume no fresh
-  capacity within their reserve, so they keep running beside a stalled
-  prefill.
+- An incomplete local prefill is not overtaken (1.1). Decodes are never hostage
+  to it: they consume no fresh capacity within their reserve, so they keep
+  running beside a stalled prefill.
 - Retraction fires only when no prefill progressed and an admission failed
   (2). The chosen victim must be quiescent — no forward of its own in flight,
   no PD pin on its pages — and an in-flight load-back or an in-flight pinned

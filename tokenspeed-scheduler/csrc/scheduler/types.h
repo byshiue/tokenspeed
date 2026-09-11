@@ -28,11 +28,6 @@
 
 namespace tokenspeed {
 
-enum class StateCheckpointPrefillMode {
-    kSingleForward,
-    kSplitTail,
-};
-
 struct SchedulerConfig {
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
@@ -62,10 +57,6 @@ struct SchedulerConfig {
     bool enable_l3_storage{false};
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
-    StateCheckpointPrefillMode state_checkpoint_prefill_mode{StateCheckpointPrefillMode::kSingleForward};
-
-    // Resolve the startup request for planning, capacity, and diagnostics.
-    StateCheckpointPrefillMode EffectiveStateCheckpointPrefillMode() const;
 
     // The P and D roles ARE the cache-transfer PD protocol: there is no
     // disaggregated deployment without it, so everything PD-specific

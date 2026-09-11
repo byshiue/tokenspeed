@@ -66,11 +66,9 @@ bool admitsLikeNewPrompt(const Request& request) {
 
 // An incomplete prefill keeps the head of line: admission reserved only this
 // chunk, and a later candidate could strand it by consuming the capacity it
-// needs to finish. A dependent state tail is the exception: its storage was
-// secured atomically with the body.
+// needs to finish.
 bool holdsHeadOfLine(const Request& request) {
-    const auto* prefilling = request.GetIf<fsm::Prefilling>();
-    return prefilling != nullptr && !prefilling->StateCheckpointTailPending();
+    return request.Is<fsm::Prefilling>();
 }
 
 template <typename Operation>
@@ -115,9 +113,6 @@ void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<co
 // per round in tokens. Every cache group derives its own reserve from it in
 // reservePrefillDemands -- the only writer of GroupDemand::reserve_tokens.
 struct PrefillReserve {
-    // Off-boundary state-checkpoint tail this round banks for the next one;
-    // 0 if the round splits no tail.
-    std::int32_t split_tail_tokens{};
     // Width of the decode step that follows the completed prompt; 0 on the P
     // role, which never decodes locally.
     std::int32_t decode_input_tokens{};
@@ -127,26 +122,19 @@ struct PrefillReserve {
     // chunks and on the P role.
     std::int32_t prompt_headroom_tokens{};
     // Whether this admission finishes shaping the snapshot-state groups: the
-    // chunk that completes the prompt, the body that banks a split tail, or
-    // a remote landing.
+    // chunk that completes the prompt, or a remote landing.
     bool reserve_snapshot_state_growth{false};
 
-    // Tail plus decode when a tail is banked, the decode slot when the chunk
-    // completes the prompt, else 0: what a group must hold at minimum.
-    std::int32_t TailAndDecodeTokens() const {
-        if (split_tail_tokens > 0) {
-            return split_tail_tokens + decode_input_tokens;
-        }
-        return completes_prefill ? decode_input_tokens : 0;
-    }
+    // The decode slot when the chunk completes the prompt, else 0.
+    std::int32_t DecodeTokens() const { return completes_prefill ? decode_input_tokens : 0; }
 };
 
 // One group's reserve, by retention. Full-history groups hold every token the
 // round is accountable for, including the prepaid prompt headroom: a
 // partially prefetched request must never be stranded. Sliding-window groups
 // recycle slid-out pages, so the rest of the prompt costs them nothing and
-// they hold only the tail and decode slot. Snapshot-state groups bank one
-// growth block (max(block_granularity, tail, decode)) on the admission that
+// they hold only the decode slot. Snapshot-state groups bank one
+// growth block (max(block_granularity, decode)) on the admission that
 // finishes shaping them, so the first boundary crossing never needs an empty
 // parent; every other round reserves 0 there.
 std::int32_t groupReserveTokens(const CacheGroupConfig& group, std::int32_t block_granularity,
@@ -155,19 +143,18 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, std::int32_t bloc
         if (!reserve.reserve_snapshot_state_growth) {
             return 0;
         }
-        return static_cast<std::int32_t>(
-            SnapshotStateReserveTokens(block_granularity, reserve.split_tail_tokens, reserve.decode_input_tokens));
+        return static_cast<std::int32_t>(SnapshotStateReserveTokens(block_granularity, reserve.decode_input_tokens));
     }
     if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
-        return reserve.TailAndDecodeTokens();
+        return reserve.DecodeTokens();
     }
-    return std::max(reserve.TailAndDecodeTokens(), reserve.prompt_headroom_tokens);
+    return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);
 }
 
 void reservePrefillDemands(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
                            const CacheCoordinator& coordinator, const PrefillReserve& reserve) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
-    _assert(reserve.split_tail_tokens >= 0 && reserve.decode_input_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
+    _assert(reserve.decode_input_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
             "prefill reserve inputs must be non-negative");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].reserve_tokens == 0, "a prefill demand's reserve is decided here and nowhere else");
@@ -368,21 +355,18 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                           ? fsm::PrefillSource::kRemote
                                           : fsm::PrefillSource::kLocal;
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
-    StateCheckpointPrefillPlan checkpoint_plan{
-        .tokens_this_round = std::min(remaining, unscheduled),
-        .materialization_after = hit_tokens + std::min(remaining, unscheduled),
-        .completes_prefill = remaining >= unscheduled,
-    };
+    std::int32_t prefill_tokens = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || promotion_boundary_tokens > 0) {
-        checkpoint_plan =
-            PlanStateCheckpointPrefill(config_.EffectiveStateCheckpointPrefillMode(), hit_tokens, unscheduled,
-                                       remaining, coordinator_.PrefixGranularity(), promotion_boundary_tokens);
-        if (checkpoint_plan.tokens_this_round == 0) {
+        prefill_tokens = AlignPrefillChunk(hit_tokens, unscheduled, remaining, coordinator_.PrefixGranularity(),
+                                           promotion_boundary_tokens);
+        if (prefill_tokens == 0) {
             return std::nullopt;
         }
     }
 
-    const std::int32_t decode_reserve = checkpoint_plan.completes_prefill ? decode_input_tokens : 0;
+    const std::int32_t after_tokens = hit_tokens + prefill_tokens;
+    const bool completes_prefill = prefill_tokens == unscheduled;
+    const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
     // Every admission on a decoding role (D, Fused) secures real headroom
     // before the prefill starts: the rest of the prompt plus decode room
     // that starts at one safe-step window and grows with each retraction
@@ -392,23 +376,19 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     // locally and never retracts, so there is no decode room to prepay.
     const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
     const PrefillReserve reserve{
-        .split_tail_tokens = checkpoint_plan.split_tail_tokens,
         .decode_input_tokens = decode_input_tokens,
-        .completes_prefill = checkpoint_plan.completes_prefill,
-        .prompt_headroom_tokens = headroom > 0 ? unscheduled - checkpoint_plan.tokens_this_round + headroom : 0,
-        // A remote landing always finishes the shaping; the P role never
-        // decodes, so it banks only a split tail.
+        .completes_prefill = completes_prefill,
+        .prompt_headroom_tokens = headroom > 0 ? unscheduled - prefill_tokens + headroom : 0,
+        // A remote landing always finishes shaping; the P role needs no
+        // local decode growth.
         .reserve_snapshot_state_growth =
-            checkpoint_plan.split_tail_tokens > 0 ||
-            (config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || checkpoint_plan.completes_prefill)),
+            config_.role != Role::kP && (source == fsm::PrefillSource::kRemote || completes_prefill),
     };
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
-    std::vector<GroupDemand> demands =
-        makeGroupDemands(tables, GroupDemand{.num_tokens = checkpoint_plan.tokens_this_round});
+    std::vector<GroupDemand> demands = makeGroupDemands(tables, GroupDemand{.num_tokens = prefill_tokens});
     reservePrefillDemands(demands, config_.cache_groups, coordinator_, reserve);
     if (source == fsm::PrefillSource::kLocal) {
-        makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens,
-                                       checkpoint_plan.materialization_after);
+        makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
     }
 
     if (source == fsm::PrefillSource::kRemote) {
@@ -443,7 +423,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     }
     discardUncachedKvEventPages(event_keys);
     return fsm::SchedulePrefillFirstChunkEvent{
-        checkpoint_plan.tokens_this_round,
+        prefill_tokens,
         decode_reserve,
         &req_pool_allocator_,
         source,
@@ -454,12 +434,10 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
             .prefix_hashes = std::move(match.prefix_hashes),
             .access_epoch = admission->access_epoch,
             .promotion_boundary_tokens = admission->promotion_boundary_tokens,
-            .state_checkpoint_tail_pending = checkpoint_plan.split_tail_tokens > 0,
-            .materialized_state_boundary_tokens = source == fsm::PrefillSource::kLocal
-                                                      ? checkpoint_plan.materialization_after /
-                                                            coordinator_.PrefixGranularity() *
-                                                            coordinator_.PrefixGranularity()
-                                                      : 0,
+            .materialized_state_boundary_tokens =
+                source == fsm::PrefillSource::kLocal
+                    ? after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity()
+                    : 0,
         },
         std::move(admission->load_pairs),
         // The P role holds a completed prompt until its result lands: the
@@ -474,44 +452,24 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    // Spend a state-checkpoint tail banked by the previous round's admission
-    // (read-and-clear at entry, so a tail banked BELOW is untouched): its
-    // pages are already held, so this round must complete it -- asserted
-    // once the chunk size is fixed -- and skips its sparse re-shaping.
-    const bool consumes_pending_tail = std::exchange(cache_progress.state_checkpoint_tail_pending, false);
-    StateCheckpointPrefillPlan checkpoint_plan{
-        .tokens_this_round = std::min(remaining, unscheduled),
-        .materialization_after = first_pos + std::min(remaining, unscheduled),
-        .completes_prefill = remaining >= unscheduled,
-    };
+    std::int32_t prefill_tokens = std::min(remaining, unscheduled);
     if (coordinator_.HasMambaStateGroup() || cache_progress.promotion_boundary_tokens > 0) {
-        checkpoint_plan =
-            PlanStateCheckpointPrefill(config_.EffectiveStateCheckpointPrefillMode(), first_pos, unscheduled, remaining,
-                                       coordinator_.PrefixGranularity(), cache_progress.promotion_boundary_tokens);
-        if (checkpoint_plan.split_tail_tokens > 0) {
-            _assert(!consumes_pending_tail, "cannot reserve a second state-checkpoint tail while one is pending");
-            cache_progress.state_checkpoint_tail_pending = true;
-        }
-        if (checkpoint_plan.tokens_this_round == 0) {
+        prefill_tokens = AlignPrefillChunk(first_pos, unscheduled, remaining, coordinator_.PrefixGranularity(),
+                                           cache_progress.promotion_boundary_tokens);
+        if (prefill_tokens == 0) {
             return std::nullopt;
         }
     }
 
-    _assert(!consumes_pending_tail || checkpoint_plan.completes_prefill,
-            "pending state-checkpoint tail must complete in one scheduler round");
-    const std::int32_t decode_reserve =
-        checkpoint_plan.completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
+    const std::int32_t after_tokens = first_pos + prefill_tokens;
+    const bool completes_prefill = prefill_tokens == unscheduled;
+    const std::int32_t decode_reserve = completes_prefill ? reserve_num_tokens_in_next_schedule_event : 0;
     // The prompt headroom was prepaid at first-chunk admission.
     const PrefillReserve reserve{
-        .split_tail_tokens = checkpoint_plan.split_tail_tokens,
         .decode_input_tokens = reserve_num_tokens_in_next_schedule_event,
-        .completes_prefill = checkpoint_plan.completes_prefill,
+        .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
-        // The round that spends a banked tail got its growth block with the
-        // body; the P role banks only a split tail.
-        .reserve_snapshot_state_growth =
-            checkpoint_plan.split_tail_tokens > 0 ||
-            (config_.role != Role::kP && checkpoint_plan.completes_prefill && !consumes_pending_tail),
+        .reserve_snapshot_state_growth = config_.role != Role::kP && completes_prefill,
     };
     const PrefillInfo previous = request->CurrentPrefillInfo();
     const std::int32_t num_computed_tokens = previous.already_scheduled_len + previous.extend_len;
@@ -521,7 +479,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     std::vector<GroupDemand> demands =
         makeGroupDemands(tables, GroupDemand{
-                                     .num_tokens = checkpoint_plan.tokens_this_round,
+                                     .num_tokens = prefill_tokens,
                                      .prefix_hashes = cache_progress.prefix_hashes,
                                      .new_prefix_hash_begin = completed.first_new_prefix_page,
                                      .completed_boundary_kind = completed.boundary_kind,
@@ -530,18 +488,15 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
                                  });
     reservePrefillDemands(demands, config_.cache_groups, coordinator_, reserve);
-    if (!consumes_pending_tail) {
-        makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos,
-                                       checkpoint_plan.materialization_after);
-    }
+    makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
     if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page, demands)) {
         return std::nullopt;
     }
 
     cache_progress.materialized_state_boundary_tokens =
-        checkpoint_plan.materialization_after / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity();
+        after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity();
     return fsm::SchedulePrefillEvent{
-        checkpoint_plan.tokens_this_round,
+        prefill_tokens,
         decode_reserve,
         std::move(cache_progress),
         config_.role == Role::kP,
@@ -657,8 +612,7 @@ Request* Scheduler::chooseVictim(std::span<Request* const> candidates) const {
     Request* victim = nullptr;
     for (Request* request : candidates) {
         const auto* prefilling = request->GetIf<fsm::Prefilling>();
-        if (prefilling != nullptr && !prefilling->StateCheckpointTailPending() &&
-            !request->ReserveCoversGeneration(kRetractionSafeSteps) &&
+        if (prefilling != nullptr && !request->ReserveCoversGeneration(kRetractionSafeSteps) &&
             (victim == nullptr || request->TokenSize() > victim->TokenSize())) {
             victim = request;
         }

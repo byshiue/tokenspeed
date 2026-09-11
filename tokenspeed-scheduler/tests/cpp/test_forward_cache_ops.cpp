@@ -111,64 +111,28 @@ TEST(StateCheckpointMaterializationStartTest, UsesOnlyFinalSlotWhenNoBoundaryFal
               51300);
 }
 
-TEST(PlanStateCheckpointPrefillTest, SingleForwardKeepsFinalExtentWhole) {
-    const StateCheckpointPrefillPlan plan =
-        PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSingleForward,
-                                   /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
-                                   /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
-    EXPECT_EQ(plan.tokens_this_round, 868);
-    EXPECT_EQ(plan.split_tail_tokens, 0);
-    EXPECT_EQ(plan.materialization_after, 51300);
-    EXPECT_TRUE(plan.completes_prefill);
+TEST(AlignPrefillChunkTest, KeepsFinalCheckpointExtentWhole) {
+    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/50432, /*unscheduled=*/868, /*token_budget=*/868,
+                                /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0),
+              868);
 }
 
-TEST(PlanStateCheckpointPrefillTest, SplitTailSeparatesAlignedBody) {
-    const StateCheckpointPrefillPlan plan =
-        PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSplitTail,
-                                   /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
-                                   /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
-    EXPECT_EQ(plan.tokens_this_round, 768);
-    EXPECT_EQ(plan.split_tail_tokens, 100);
-    EXPECT_EQ(plan.materialization_after, 51200);
-    EXPECT_FALSE(plan.completes_prefill);
+TEST(AlignPrefillChunkTest, BudgetStillBoundsCheckpointExtent) {
+    EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/50432, /*unscheduled=*/868, /*token_budget=*/800,
+                                /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0),
+              768);
 }
 
-TEST(PlanStateCheckpointPrefillTest, EffectiveModeIsSharedByPlanningAndDiagnostics) {
-    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
-        for (const bool prefix_cache_enabled : {false, true}) {
-            for (const bool has_state : {false, true}) {
-                SchedulerConfig cfg{};
-                cfg.role = role;
-                cfg.disable_prefix_cache = !prefix_cache_enabled;
-                cfg.state_checkpoint_prefill_mode = StateCheckpointPrefillMode::kSplitTail;
-                CacheGroupConfig group{};
-                group.family = has_state ? CacheGroupFamily::State : CacheGroupFamily::History;
-                group.retention = CacheGroupConfig::Retention::FullHistory;
-                cfg.cache_groups = {group};
-                const bool splits = has_state && prefix_cache_enabled && role != Role::kD;
-                EXPECT_EQ(cfg.EffectiveStateCheckpointPrefillMode(),
-                          splits ? StateCheckpointPrefillMode::kSplitTail : StateCheckpointPrefillMode::kSingleForward);
-                const StateCheckpointPrefillPlan plan =
-                    PlanStateCheckpointPrefill(cfg.EffectiveStateCheckpointPrefillMode(),
-                                               /*first_pos=*/50432, /*unscheduled_tokens=*/868, /*token_budget=*/868,
-                                               /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
-                EXPECT_EQ(plan.tokens_this_round, splits ? 768 : 868);
-                EXPECT_EQ(plan.split_tail_tokens, splits ? 100 : 0);
-                EXPECT_EQ(plan.completes_prefill, !splits);
-            }
-        }
-    }
+TEST(SnapshotStateReserveTokensTest, CoversGrowthAndDecodeWidth) {
+    EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/128, /*decode_tokens=*/1), 128);
+    EXPECT_EQ(SnapshotStateReserveTokens(/*block_granularity=*/2, /*decode_tokens=*/3), 3);
 }
 
-TEST(PlanStateCheckpointPrefillTest, SplitTailKeepsAlignedAndBoundaryFreeExtentsWhole) {
+TEST(AlignPrefillChunkTest, KeepsAlignedAndBoundaryFreeFinalExtentsWhole) {
     for (const std::int32_t unscheduled : {768, 100}) {
-        const StateCheckpointPrefillPlan plan =
-            PlanStateCheckpointPrefill(StateCheckpointPrefillMode::kSplitTail,
-                                       /*first_pos=*/51200, unscheduled, /*token_budget=*/868,
-                                       /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0);
-        EXPECT_EQ(plan.tokens_this_round, unscheduled);
-        EXPECT_EQ(plan.split_tail_tokens, 0);
-        EXPECT_TRUE(plan.completes_prefill);
+        EXPECT_EQ(AlignPrefillChunk(/*first_pos=*/51200, unscheduled, /*token_budget=*/868,
+                                    /*prefix_granularity=*/128, /*promotion_boundary_tokens=*/0),
+                  unscheduled);
     }
 }
 
@@ -558,12 +522,6 @@ void ExpectRejectedNamingGroup(const SchedulerConfig& config, const std::string&
 
 TEST(SchedulerConfigValidateTest, AcceptsAValidConfig) {
     EXPECT_NO_THROW(MakeValidConfig().Validate());
-}
-
-TEST(SchedulerConfigValidateTest, RejectsUnknownStateCheckpointPrefillMode) {
-    SchedulerConfig config = MakeValidConfig();
-    config.state_checkpoint_prefill_mode = static_cast<StateCheckpointPrefillMode>(-1);
-    EXPECT_THROW(config.Validate(), std::invalid_argument);
 }
 
 TEST(SchedulerConfigValidateTest, RejectsNonPositiveGlobalP) {

@@ -44,9 +44,6 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Storage for the final request-local state tail was secured atomically
-    // with the preceding aligned body.
-    bool state_checkpoint_tail_pending{false};
     // Last aligned state boundary produced by scheduled local prefill. The
     // ordered forward stream materializes it before subsequent publication.
     // Decode must not advance this: verify commits only its accepted endpoint.
@@ -158,9 +155,6 @@ struct Prefilling : public ForwardState {
     }
 
     std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
-    // The final state-checkpoint tail's storage is already reserved, so this
-    // request's remaining prompt is capacity-safe.
-    bool StateCheckpointTailPending() const { return CacheProgressRef().state_checkpoint_tail_pending; }
     TokenContainer::Window window{};
 
 private:

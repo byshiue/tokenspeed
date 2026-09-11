@@ -154,10 +154,9 @@ Consumers outside the cache layer treat the ids as opaque.
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
 full-history snapshot-state prefill normally needs only its input, aligned
-prefix output, and final continuation checkpoints. The startup-selected
-checkpoint-prefill plan either materializes the aligned and final outputs in
-one forward, or lets an aligned body atomically reserve an off-page tail whose
-next forward consumes that reservation. The next decode admission rolls the
+prefix output, and final continuation checkpoints. One forward materializes
+the aligned and final outputs, with capacity for both secured at admission.
+The next decode admission rolls the
 expired input block forward, including under overlap scheduling. The table
 keeps absolute slot positions while representing other skipped intermediate
 checkpoints as null holes (`0`). State consumers may gather only the declared

@@ -232,14 +232,12 @@ def test_k3_128k_requires_group_aware_shared_pool_geometry() -> None:
     assert corrected.available_kv_pages() == before
 
 
-@pytest.mark.parametrize("mode", ["SingleForward", "SplitTail"])
 @pytest.mark.parametrize("block_granularity", [1, 2, 4])
 @pytest.mark.parametrize("chunk_tokens", [4, 8, 9])
 @pytest.mark.parametrize("decode_width", [1, 3])
 @pytest.mark.parametrize("overlap_depth", [0, 1])
 @pytest.mark.parametrize("prefix_cache_enabled", [False, True])
 def test_accepted_state_prompts_can_prefill_and_start_decode(
-    mode: str,
     block_granularity: int,
     chunk_tokens: int,
     decode_width: int,
@@ -257,9 +255,6 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
         cfg.disable_prefix_cache = not prefix_cache_enabled
         cfg.decode_input_tokens = decode_width
         cfg.overlap_schedule_depth = overlap_depth
-        cfg.state_checkpoint_prefill_mode = getattr(
-            cfg.StateCheckpointPrefillMode, mode
-        )
         cfg.cache_groups = [
             ts.CacheGroupConfig(
                 group_id="state",
@@ -296,12 +291,11 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
                 assert _find_forward_op(scheduler.next_execution_plan()) is not None
 
 
-@pytest.mark.parametrize("mode", ["SingleForward", "SplitTail"])
 @pytest.mark.parametrize("publish_on_finish", [False, True])
 @pytest.mark.parametrize("decode_width", [1, 3])
 @pytest.mark.parametrize("state_granularity", [1, 2, 4])
 def test_decode_reuses_only_materialized_state_boundary(
-    mode: str, publish_on_finish: bool, decode_width: int, state_granularity: int
+    publish_on_finish: bool, decode_width: int, state_granularity: int
 ) -> None:
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 4
@@ -313,7 +307,6 @@ def test_decode_reuses_only_materialized_state_boundary(
     cfg.disable_prefix_cache = False
     cfg.decode_input_tokens = decode_width
     cfg.overlap_schedule_depth = 0
-    cfg.state_checkpoint_prefill_mode = getattr(cfg.StateCheckpointPrefillMode, mode)
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="state",
@@ -401,9 +394,8 @@ def _drive_k3_to_retract(scheduler) -> dict[str, dict[int, int]]:
 
 
 def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
-    """Binding smoke for a split readmit and its reserved state tail."""
+    """Readmission restores the prefix and prefills its full remaining extent."""
     cfg = _make_k3_config()
-    cfg.state_checkpoint_prefill_mode = cfg.StateCheckpointPrefillMode.SplitTail
     scheduler = ts.Scheduler(cfg)
     before = scheduler.available_kv_pages()
     pre_retract_pages = _drive_k3_to_retract(scheduler)
@@ -416,7 +408,7 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     assert tuple(body.request_ids) == ("a",)
     assert tuple(body.prefill_lengths) == (11,)
     assert tuple(body.extend_prefix_lens) == (8,)
-    assert tuple(body.input_lengths) == (2,)
+    assert tuple(body.input_lengths) == (3,)
     tables = dict(body.block_tables)
     assert tuple(tables) == K3_GROUP_IDS
     prefix_granularity = _make_k3_config().prefix_granularity
@@ -433,7 +425,9 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
     fresh_tail_entries = []
     for group_id in K3_GROUP_IDS:
         row = tuple(tables[group_id][0])
-        assert len(row) == expected_slots
+        # State groups include their decode growth block beyond the endpoint.
+        growth_slots = int(group_id != K3_GROUP_IDS[0])
+        assert len(row) == expected_slots + growth_slots
         group_positive = _positive_pages(row)
         assert group_positive
         all_positive_entries.extend(group_positive)
@@ -447,23 +441,17 @@ def test_k3_readmit_rebuilds_all_four_tables_and_restores_pages() -> None:
         restored_pages.update(restored_in_group)
 
         tail = row[prefix_slots:]
-        assert len(tail) == 2
+        assert len(tail) == 2 + growth_slots
         group_tail = _positive_pages(tail)
-        # The aligned body materializes its state checkpoint and atomically
-        # reserves the final prompt-tail slot, so every group owns both pages.
+        # One forward materializes the aligned checkpoint and endpoint;
+        # state groups also own the following growth block.
         assert all(page > 0 for page in tail)
-        assert len(group_tail) == 2
+        assert len(group_tail) == 2 + growth_slots
         fresh_tail_entries.extend(group_tail)
 
     assert len(set(all_positive_entries)) == len(all_positive_entries)
     assert len(set(fresh_tail_entries)) == len(fresh_tail_entries)
     assert set(fresh_tail_entries).isdisjoint(restored_pages)
-
-    tail = _find_forward_op(scheduler.next_execution_plan())
-    assert tail is not None
-    assert tuple(tail.request_ids) == ("a",)
-    assert tuple(tail.extend_prefix_lens) == (10,)
-    assert tuple(tail.input_lengths) == (1,)
 
     _advance_tokens(scheduler, "a", [3000])
     scheduler.next_execution_plan()
