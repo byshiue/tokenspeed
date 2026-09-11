@@ -973,6 +973,4 @@ class KdaAttnBackend(MambaAttnBackend):
         self, query_start_loc: torch.Tensor
     ) -> torch.Tensor:
         """Materialize one reusable native KDA boundary per forward."""
-        if query_start_loc.dtype == torch.int64:
-            return query_start_loc
         return query_start_loc.to(torch.int64)

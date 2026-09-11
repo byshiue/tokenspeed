@@ -210,7 +210,8 @@ solutions may retain their original K-major Python adapters; the kernel facade
 converts between that layout and the runtime's V-major state slab on both scans.
 Native-layout adapter entry points are not required for checkpoint continuation.
 KDA's int64 sequence boundaries are still prepared once in runtime metadata and
-reused by the original adapters.
+reused by the original adapters. Preparation uses `Tensor.to(torch.int64)`;
+an already-int64 boundary is returned unchanged without allocating a copy.
 
 Scan results may be transposed views in that public state layout. The batched
 input packer addresses recurrent-state rows and features using their actual

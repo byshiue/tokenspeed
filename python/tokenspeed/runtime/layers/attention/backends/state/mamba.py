@@ -1150,14 +1150,14 @@ class MambaAttnBackend(AttentionBackend):
                 rounding_mode="floor",
             )
         for group_id in self._state_group_ids:
-            rows = self._state_rows(block_tables, group_id)
-            table_width = rows.shape[1]
+            state_block_table = self._state_rows(block_tables, group_id)
+            table_width = state_block_table.shape[1]
             out_slots_safe = out_slots_by_width.get(table_width)
             if out_slots_safe is None:
                 out_slots_safe = plan.out_slots.clamp(min=0, max=table_width - 1)
                 out_slots_by_width[table_width] = out_slots_safe
             state_in, state_out = _gather_state_block_indices(
-                rows,
+                state_block_table,
                 plan,
                 out_slots_safe=out_slots_safe,
                 validate=validate,
@@ -1166,7 +1166,8 @@ class MambaAttnBackend(AttentionBackend):
             state_in_blocks[group_id] = state_in
             state_out_blocks[group_id] = state_out
             if checkpoint_batch is not None:
-                checkpoint_pages = rows[
+                # Select each checkpoint request's row and its state-block column.
+                checkpoint_pages = state_block_table[
                     checkpoint_batch.rows, checkpoint_slots.clamp(max=table_width - 1)
                 ]
                 if validate and bool((checkpoint_pages <= 0).any()):

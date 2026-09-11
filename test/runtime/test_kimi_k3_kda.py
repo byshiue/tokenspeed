@@ -76,6 +76,15 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
     backend.kda_recurrent_layout = "v_major"
     backend.kda_backend = "auto"
     backend._kda_gate = lambda g_raw, *_args: g_raw
+    # Prepare boundaries once; repeated preparation must preserve their identity.
+    boundaries = torch.tensor([0, 1], dtype=torch.int32)
+    scan_boundaries = backend._prepare_prefill_scan_query_start_loc(boundaries)
+    assert scan_boundaries.dtype == torch.int64
+    assert torch.equal(scan_boundaries, boundaries)
+    assert (
+        backend._prepare_prefill_scan_query_start_loc(scan_boundaries)
+        is scan_boundaries
+    )
     stored = torch.arange(24, dtype=torch.float32).view(1, 2, 3, 4)
     final = torch.empty(1, 2, 3, 4)
     captured = {}
@@ -92,7 +101,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
         query,
         value,
         stored,
-        torch.tensor([0, 1]),
+        scan_boundaries,
         A_log=torch.empty(2),
         dt_bias=torch.empty(2, 3),
         a=None,
@@ -107,6 +116,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None
         cu_seqlens_cpu=(0, 1),
     )
     assert captured["initial_state"] is stored
+    assert captured["cu_seqlens"] is scan_boundaries
     assert captured["recurrent_layout"] == "v_major"
     assert final_state is final
 
