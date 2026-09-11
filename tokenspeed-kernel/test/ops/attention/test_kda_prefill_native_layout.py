@@ -24,6 +24,8 @@ import pytest
 import tokenspeed_kernel.ops.attention.kda.cute_dsl as cutedsl_op
 import torch
 from tokenspeed_kernel.ops.attention.kda import kda_paged_prefill
+from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.registry import KernelRegistry
 
 HEADS, DIM = 12, 128
 
@@ -61,7 +63,10 @@ def _actual(inputs, state, bounds, cpu, layout):
 
 
 @pytest.mark.parametrize("layout", ["v_major", "k_major"])
-def test_dispatch_native_state_and_shared_boundaries(monkeypatch, layout):
+def test_dispatch_native_state_and_shared_boundaries(
+    monkeypatch, layout, b300_platform
+):
+    """Exercise NVIDIA layout dispatch on CPU tensors on any host platform."""
     inputs, native_state, bounds, cpu = _inputs("cpu", [17, 15])
     state = (
         native_state
@@ -87,11 +92,20 @@ def test_dispatch_native_state_and_shared_boundaries(monkeypatch, layout):
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_check_config", lambda bound: None)
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_workspace_size", lambda *a, **k: 0)
     monkeypatch.setattr(cutedsl_op, "cutedsl_kda_forward", forward)
-    for _ in range(2):
-        result = _actual(inputs, state, bounds, cpu, layout)
-        expected = final if layout == "v_major" else final.transpose(-1, -2)
-        assert torch.equal(result.final_state, expected)
-        assert result.final_state.data_ptr() == final.data_ptr()
+    registry = KernelRegistry.get()
+    real_platform = Platform.get()
+    try:
+        # CPU tensors still go through platform-based kernel selection.
+        Platform.override(b300_platform)
+        registry.clear_cache()
+        for _ in range(2):
+            result = _actual(inputs, state, bounds, cpu, layout)
+            expected = final if layout == "v_major" else final.transpose(-1, -2)
+            assert torch.equal(result.final_state, expected)
+            assert result.final_state.data_ptr() == final.data_ptr()
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
     assert len(seen) == 2
 
 
