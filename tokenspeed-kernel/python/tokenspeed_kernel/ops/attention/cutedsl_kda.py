@@ -33,6 +33,7 @@ validated on every call.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.attention.prefill_workspace import KdaPrefillWorkspace
 from tokenspeed_kernel.ops.attention.triton.kda_prefill_inputs import (
     prepare_kda_prefill_gate_beta,
 )
@@ -40,7 +41,9 @@ from tokenspeed_kernel.thirdparty.cutedsl_kda import (
     DEFAULT_SCALE,
     cutedsl_kda_check_config,
     cutedsl_kda_forward,
+    cutedsl_kda_prepare_prefill,
     cutedsl_kda_supports_output_buffer,
+    cutedsl_kda_supports_prefill_plan,
     cutedsl_kda_workspace_size,
     is_cutedsl_kda_installed,
 )
@@ -58,6 +61,7 @@ def cutedsl_kda_chunk_prefill(
     dt_bias: torch.Tensor | None = None,
     *,
     out: torch.Tensor | None,
+    prefill_workspace: KdaPrefillWorkspace | None,
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_cpu: torch.Tensor | None = None,
@@ -94,6 +98,9 @@ def cutedsl_kda_chunk_prefill(
         out: Contiguous destination with v's shape, dtype and device, or None
             to allocate. Must not overlap inputs. Older native wrappers use a
             copy fallback; output-buffer-capable wrappers write it directly.
+        prefill_workspace: Forward-owned scratch/plan shared by sequential layers,
+            or None for a standalone call. Its boundaries must be this call's
+            immutable int64 cu_seqlens; native routing is unchanged.
 
     Returns:
         ``(o [B, T, HV, V], final_state [N, HV, V, K])`` in native layout.
@@ -167,17 +174,36 @@ def cutedsl_kda_chunk_prefill(
             dtype=torch.float32,
             device=q.device,
         )
-    # Decomposition-route scratch (0 bytes on the engine route); preallocated
-    # here so the wrapper does not allocate on the hot path.
-    ws_bytes = cutedsl_kda_workspace_size(
-        boundaries, num_value_heads, cu_seqlens_cpu=cu_seqlens_cpu
-    )
-    workspace = (
-        torch.empty(ws_bytes, dtype=torch.uint8, device=q.device) if ws_bytes else None
-    )
-    output_kwargs = {}
-    if out is not None and cutedsl_kda_supports_output_buffer():
-        output_kwargs["out"] = out.reshape(v.shape)
+    # A capable wrapper prepares route/grid and workspace views once per
+    # forward. Old wheels and capture keep per-call preparation through the
+    # same native execution path. No native planning rules live in runtime.
+    plan = None
+    if prefill_workspace is not None and cutedsl_kda_supports_prefill_plan():
+        plan = prefill_workspace.get_plan(
+            boundaries, num_value_heads, cutedsl_kda_prepare_prefill
+        )
+    if plan is not None:
+        native_kwargs = {
+            "plan": plan,
+            "out": None if out is None else out.reshape(v.shape),
+        }
+    else:
+        if prefill_workspace is None:
+            ws_bytes = cutedsl_kda_workspace_size(
+                boundaries, num_value_heads, cu_seqlens_cpu=cu_seqlens_cpu
+            )
+            workspace = (
+                torch.empty(ws_bytes, dtype=torch.uint8, device=q.device)
+                if ws_bytes
+                else None
+            )
+        else:
+            workspace = prefill_workspace.get(
+                boundaries, num_value_heads, cutedsl_kda_workspace_size
+            )
+        native_kwargs = {"workspace": workspace, "cu_seqlens_cpu": cu_seqlens_cpu}
+        if out is not None and cutedsl_kda_supports_output_buffer():
+            native_kwargs["out"] = out.reshape(v.shape)
     result, final_state = cutedsl_kda_forward(
         q,
         k,
@@ -189,9 +215,7 @@ def cutedsl_kda_chunk_prefill(
         boundaries,
         state_in,
         scale=DEFAULT_SCALE,
-        workspace=workspace,
-        cu_seqlens_cpu=cu_seqlens_cpu,
-        **output_kwargs,
+        **native_kwargs,
     )
     result = result.view(batch, tokens, num_value_heads, value_dim)
     if destination is not None:

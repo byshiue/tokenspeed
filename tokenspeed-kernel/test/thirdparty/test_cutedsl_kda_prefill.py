@@ -90,6 +90,7 @@ def _assert_matches_portable(
     actual_out, actual_state = cutedsl_kda_chunk_prefill(
         *inputs,
         out=None,
+        prefill_workspace=None,
         initial_state=(
             None
             if initial_state is None

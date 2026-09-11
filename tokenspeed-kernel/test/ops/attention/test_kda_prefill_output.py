@@ -54,6 +54,7 @@ def run(args, state, bounds, cpu, out):
         cu_seqlens=bounds,
         cu_seqlens_cpu=cpu,
         out=out,
+        prefill_workspace=None,
         lower_bound=-5.0,
         override=None,
         solution="cutedsl_kda",
@@ -88,6 +89,7 @@ def test_adapter_output_contract_and_legacy_fallback(monkeypatch, native_out, ba
     out, final = cutedsl.cutedsl_kda_chunk_prefill(
         *args,
         out=target,
+        prefill_workspace=None,
         initial_state=state,
         cu_seqlens=None,
         cu_seqlens_cpu=None,
@@ -122,6 +124,7 @@ def test_dispatch_copy_fallback_without_output_trait(monkeypatch):
 
     def kernel(**kwargs):
         assert "out" not in kwargs
+        assert "prefill_workspace" not in kwargs
         return attention.KdaPrefillResult(args[2] + 1, state)
 
     selected = SelectedKernel("test_output_fallback", kernel)

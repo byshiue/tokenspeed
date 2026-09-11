@@ -58,6 +58,7 @@ def _actual(inputs, state, bounds, cpu, layout):
         solution="cutedsl_kda",
         recurrent_layout=layout,
         out=None,
+        prefill_workspace=None,
     )
 
 

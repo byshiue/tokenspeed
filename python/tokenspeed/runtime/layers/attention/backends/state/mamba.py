@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention import (
     gdn_decode_step,
     gdn_replay_commit,
 )
+from tokenspeed_kernel.ops.attention.prefill_workspace import KdaPrefillWorkspace
 from tokenspeed_kernel.ops.attention.triton.causal_conv1d_metadata import (
     CAUSAL_CONV1D_BLOCK_M,
     CausalConv1dPrefillMetadata,
@@ -296,6 +297,9 @@ def _build_cu_extend_seq_lens_cpu(
 @dataclass
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
+    # Scratch only, not request state. Created lazily by KDA and discarded
+    # with this forward; never reuse an earlier forward's workspace owner.
+    kda_prefill_workspace: KdaPrefillWorkspace | None
     mamba_output_indices: torch.Tensor | None = None
     extend_seq_lens_cpu: torch.Tensor | None = None
     # Host int64 prefix sum of extend_seq_lens_cpu, equal to
@@ -921,7 +925,7 @@ class MambaAttnBackend(AttentionBackend):
             if tokens_per_req > 1:
                 set_total_chunks_hint_uniform(bs, tokens_per_req, query_start_loc)
             self.forward_metadata = MambaForwardMetadata(
-                query_start_loc=query_start_loc
+                query_start_loc=query_start_loc, kda_prefill_workspace=None
             )
             return
 
@@ -959,6 +963,7 @@ class MambaAttnBackend(AttentionBackend):
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=query_start_loc,
+            kda_prefill_workspace=None,
             extend_seq_lens_cpu=extend_seq_lens_cpu,
             cu_extend_seq_lens_cpu=cu_extend_seq_lens_cpu,
             query_start_loc_int64=query_start_loc.to(dtype=torch.int64),
@@ -1069,6 +1074,7 @@ class MambaAttnBackend(AttentionBackend):
         self._qsl_last_mode[bs - 1] = (forward_mode, self.spec_num_tokens > 1)
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
+            kda_prefill_workspace=None,
             mamba_output_indices=mamba_output_indices,
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,
@@ -1200,6 +1206,7 @@ class MambaAttnBackend(AttentionBackend):
 
         self.forward_metadata = MambaForwardMetadata(
             query_start_loc=self.query_start_loc_list[bs - 1],
+            kda_prefill_workspace=None,
             mamba_output_indices=mamba_output_indices,
             state_in_blocks_by_group=state_in_blocks_by_group,
             state_out_blocks_by_group=state_out_blocks_by_group,

@@ -91,6 +91,8 @@ def cutedsl_kda_workspace_size(cu_seqlens, heads: int, cu_seqlens_cpu=None) -> i
 
 def cutedsl_kda_forward(*args, **kwargs):
     """Run the token-major KDA forward and return ``(out, new_state)``."""
+    if "plan" in kwargs:
+        return _module().cutedsl_kda_forward_prepared(*args, **kwargs)
     if "out" in kwargs:
         return _module().cutedsl_kda_forward_out(*args, **kwargs)
     return _module().cutedsl_kda_forward(*args, **kwargs)
@@ -104,3 +106,28 @@ def cutedsl_kda_supports_output_buffer() -> bool:
     capability describes the Python wrapper API, not a different GPU kernel.
     """
     return callable(getattr(_module(), "cutedsl_kda_forward_out", None))
+
+
+@lru_cache(maxsize=1)
+def cutedsl_kda_supports_prefill_plan() -> bool:
+    """Whether the installed wrapper supports forward-owned prepared launches.
+
+    This is a Python API capability, not a different GPU implementation.
+    Older wheels continue using explicit scratch and per-call host planning.
+    """
+    module = _module()
+    return callable(getattr(module, "cutedsl_kda_prepare_prefill", None)) and callable(
+        getattr(module, "cutedsl_kda_forward_prepared", None)
+    )
+
+
+def cutedsl_kda_prepare_prefill(cu_seqlens, heads: int, *, cu_seqlens_cpu):
+    """Return the native wrapper's opaque, stream-local prefill plan.
+
+    Device/host boundaries must be equal and immutable for this forward.
+    The wrapper owns routing, capacity and partition views; runtime callers
+    must retain the plan until every queued layer consumes its scratch.
+    """
+    return _module().cutedsl_kda_prepare_prefill(
+        cu_seqlens, heads, cu_seqlens_cpu=cu_seqlens_cpu
+    )

@@ -63,6 +63,24 @@ unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
 
+### Forward-owned KDA extend scratch
+
+KDA extend scratch belongs to a single forward's metadata. The shared workspace
+owner reuses the native size query and allocation across ordered layers, with
+separate storage per head count and CUDA stream. The device boundaries and host
+hint are immutable for that forward; a new forward always creates a new owner,
+even when its lengths match. This is temporary scan scratch, not cached request
+state: the LCM state-page ownership and lifetime are unchanged. Capture-private
+scratch is never retained for eager reuse. Native routing, workspace partitioning
+and scan arithmetic remain the native wrapper's responsibility.
+When the native wrapper exposes a prepared-plan API, this owner also retains
+its opaque launch plan and partition views. Old wrappers use scratch-only reuse.
+Prepared plans are built outside stream capture; capture uses the same native
+scan with per-call preparation, never retaining graph-private views for eager
+reuse. A graph explicitly consuming an externally prepared plan must retain
+that plan, like its other external input buffers. No routing rules are copied
+into runtime and no second GPU execution path is introduced.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under

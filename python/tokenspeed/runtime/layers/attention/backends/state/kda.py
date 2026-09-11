@@ -44,6 +44,7 @@ from tokenspeed_kernel.ops.attention import (
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
 )
+from tokenspeed_kernel.ops.attention.prefill_workspace import KdaPrefillWorkspace
 from tokenspeed_kernel.ops.attention.triton.capture_payload import (
     capture_replay_payload,
 )
@@ -916,6 +917,10 @@ class KdaAttnBackend(MambaAttnBackend):
         scan_boundaries = self.forward_metadata.query_start_loc_int64
         if scan_boundaries is None:
             raise RuntimeError("KDA prefill requires metadata-built int64 boundaries")
+        if self.forward_metadata.kda_prefill_workspace is None:
+            self.forward_metadata.kda_prefill_workspace = KdaPrefillWorkspace(
+                scan_boundaries, cu_seqlens_cpu
+            )
         # The scan is the terminal producer of this attention break. Its live
         # token prefix can land directly in the following graph's stable input.
         # Other enclosing breaks may have a different output geometry; retain
@@ -943,6 +948,7 @@ class KdaAttnBackend(MambaAttnBackend):
             cu_seqlens_cpu=cu_seqlens_cpu,
             lower_bound=lower_bound,
             solution=None if self.kda_backend == "auto" else self.kda_backend,
+            prefill_workspace=self.forward_metadata.kda_prefill_workspace,
             recurrent_layout=self.kda_recurrent_layout,
             out=out,
         )

@@ -123,6 +123,7 @@ def _run_case(
         *operator_inputs,
         *parameters,
         out=None,
+        prefill_workspace=None,
         initial_state=recurrent_state,
         cu_seqlens=cu_seqlens,
         lower_bound=LOWER_BOUND,

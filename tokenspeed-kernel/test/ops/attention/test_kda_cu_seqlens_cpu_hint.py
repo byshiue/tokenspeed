@@ -92,6 +92,7 @@ def test_hint_reaches_wrapper_calls(stubbed_wrapper):
         dt_bias,
         initial_state=None,
         out=None,
+        prefill_workspace=None,
         cu_seqlens=cu,
         cu_seqlens_cpu=hint,
         lower_bound=-5.0,
@@ -117,6 +118,7 @@ def test_hint_length_mismatch_raises(stubbed_wrapper):
             dt_bias,
             initial_state=None,
             out=None,
+            prefill_workspace=None,
             cu_seqlens=cu,
             cu_seqlens_cpu=torch.tensor([0, T], dtype=torch.int64),
             lower_bound=-5.0,
@@ -136,6 +138,7 @@ def test_batch_fallback_synthesizes_hint(stubbed_wrapper):
         dt_bias,
         initial_state=None,
         out=None,
+        prefill_workspace=None,
         cu_seqlens=None,
         lower_bound=-5.0,
     )
@@ -198,6 +201,7 @@ def test_facade_requires_host_boundaries(monkeypatch):
         cu_seqlens=cu,
         lower_bound=-5.0,
         out=None,
+        prefill_workspace=None,
     )
 
     with pytest.raises(TypeError):

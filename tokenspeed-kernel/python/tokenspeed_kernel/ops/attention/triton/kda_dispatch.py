@@ -668,14 +668,17 @@ def flashkda_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     traits={
         "recurrent_layout": frozenset({"v_major"}),
         "output_buffer": frozenset({True}),
+        "prefill_workspace": frozenset({True}),
     },
     tags={"nvidia", "paged_cache"},
 )
 def cutedsl_kda_nvidia_paged_prefill(
-    *, out: torch.Tensor | None, **kwargs
+    *, out: torch.Tensor | None, prefill_workspace, **kwargs
 ) -> KdaPrefillResult:
     from tokenspeed_kernel.ops.attention.cutedsl_kda import cutedsl_kda_chunk_prefill
 
     return _nvidia_kda_prefill(
-        cutedsl_kda_chunk_prefill, implementation_kwargs={"out": out}, **kwargs
+        cutedsl_kda_chunk_prefill,
+        implementation_kwargs={"out": out, "prefill_workspace": prefill_workspace},
+        **kwargs,
     )

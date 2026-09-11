@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import torch
+from tokenspeed_kernel.ops.attention.prefill_workspace import KdaPrefillWorkspace
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -4995,6 +4996,7 @@ def kda_paged_prefill(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
     out: torch.Tensor | None,
+    prefill_workspace: KdaPrefillWorkspace | None,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -5023,6 +5025,8 @@ def kda_paged_prefill(
         out: Caller-owned contiguous output with v's shape, dtype and device,
             or None to allocate. Must not overlap an input. Capable solutions
             write it directly; other solutions retain the copy handoff.
+        prefill_workspace: Scratch owner for this immutable forward, or None.
+            Only solutions declaring the prefill_workspace trait receive it.
 
     Returns:
         Packed output and final state, in the caller's ``recurrent_layout``.
@@ -5076,6 +5080,8 @@ def kda_paged_prefill(
         if spec is not None and True in spec.traits.get("output_buffer", ())
         else {}
     )
+    if spec is not None and True in spec.traits.get("prefill_workspace", ()):
+        output_kwargs["prefill_workspace"] = prefill_workspace
     result = kernel(
         q=q,
         k=k,

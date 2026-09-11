@@ -82,7 +82,9 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
     bounds = torch.tensor([0, 1], dtype=torch.int32)
     bounds64 = bounds.to(torch.int64)
     backend.forward_metadata = mamba.MambaForwardMetadata(
-        query_start_loc=bounds, query_start_loc_int64=bounds64
+        query_start_loc=bounds,
+        query_start_loc_int64=bounds64,
+        kda_prefill_workspace=None,
     )
     stored = torch.arange(24, dtype=torch.float32).view(1, 2, 3, 4)
     final = torch.empty(1, 2, 3, 4)
@@ -118,7 +120,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
         seq_len=1,
         num_real_tokens=1,
         lower_bound=-5.0,
-        cu_seqlens_cpu=(0, 1),
+        cu_seqlens_cpu=torch.tensor([0, 1], dtype=torch.int64),
     )
     assert captured["initial_state"] is stored
     assert captured["recurrent_layout"] == "v_major"
