@@ -190,12 +190,17 @@ for the whole materialized suffix through the endpoint and its reserve.
 
 When an extend materializes internal state checkpoints, convolution windows
 are assembled directly into their destination blocks by the kernel package.
+The prefill path calls that batched write before causal convolution updates
+the final continuation state; no write is needed without an internal checkpoint.
 At most one internal checkpoint per eligible request is selected. Its token
 position and packed-prefix metadata are computed once on the host; the GPU
 views share one immutable, pinned asynchronous upload. Decode has no such batch
 and does not compute checkpoint indices. Recurrent execution partitions the
 batch into a body scan and a tail scan when an internal checkpoint is needed.
-Otherwise the ordinary prefill scan runs once. Every request in a checkpoint
+Otherwise the ordinary prefill scan runs once. `_run_prefill_recurrent` owns
+both cases and always returns outputs and final states; its caller writes the
+final states to the continuation blocks. Target verification remains separate.
+Every request in a checkpoint
 batch participates in the body: rows crossing a checkpoint stop at that
 boundary, while other rows run to completion. Only crossing rows enter the
 packed tail scan, initialized directly

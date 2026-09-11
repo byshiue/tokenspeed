@@ -1660,30 +1660,7 @@ class MambaAttnBackend(AttentionBackend):
             return None
         return blocks_by_group.get(self._state_group_for(layer_id))
 
-    def _write_prefill_conv_checkpoints(
-        self,
-        raw_inputs: torch.Tensor,
-        conv_states: torch.Tensor,
-        state_in_blocks: torch.Tensor,
-        state_out_blocks: torch.Tensor,
-        checkpoint_blocks: torch.Tensor | None,
-        checkpoint_batch: _PrefillCheckpointBatch | None,
-    ) -> None:
-        """Write every request's sparse conv snapshot as one batched update."""
-        if checkpoint_blocks is None or checkpoint_batch is None:
-            return
-        write_prefill_conv_checkpoints(
-            raw_inputs,
-            conv_states,
-            state_in_blocks,
-            state_out_blocks,
-            checkpoint_blocks,
-            checkpoint_batch.rows,
-            checkpoint_batch.sequence_starts,
-            checkpoint_batch.checkpoint_seq_lens,
-        )
-
-    def _run_prefill_recurrent_checkpoint_split(
+    def _run_prefill_recurrent(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -1693,6 +1670,8 @@ class MambaAttnBackend(AttentionBackend):
         checkpoint_blocks: torch.Tensor | None,
         checkpoint_batch: _PrefillCheckpointBatch | None,
         *,
+        seq_len: int,
+        num_real_tokens: int,
         A_log: torch.Tensor,
         dt_bias: torch.Tensor,
         a: torch.Tensor | None,
@@ -1702,18 +1681,44 @@ class MambaAttnBackend(AttentionBackend):
         f_b_weight: torch.Tensor | None,
         beta_raw: torch.Tensor | None,
         lower_bound: float | None,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Scan every request body once, then continue checkpointed tails.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return prefill outputs and final states, saving internal checkpoints.
 
-        The body batch contains every request. A row crossing an internal cache
-        boundary stops at that checkpoint; all other rows run to completion.
+        Without an internal checkpoint, scan the full batch using its prepared
+        metadata. ``seq_len`` includes bucket padding; ``num_real_tokens`` does
+        not. Otherwise, the body batch contains every request. A row crossing
+        an internal cache boundary stops there; all other rows run to completion.
         The second packed batch contains only the checkpointed rows' remaining
         tails and starts from the body scan's final state. Together the two scans
         cover every input token exactly once while materializing both the aligned
         checkpoint state and the final continuation state.
         """
         if checkpoint_blocks is None or checkpoint_batch is None:
-            return None
+            metadata = self.forward_metadata
+            scan_query_start_loc = metadata.scan_query_start_loc
+            if metadata.extend_seq_lens_cpu is not None:
+                set_total_chunks_hint(
+                    metadata.extend_seq_lens_cpu, scan_query_start_loc
+                )
+            return self._prefill_scan(
+                query,
+                key,
+                value,
+                recurrent_state,
+                scan_query_start_loc,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                a=a,
+                b=b,
+                g_raw=g_raw,
+                f_a_out=f_a_out,
+                f_b_weight=f_b_weight,
+                beta_raw=beta_raw,
+                seq_len=seq_len,
+                num_real_tokens=num_real_tokens,
+                lower_bound=lower_bound,
+                cu_seqlens_cpu=metadata.cu_extend_seq_lens_cpu,
+            )
 
         num_body_tokens = checkpoint_batch.body_token_indices.numel()
         single_request = checkpoint_batch.body_seq_lens_cpu.numel() == 1
@@ -2174,7 +2179,6 @@ class MambaAttnBackend(AttentionBackend):
         )
 
         query_start_loc = self.forward_metadata.query_start_loc
-        scan_query_start_loc = self.forward_metadata.scan_query_start_loc
 
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
@@ -2252,14 +2256,18 @@ class MambaAttnBackend(AttentionBackend):
                 num_real_tokens = int(sum(int(x) for x in extend_seq_lens_cpu))
                 scrub_padding_tail(num_real_tokens, mixed_qkv, a, b)
 
-            self._write_prefill_conv_checkpoints(
-                mixed_qkv,
-                conv_states,
-                state_in_blocks,
-                state_out_blocks,
-                checkpoint_blocks,
-                checkpoint_batch,
-            )
+            if checkpoint_blocks is not None and checkpoint_batch is not None:
+                # Save internal conv states before updating the continuation state.
+                write_prefill_conv_checkpoints(
+                    mixed_qkv,
+                    conv_states,
+                    state_in_blocks,
+                    state_out_blocks,
+                    checkpoint_blocks,
+                    checkpoint_batch.rows,
+                    checkpoint_batch.sequence_starts,
+                    checkpoint_batch.checkpoint_seq_lens,
+                )
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
             mixed_qkv = causal_conv1d_fn(
                 mixed_qkv_t,
@@ -2342,7 +2350,7 @@ class MambaAttnBackend(AttentionBackend):
                 lower_bound=gate_lower_bound,
             )
         else:
-            split_result = self._run_prefill_recurrent_checkpoint_split(
+            core_attn_out, last_recurrent_state = self._run_prefill_recurrent(
                 query,
                 key,
                 value,
@@ -2350,6 +2358,8 @@ class MambaAttnBackend(AttentionBackend):
                 ssm_states,
                 checkpoint_blocks,
                 checkpoint_batch,
+                seq_len=seq_len,
+                num_real_tokens=num_real_tokens,
                 A_log=A_log,
                 dt_bias=dt_bias,
                 a=a,
@@ -2360,30 +2370,6 @@ class MambaAttnBackend(AttentionBackend):
                 beta_raw=beta_raw,
                 lower_bound=gate_lower_bound,
             )
-            if split_result is None:
-                if extend_seq_lens_cpu is not None:
-                    set_total_chunks_hint(extend_seq_lens_cpu, scan_query_start_loc)
-                core_attn_out, last_recurrent_state = self._prefill_scan(
-                    query,
-                    key,
-                    value,
-                    recurrent_state,
-                    scan_query_start_loc,
-                    A_log=A_log,
-                    dt_bias=dt_bias,
-                    a=a,
-                    b=b,
-                    g_raw=g_raw,
-                    f_a_out=f_a_out,
-                    f_b_weight=f_b_weight,
-                    beta_raw=beta_raw,
-                    seq_len=seq_len,
-                    num_real_tokens=num_real_tokens,
-                    lower_bound=gate_lower_bound,
-                    cu_seqlens_cpu=self.forward_metadata.cu_extend_seq_lens_cpu,
-                )
-            else:
-                core_attn_out, last_recurrent_state = split_result
             last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             # Extend indices never carry pad(-1), so this write is unguarded.
             ssm_states[state_out_long] = last_recurrent_state

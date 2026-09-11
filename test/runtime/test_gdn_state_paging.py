@@ -525,18 +525,24 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         )
 
     def test_conv_checkpoints_are_written_as_one_batch(self):
+        from tokenspeed_kernel.ops.attention.triton.prefill_state_checkpoints import (
+            write_prefill_conv_checkpoints,
+        )
+
         torch = self.torch
         raw = torch.arange(30, dtype=torch.float32).view(15, 2)
         states = torch.arange(60, dtype=torch.float32).view(10, 2, 3)
         source_page_two = states[2].clone()
 
-        self.backend._write_prefill_conv_checkpoints(
+        write_prefill_conv_checkpoints(
             raw,
             states,
             torch.tensor([1, 2, 3], dtype=torch.int32),
             torch.tensor([4, 5, 6], dtype=torch.int32),
             torch.tensor([-1, 7, 8], dtype=torch.int32),
-            self.plan,
+            self.plan.rows,
+            self.plan.sequence_starts,
+            self.plan.checkpoint_seq_lens,
         )
 
         expected_short = torch.stack((source_page_two[:, -1], raw[5], raw[6]), dim=1)
@@ -544,7 +550,11 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.assertTrue(torch.equal(states[7], expected_short))
         self.assertTrue(torch.equal(states[8], expected_long))
 
-    def test_recurrent_checkpoint_split_scans_body_then_tail(self):
+    def test_recurrent_prefill_scans_with_and_without_checkpoints(self):
+        from unittest.mock import patch
+
+        from tokenspeed.runtime.layers.attention.backends.state import mamba
+
         torch = self.torch
         calls = []
 
@@ -559,14 +569,9 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         recurrent = torch.arange(3, dtype=torch.float32).view(3, 1, 1, 1)
         slab = torch.zeros(10, 1, 1, 1)
 
-        output, final_state = self.backend._run_prefill_recurrent_checkpoint_split(
-            tokens,
-            tokens,
-            tokens,
-            recurrent,
-            slab,
-            torch.tensor([-1, 7, 8], dtype=torch.int32),
-            self.plan,
+        scan_kwargs = dict(
+            seq_len=15,
+            num_real_tokens=15,
             A_log=torch.empty(1),
             dt_bias=torch.empty(1),
             a=per_token,
@@ -576,6 +581,17 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             f_b_weight=torch.empty(1),
             beta_raw=per_token,
             lower_bound=-5.0,
+        )
+        checkpoint_blocks = torch.tensor([-1, 7, 8], dtype=torch.int32)
+        output, final_state = self.backend._run_prefill_recurrent(
+            tokens,
+            tokens,
+            tokens,
+            recurrent,
+            slab,
+            checkpoint_blocks,
+            self.plan,
+            **scan_kwargs,
         )
 
         self.assertEqual(len(calls), 2)
@@ -602,7 +618,60 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         self.assertEqual(final_state.flatten().tolist(), [100, 201, 202])
         self.assertEqual(slab[[7, 8]].flatten().tolist(), [101, 102])
 
+        # The same entry point also handles a complete scan, including padding,
+        # without writing checkpoint or continuation slots in the state pool.
+        boundaries = torch.tensor([0, 5, 9, 15], dtype=torch.int64)
+        padded_tokens = torch.arange(16, dtype=torch.float32).view(1, 16, 1, 1)
+        fallback_kwargs = dict(scan_kwargs, seq_len=16)
+        for blocks, plan in (
+            (None, None),
+            (None, self.plan),
+            (checkpoint_blocks, None),
+        ):
+            for lengths in (None, torch.tensor([5, 4, 6], dtype=torch.int32)):
+                with self.subTest(
+                    blocks=blocks is not None,
+                    plan=plan is not None,
+                    has_lengths=lengths is not None,
+                ), patch.object(mamba, "set_total_chunks_hint") as hint:
+                    calls.clear()
+                    self.backend.forward_metadata = SimpleNamespace(
+                        scan_query_start_loc=boundaries,
+                        extend_seq_lens_cpu=lengths,
+                        cu_extend_seq_lens_cpu=boundaries,
+                    )
+                    saved_slab = slab.clone()
+                    output, final_state = self.backend._run_prefill_recurrent(
+                        padded_tokens,
+                        padded_tokens,
+                        padded_tokens,
+                        recurrent,
+                        slab,
+                        blocks,
+                        plan,
+                        **fallback_kwargs,
+                    )
+                    self.assertEqual(len(calls), 1)
+                    query, _, _, initial, scan_boundaries, kwargs = calls[0]
+                    self.assertIs(query, padded_tokens)
+                    self.assertIs(initial, recurrent)
+                    self.assertIs(scan_boundaries, boundaries)
+                    self.assertIs(kwargs["cu_seqlens_cpu"], boundaries)
+                    self.assertEqual(kwargs["seq_len"], 16)
+                    self.assertEqual(kwargs["num_real_tokens"], 15)
+                    self.assertTrue(torch.equal(output, padded_tokens.squeeze(0)))
+                    self.assertTrue(torch.equal(final_state, recurrent + 100))
+                    self.assertTrue(torch.equal(slab, saved_slab))
+                    if lengths is None:
+                        hint.assert_not_called()
+                    else:
+                        hint.assert_called_once_with(lengths, boundaries)
+
     def test_single_checkpoint_uses_the_same_pack_and_write_contract(self):
+        from tokenspeed_kernel.ops.attention.triton.prefill_state_checkpoints import (
+            write_prefill_conv_checkpoints,
+        )
+
         torch = self.torch
         from tokenspeed.runtime.layers.attention.backends.state.mamba import (
             _build_prefill_checkpoint_batch,
@@ -619,13 +688,15 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         raw = torch.arange(10, dtype=torch.float32).view(5, 2)
         conv_states = torch.arange(36, dtype=torch.float32).view(6, 2, 3)
         source = conv_states[1].clone()
-        self.backend._write_prefill_conv_checkpoints(
+        write_prefill_conv_checkpoints(
             raw,
             conv_states,
             torch.tensor([1], dtype=torch.int32),
             torch.tensor([2], dtype=torch.int32),
             torch.tensor([4], dtype=torch.int32),
-            plan,
+            plan.rows,
+            plan.sequence_starts,
+            plan.checkpoint_seq_lens,
         )
         expected_conv = torch.stack((source[:, -1], raw[0], raw[1]), dim=1)
         self.assertTrue(torch.equal(conv_states[4], expected_conv))
@@ -641,7 +712,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
         per_token = tokens.view(5, 1)
         recurrent = torch.tensor([[[[3.0]]]])
         slab = torch.zeros(6, 1, 1, 1)
-        output, final_state = self.backend._run_prefill_recurrent_checkpoint_split(
+        output, final_state = self.backend._run_prefill_recurrent(
             tokens,
             tokens,
             tokens,
@@ -649,6 +720,8 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
             slab,
             torch.tensor([4], dtype=torch.int32),
             plan,
+            seq_len=5,
+            num_real_tokens=5,
             A_log=torch.empty(1),
             dt_bias=torch.empty(1),
             a=per_token,
@@ -1403,17 +1476,17 @@ class TritonCheckpointContinuationTest(unittest.TestCase):
                 checkpoint_blocks = torch.tensor(
                     [3, 4], device="cuda", dtype=torch.int32
                 )
-                actual_out, actual_state = (
-                    backend._run_prefill_recurrent_checkpoint_split(
-                        q,
-                        k,
-                        v,
-                        initial,
-                        slab,
-                        checkpoint_blocks,
-                        plan,
-                        **kwargs,
-                    )
+                actual_out, actual_state = backend._run_prefill_recurrent(
+                    q,
+                    k,
+                    v,
+                    initial,
+                    slab,
+                    checkpoint_blocks,
+                    plan,
+                    seq_len=n,
+                    num_real_tokens=n,
+                    **kwargs,
                 )
                 torch.testing.assert_close(
                     actual_out, expected_out, atol=2e-3, rtol=1e-2
