@@ -91,16 +91,4 @@ def cutedsl_kda_workspace_size(cu_seqlens, heads: int, cu_seqlens_cpu=None) -> i
 
 def cutedsl_kda_forward(*args, **kwargs):
     """Run the token-major KDA forward and return ``(out, new_state)``."""
-    if "out" in kwargs:
-        return _module().cutedsl_kda_forward_out(*args, **kwargs)
     return _module().cutedsl_kda_forward(*args, **kwargs)
-
-
-@lru_cache(maxsize=1)
-def cutedsl_kda_supports_output_buffer() -> bool:
-    """Whether the installed wrapper accepts a caller-owned forward output.
-
-    Older wheels remain supported through the adapter's copy fallback. This
-    capability describes the Python wrapper API, not a different GPU kernel.
-    """
-    return callable(getattr(_module(), "cutedsl_kda_forward_out", None))

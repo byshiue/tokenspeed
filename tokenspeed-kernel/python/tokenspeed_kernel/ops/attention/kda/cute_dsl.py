@@ -23,20 +23,17 @@
 States use the native ``[N, HV, V, K]`` convention, matching the NVIDIA
 cache and the CuteDSL ABI. The dispatch facade adapts other cache layouts;
 this wrapper must not transpose the state a second time. The native
-token-major build reads ``[B, T, H, D]`` activations directly. Gate casting
-and packing strided beta logits share one preparation kernel. Sigmoid(beta),
-the safe gate, and QK L2 normalization run in-kernel, like the FLA and
-FlashKDA paths. The safe-gate lower bound is baked into the CUBIN and
-validated on every call.
+token-major build reads ``[B, T, H, D]`` activations directly. PyTorch casts
+the gate to FP32 and packs strided beta logits into contiguous storage.
+Sigmoid(beta), the safe gate, and QK L2 normalization run in-kernel, like the
+FLA and FlashKDA paths. The safe-gate lower bound is baked into the CUBIN
+and validated on every call.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
-from tokenspeed_kernel.ops.attention.kda._triton.prefill_inputs import (
-    prepare_kda_prefill_gate_beta,
-)
 from tokenspeed_kernel.ops.attention.kda.triton import (
     _DENSE_HALF_SIGNATURES,
     _nvidia_kda_prefill,
@@ -47,7 +44,6 @@ from tokenspeed_kernel.thirdparty.cutedsl_kda import (
     DEFAULT_SCALE,
     cutedsl_kda_check_config,
     cutedsl_kda_forward,
-    cutedsl_kda_supports_output_buffer,
     cutedsl_kda_workspace_size,
     is_cutedsl_kda_installed,
 )
@@ -63,18 +59,11 @@ __all__ = ["cutedsl_kda_chunk_prefill", "is_cutedsl_kda_installed"]
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={
-        "recurrent_layout": frozenset({"v_major"}),
-        "output_buffer": frozenset({True}),
-    },
+    traits={"recurrent_layout": frozenset({"v_major"})},
     tags={"nvidia", "paged_cache"},
 )
-def cutedsl_kda_nvidia_paged_prefill(
-    *, out: torch.Tensor | None, **kwargs
-) -> KdaPrefillResult:
-    return _nvidia_kda_prefill(
-        cutedsl_kda_chunk_prefill, implementation_kwargs={"out": out}, **kwargs
-    )
+def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
+    return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill, **kwargs)
 
 
 def cutedsl_kda_chunk_prefill(
@@ -86,7 +75,6 @@ def cutedsl_kda_chunk_prefill(
     A_log: torch.Tensor,
     dt_bias: torch.Tensor | None = None,
     *,
-    out: torch.Tensor | None,
     initial_state: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
     cu_seqlens_cpu: torch.Tensor | None = None,
@@ -120,9 +108,6 @@ def cutedsl_kda_chunk_prefill(
         lower_bound: Safe-gate lower bound; required, and must match the
             value baked into the CUBIN (validated).
         beta_is_logit: Must be True; the kernel always applies sigmoid.
-        out: Contiguous destination with v's shape, dtype and device, or None
-            to allocate. Must not overlap inputs. Older native wrappers use a
-            copy fallback; output-buffer-capable wrappers write it directly.
 
     Returns:
         ``(o [B, T, HV, V], final_state [N, HV, V, K])`` in native layout.
@@ -137,14 +122,6 @@ def cutedsl_kda_chunk_prefill(
     # loudly rather than silently mis-gate.
     cutedsl_kda_check_config(float(lower_bound))
     batch, tokens, num_heads, key_dim = q.shape
-    destination = out
-    if out is not None and (
-        out.shape != v.shape
-        or out.dtype != v.dtype
-        or out.device != v.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError("KDA out must be contiguous with v's shape, dtype and device")
     num_value_heads, value_dim = v.shape[2], v.shape[-1]
     if cu_seqlens is not None:
         num_sequences = cu_seqlens.numel() - 1
@@ -175,12 +152,13 @@ def cutedsl_kda_chunk_prefill(
         g_raw = g_raw.reshape(1, batch * tokens, num_value_heads, key_dim)
         beta = beta.reshape(1, batch * tokens, num_value_heads)
     # Native token-major ABI: no head-major re-layout. Gate must be FP32
-    # and beta may be a strided slice of the merged projection, so pack
-    # both together into the contiguous memory the kernel descriptors index.
+    # and beta may be a strided slice of the merged projection; contiguous()
+    # pins the token-major memory the kernel descriptors index.
     q = q.contiguous()
     k = k.contiguous()
     v = v.contiguous()
-    g_f32, beta = prepare_kda_prefill_gate_beta(g_raw, beta)
+    g_f32 = g_raw.float().contiguous()
+    beta = beta.contiguous()
     dt_bias = dt_bias.reshape(num_value_heads, key_dim).contiguous()
     A_log = A_log.contiguous()
     # The dispatch layout trait already matches the native [N, HV, V, K]
@@ -204,10 +182,7 @@ def cutedsl_kda_chunk_prefill(
     workspace = (
         torch.empty(ws_bytes, dtype=torch.uint8, device=q.device) if ws_bytes else None
     )
-    output_kwargs = {}
-    if out is not None and cutedsl_kda_supports_output_buffer():
-        output_kwargs["out"] = out.reshape(v.shape)
-    result, final_state = cutedsl_kda_forward(
+    out, final_state = cutedsl_kda_forward(
         q,
         k,
         v,
@@ -220,11 +195,5 @@ def cutedsl_kda_chunk_prefill(
         scale=DEFAULT_SCALE,
         workspace=workspace,
         cu_seqlens_cpu=cu_seqlens_cpu,
-        **output_kwargs,
     )
-    result = result.view(batch, tokens, num_value_heads, value_dim)
-    if destination is not None:
-        if result.data_ptr() != destination.data_ptr():
-            destination.copy_(result)
-        result = destination
-    return result, final_state
+    return out.view(batch, tokens, num_value_heads, value_dim), final_state

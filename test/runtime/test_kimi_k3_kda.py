@@ -71,10 +71,7 @@ register_cuda_ci(est_time=240, suite="runtime-1gpu")
 _LOWER_BOUND = -5.0
 
 
-@pytest.mark.parametrize("handoff_kind", ["none", "matching", "other_shape"])
-def test_prefill_hands_the_stored_state_to_the_op_untouched(
-    monkeypatch, handoff_kind
-) -> None:
+def test_prefill_hands_the_stored_state_to_the_op_untouched(monkeypatch) -> None:
     backend = object.__new__(KdaAttnBackend)
     backend.kda_recurrent_layout = "v_major"
     backend.kda_backend = "auto"
@@ -87,12 +84,6 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
     stored = torch.arange(24, dtype=torch.float32).view(1, 2, 3, 4)
     final = torch.empty(1, 2, 3, 4)
     captured = {}
-    handoff = (
-        None
-        if handoff_kind == "none"
-        else torch.empty((1, 2, 4) if handoff_kind == "matching" else (1, 8))
-    )
-    monkeypatch.setattr(kda, "current_break_output", lambda: handoff)
 
     def fake_prefill(*_args, **kwargs):
         captured.update(kwargs)
@@ -124,11 +115,7 @@ def test_prefill_hands_the_stored_state_to_the_op_untouched(
     assert captured["recurrent_layout"] == "v_major"
     assert captured["cu_seqlens"] is bounds64
     assert final_state is final
-    if handoff_kind == "matching":
-        assert captured["out"].shape == (1, 1, 2, 4)
-        assert captured["out"].data_ptr() == handoff.data_ptr()
-    else:
-        assert captured["out"] is None
+    assert "out" not in captured
 
 
 def _backend_config(device: str, *, spec_tokens: int = 1):

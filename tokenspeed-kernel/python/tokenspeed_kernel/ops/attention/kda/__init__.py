@@ -150,7 +150,6 @@ def kda_paged_prefill(
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor,
-    out: torch.Tensor | None,
     lower_bound: float | None = -5.0,
     override: str | None = None,
     solution: str | None = None,
@@ -176,9 +175,6 @@ def kda_paged_prefill(
         solution: Optional registered solution name.
         recurrent_layout: Layout of the backend-owned recurrent state; the
             platform default when omitted.
-        out: Caller-owned contiguous output with v's shape, dtype and device,
-            or None to allocate. Must not overlap an input. Capable solutions
-            write it directly; other solutions retain the copy handoff.
 
     Returns:
         Packed output and final state, in the caller's ``recurrent_layout``.
@@ -190,13 +186,6 @@ def kda_paged_prefill(
         raise ValueError("KDA q, k, and g_raw must have identical shapes")
     if v.ndim != 4 or v.shape[:3] != q.shape[:3]:
         raise ValueError("KDA v must match q through the head dimension")
-    if out is not None and (
-        out.shape != v.shape
-        or out.dtype != v.dtype
-        or out.device != v.device
-        or not out.is_contiguous()
-    ):
-        raise ValueError("KDA out must be contiguous with v's shape, dtype and device")
     if beta_logits.shape != q.shape[:-1]:
         raise ValueError("KDA beta logits must be [1, total_tokens, heads]")
     num_sequences = cu_seqlens.numel() - 1
@@ -227,11 +216,6 @@ def kda_paged_prefill(
     relayout = supported is not None and recurrent_layout not in supported
     if relayout:
         initial_state = initial_state.transpose(-1, -2).contiguous()
-    output_kwargs = (
-        {"out": out}
-        if spec is not None and True in spec.traits.get("output_buffer", ())
-        else {}
-    )
     result = kernel(
         q=q,
         k=k,
@@ -244,11 +228,7 @@ def kda_paged_prefill(
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
         lower_bound=lower_bound,
-        **output_kwargs,
     )
-    if out is not None and result.out is not out:
-        out.copy_(result.out)
-        result = KdaPrefillResult(out, result.final_state)
     if relayout:
         # Hand the final state back in the caller's layout (a view; no copy).
         return KdaPrefillResult(result.out, result.final_state.transpose(-1, -2))

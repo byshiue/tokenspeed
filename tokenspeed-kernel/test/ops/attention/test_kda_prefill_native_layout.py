@@ -57,7 +57,6 @@ def _actual(inputs, state, bounds, cpu, layout):
         override=None,
         solution="cutedsl_kda",
         recurrent_layout=layout,
-        out=None,
     )
 
 
@@ -73,6 +72,7 @@ def test_dispatch_native_state_and_shared_boundaries(monkeypatch, layout):
     final = native_state + 1
 
     def forward(q, k, v, g, a_log, dt_bias, beta, boundaries, initial, **kwargs):
+        assert "out" not in kwargs
         assert boundaries is bounds
         assert torch.equal(initial, native_state)
         if layout == "v_major":

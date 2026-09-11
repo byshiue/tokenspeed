@@ -581,35 +581,12 @@ The NVIDIA CuteDSL prefill adapter declares its native `v_major`
 (`[N, H, V, K]`) state layout. The dispatch facade alone adapts a caller
 with another layout; the wrapper must not round-trip native state through
 FLA's `[N, H, K, V]` convention. Direct wrapper callers use the native
-layout for both initial and final state. Token-major gate conversion to
-FP32 and strided beta packing share one kernel, preserving their values.
-Neither change modifies the native scan, its gate math, or GEMM arithmetic.
-
-## Prefill graph output destinations
-
-The breakable graph owns each eager break's stable handoff buffer. During
-replay it publishes that destination only for the duration of the break,
-through `current_break_output()`; first capture and ordinary eager execution
-return None. Attention backends do not cache it or allocate another persistent
-output pool. A terminal producer may use a compatible leading view as its
-output, never as intermediate storage. An incompatible enclosing break retains
-the existing result-copy handoff. A nested decorated break masks its parent's
-destination even when their output geometries match: an inner result may still
-be live when another inner producer runs.
-
-KDA prefill passes a contiguous live-token view through the same dispatch API
-used without graphs. The CuteDSL adapter can pass that destination to an
-output-buffer-capable native Python wrapper; older wheels and other selected
-solutions retain a copy fallback. The wrapper extension changes allocation
-and output-pointer plumbing only, not scan arithmetic or native binaries.
-
-The graph's landing check recognizes an exact leading alias by shape, dtype,
-device, strides and pointer, not Python identity alone. It must not skip a
-copy for a transpose or dtype reinterpretation at the same address. Padding
-cleanup remains graph-owned and runs after the producer, including the direct
-write case. Same-shaped breaks may share a destination only with the existing
-strictly sequential output lifetimes; graph-pool reuse and bucket switching
-must not extend a borrowed view's lifetime beyond its break.
+layout for both initial and final state. Gate conversion to FP32 and beta
+packing retain their ordinary PyTorch operations. The native wrapper allocates
+the scan output; breakable graph replay copies it into the graph-owned stable
+handoff buffer. No output-buffer extension to the native wrapper is required.
+These preparation changes modify neither the native scan, its gate math, nor
+GEMM arithmetic.
 
 ## Non-goals
 

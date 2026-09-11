@@ -46,8 +46,7 @@ Address-stability contract (the load-bearing invariant):
   capture before calling :meth:`BreakableCapture.replay`.
 * Break-point outputs must land at the *same* address each replay. We achieve
   this by allocating a destination buffer in the captured segment (pool-pinned)
-  and copying the eager op's result into it, or letting its terminal producer
-  write it directly via current_break_output(); the next segment reads that address.
+  and copying the eager op's result into it; the next segment reads that address.
 """
 
 from __future__ import annotations
@@ -68,7 +67,6 @@ __all__ = [
     "break_here",
     "break_point",
     "current_forward_ctx",
-    "current_break_output",
     "current_valid_rows",
     "is_breakable_capture_active",
     "scrub_padding_tail",
@@ -81,20 +79,6 @@ __all__ = [
 _ambient_ctx: Any = None
 # Real leading rows of the replay in progress; see current_valid_rows.
 _replay_valid_rows: int | None = None
-# Scoped to the eager break being executed; never retained on an attention backend.
-_break_output: torch.Tensor | None = None
-
-
-def current_break_output() -> torch.Tensor | None:
-    """Return the current break's stable output destination, when already known.
-
-    None on the first capture invocation, outside an eager break, and inside a
-    nested decorated break (whose output need not be its parent's result). A terminal
-    producer may write a compatible leading view directly instead of allocating
-    a temporary result. It must not use this buffer for intermediates or inputs;
-    the break still owns the destination's lifetime and padding cleanup.
-    """
-    return _break_output
 
 
 @contextmanager
@@ -334,8 +318,7 @@ def _record_break(
     ``resolve_dst(result)`` maps the break's first output to its stable handoff
     buffer; it is called once (on the capture-time invocation) and the buffer is
     reused verbatim on every replay, where the (possibly shorter, see
-    :func:`_land_in`) live result is copied into it unless the terminal producer
-    already wrote the destination's matching leading view.
+    :func:`_land_in`) live result is copied into it.
     """
     weak_args = tuple(weak_ref_tensor(a) for a in args)
     weak_kwargs = {k: weak_ref_tensor(v) for k, v in kwargs.items()}
@@ -344,21 +327,15 @@ def _record_break(
     state: dict[str, torch.Tensor] = {}
 
     def replay_fn() -> torch.Tensor:
-        global _break_output
         live_ctx = current_forward_ctx()
 
         def sub(a: Any) -> Any:
             return live_ctx if a is captured_ctx else a
 
-        previous_output = _break_output
-        _break_output = state.get("dst")
-        try:
-            result = fn(
-                *(sub(a) for a in weak_args),
-                **{k: sub(v) for k, v in weak_kwargs.items()},
-            )
-        finally:
-            _break_output = previous_output
+        result = fn(
+            *(sub(a) for a in weak_args),
+            **{k: sub(v) for k, v in weak_kwargs.items()},
+        )
         dst = state.get("dst")
         if dst is None:
             dst = state["dst"] = resolve_dst(result)
@@ -435,19 +412,9 @@ def break_point(method: Callable | None = None) -> Callable:
     def decorator(method: Callable) -> Callable:
         @functools.wraps(method)
         def wrapper(*args: Any, **kwargs: Any) -> Any:
-            global _break_output
             # Zero-overhead passthrough off the capture path (no 0-row skipping here).
             if not is_breakable_capture_active():
-                if _break_output is None:
-                    return method(*args, **kwargs)
-                # A nested break is not necessarily the enclosing break's
-                # terminal producer, even if their output shapes happen to match.
-                previous_output = _break_output
-                _break_output = None
-                try:
-                    return method(*args, **kwargs)
-                finally:
-                    _break_output = previous_output
+                return method(*args, **kwargs)
             cap = BreakableCapture.current()
 
             def resolve_dst(result: torch.Tensor) -> torch.Tensor:
@@ -514,16 +481,7 @@ def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:
     """
     if result is dst:
         return
-    target = dst if result.shape == dst.shape else dst.narrow(0, 0, result.shape[0])
-    # A producer can return a squeeze/view of the destination's live prefix.
-    # Pointer equality alone is insufficient: reinterpretations and transposes
-    # must not be mistaken for an already-landed result.
-    if (
-        result.shape == target.shape
-        and result.dtype == target.dtype
-        and result.device == target.device
-        and result.stride() == target.stride()
-        and result.data_ptr() == target.data_ptr()
-    ):
-        return
-    target.copy_(result)
+    if result.shape == dst.shape:
+        dst.copy_(result)
+    else:
+        dst.narrow(0, 0, result.shape[0]).copy_(result)
