@@ -172,8 +172,7 @@ def test_flash_original_wrapper_preserves_state_and_int64_boundaries(monkeypatch
 def test_original_adapters_preserve_runtime_v_major_state(
     monkeypatch, stubbed_wrapper, solution
 ):
-    import tokenspeed_kernel.ops.attention as attn
-    import tokenspeed_kernel.ops.attention.triton.kda_dispatch as kd
+    import tokenspeed_kernel.ops.attention.kda as attn
     from tokenspeed_kernel.registry import KernelRegistry
 
     def fake_flash_kda_fwd():
@@ -191,7 +190,8 @@ def test_original_adapters_preserve_runtime_v_major_state(
     )
     spec = KernelRegistry.get().get_by_name(name)
     assert spec.traits["recurrent_layout"] == frozenset({"k_major"})
-    selected = SelectedKernel(name, getattr(kd, name))
+    adapter = cutedsl_op if solution == "cutedsl_kda" else flash_op
+    selected = SelectedKernel(name, getattr(adapter, name))
     monkeypatch.setattr(attn, "select_kernel", lambda *args, **kwargs: selected)
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     state = torch.arange(HV * K * V, dtype=torch.float32).view(1, HV, V, K)
@@ -237,7 +237,7 @@ def test_hint_length_mismatch_raises(stubbed_wrapper):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_cutedsl_original_adapter_split_matches_full_scan():
-    import tokenspeed_kernel.ops.attention as attn
+    import tokenspeed_kernel.ops.attention.kda as attn
 
     if not cutedsl_op.is_cutedsl_kda_installed():
         pytest.skip("CuteDSL KDA is not available on this GPU")

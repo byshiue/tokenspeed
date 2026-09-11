@@ -39,7 +39,7 @@ group's retention, never by call site:
   to decode — raised on a decoding role's first chunk to the rest of the prompt
   plus the admission headroom (§4), so a partially prefetched request is never
   stranded.
-- *Sliding-window* groups (either family) recycle slid-out pages, so the rest
+- *Sliding-window* groups recycle slid-out pages, so the rest
   of the prompt costs them nothing: they hold only the decode slot.
   Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
   waiting on a pool that had room for it.

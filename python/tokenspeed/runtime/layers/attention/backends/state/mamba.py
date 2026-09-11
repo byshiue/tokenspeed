@@ -29,6 +29,12 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
+    PackedPrefillCheckpointInputs,
+    pack_prefill_recurrent_checkpoint_inputs,
+    write_prefill_conv_checkpoints,
+    write_prefill_recurrent_checkpoints,
+)
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill,
     gdn_decode_mtp,
@@ -41,12 +47,6 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint_uniform,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
-from tokenspeed_kernel.ops.attention.triton.prefill_state_checkpoints import (
-    PackedPrefillCheckpointInputs,
-    pack_prefill_recurrent_checkpoint_inputs,
-    write_prefill_conv_checkpoints,
-    write_prefill_recurrent_checkpoints,
-)
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,

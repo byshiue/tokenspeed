@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused sparse state-checkpoint preparation for recurrent prefill."""
+"""Shared Triton checkpoint preparation for GDN and KDA recurrent prefill."""
 
 from __future__ import annotations
 

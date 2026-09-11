@@ -513,7 +513,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
                 )
 
     def test_conv_checkpoints_are_written_as_one_batch(self):
-        from tokenspeed_kernel.ops.attention.triton.prefill_state_checkpoints import (
+        from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
             write_prefill_conv_checkpoints,
         )
 
@@ -656,7 +656,7 @@ class PrefillCheckpointBatchTest(unittest.TestCase):
                         hint.assert_called_once_with(lengths, boundaries)
 
     def test_single_checkpoint_uses_the_same_pack_and_write_contract(self):
-        from tokenspeed_kernel.ops.attention.triton.prefill_state_checkpoints import (
+        from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
             write_prefill_conv_checkpoints,
         )
 
@@ -1410,7 +1410,7 @@ class TritonCheckpointContinuationTest(unittest.TestCase):
             self.skipTest("GPU required")
         from unittest.mock import patch
 
-        from tokenspeed_kernel.ops.attention.triton.gated_delta_rule import (
+        from tokenspeed_kernel.ops.attention.gdn.triton import (
             triton_gdn_chunk_prefill,
         )
 

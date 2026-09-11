@@ -258,8 +258,7 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
         cfg.cache_groups = [
             ts.CacheGroupConfig(
                 group_id="state",
-                rows_per_page=block_granularity,
-                entry_stride_tokens=1,
+                block_granularity=block_granularity,
                 total_pages=usable_blocks + 1,
                 retention=ts.CacheRetention.FullHistory,
                 family=ts.CacheGroupFamily.State,
@@ -310,8 +309,7 @@ def test_decode_reuses_only_materialized_state_boundary(
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id="state",
-            rows_per_page=state_granularity,
-            entry_stride_tokens=1,
+            block_granularity=state_granularity,
             total_pages=33,
             retention=ts.CacheRetention.FullHistory,
             family=ts.CacheGroupFamily.State,

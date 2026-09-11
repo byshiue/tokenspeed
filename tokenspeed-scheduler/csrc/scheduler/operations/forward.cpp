@@ -137,13 +137,13 @@ struct PrefillReserve {
 // growth block (max(block_granularity, decode)) on the admission that
 // finishes shaping them, so the first boundary crossing never needs an empty
 // parent; every other round reserves 0 there.
-std::int32_t groupReserveTokens(const CacheGroupConfig& group, std::int32_t block_granularity,
-                                const PrefillReserve& reserve) {
+std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillReserve& reserve) {
     if (group.IsSnapshotStateGroup()) {
         if (!reserve.reserve_snapshot_state_growth) {
             return 0;
         }
-        return static_cast<std::int32_t>(SnapshotStateReserveTokens(block_granularity, reserve.decode_input_tokens));
+        return static_cast<std::int32_t>(
+            SnapshotStateReserveTokens(group.block_granularity, reserve.decode_input_tokens));
     }
     if (group.retention == CacheGroupConfig::Retention::SlidingWindow) {
         return reserve.DecodeTokens();
@@ -152,14 +152,13 @@ std::int32_t groupReserveTokens(const CacheGroupConfig& group, std::int32_t bloc
 }
 
 void reservePrefillDemands(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
-                           const CacheCoordinator& coordinator, const PrefillReserve& reserve) {
+                           const PrefillReserve& reserve) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
     _assert(reserve.decode_input_tokens >= 0 && reserve.prompt_headroom_tokens >= 0,
             "prefill reserve inputs must be non-negative");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].reserve_tokens == 0, "a prefill demand's reserve is decided here and nowhere else");
-        demands[i].reserve_tokens = groupReserveTokens(
-            cache_groups[i], coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i)), reserve);
+        demands[i].reserve_tokens = groupReserveTokens(cache_groups[i], reserve);
     }
 }
 
@@ -386,7 +385,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     };
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
     std::vector<GroupDemand> demands = makeGroupDemands(tables, GroupDemand{.num_tokens = prefill_tokens});
-    reservePrefillDemands(demands, config_.cache_groups, coordinator_, reserve);
+    reservePrefillDemands(demands, config_.cache_groups, reserve);
     if (source == fsm::PrefillSource::kLocal) {
         makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
     }
@@ -487,7 +486,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      .stream_completed_to_host = config_.StreamsDeviceCacheToHost(),
                                      .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
                                  });
-    reservePrefillDemands(demands, config_.cache_groups, coordinator_, reserve);
+    reservePrefillDemands(demands, config_.cache_groups, reserve);
     makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
     if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page, demands)) {
         return std::nullopt;

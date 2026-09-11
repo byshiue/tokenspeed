@@ -44,8 +44,7 @@ def test_final_extent_and_decode_through_runtime_config(
     groups = [
         ts.CacheGroupConfig(
             group_id="history",
-            rows_per_page=128,
-            entry_stride_tokens=1,
+            block_granularity=128,
             total_pages=64,
             retention=ts.CacheRetention.FullHistory,
             family=ts.CacheGroupFamily.History,
@@ -55,8 +54,7 @@ def test_final_extent_and_decode_through_runtime_config(
         groups.append(
             ts.CacheGroupConfig(
                 group_id="state",
-                rows_per_page=128,
-                entry_stride_tokens=1,
+                block_granularity=128,
                 total_pages=64,
                 retention=ts.CacheRetention.FullHistory,
                 family=ts.CacheGroupFamily.State,
