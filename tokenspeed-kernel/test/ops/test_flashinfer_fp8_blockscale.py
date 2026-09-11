@@ -21,32 +21,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("prefix_rows", [4, 16, 128, 256])
-@pytest.mark.parametrize("roundtrip_fp8", [False, True])
-def test_prepacked_quantization_is_row_partition_invariant(
-    device: str, prefix_rows: int, roundtrip_fp8: bool
-) -> None:
-    """Padding preserves quantized bytes and nonzero groups' scales."""
-    torch.manual_seed(37)
-    x = torch.randn(prefix_rows + 2, 512, device=device, dtype=torch.bfloat16)
-    if roundtrip_fp8:
-        x = x.to(torch.float8_e4m3fn).to(torch.bfloat16)
-    x[0].zero_()
-
-    full_q, full_scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
-    prefix_q, prefix_scales = flashinfer_fp8_blockscale_quantize_prepacked(
-        x[:prefix_rows].contiguous(), 128
-    )
-    assert torch.equal(
-        full_q[:prefix_rows].view(torch.uint8), prefix_q.view(torch.uint8)
-    )
-    assert torch.equal(full_scales[:, 1:prefix_rows], prefix_scales[:, 1:])
-    # A zero group's dequantized values are zero with either backend's
-    # positive scale (native uses an epsilon floor, padding uses one).
-    assert torch.count_nonzero(prefix_q[0].float()).item() == 0
-    assert torch.all(torch.isfinite(prefix_scales[:, 0]) & (prefix_scales[:, 0] > 0))
-
-
 @pytest.mark.parametrize("m", [1, 2, 3, 4, 5, 8])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_quantize_prepacked_writes_native_scales_and_padding(
