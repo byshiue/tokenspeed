@@ -233,7 +233,13 @@ TEST_F(MambaStateCheckpointSuite, BatchesFinalExtentInOneForward) {
     EXPECT_EQ(op->request_ids, (std::vector<std::string>{"a", "b"}));
     EXPECT_EQ(op->input_lengths, (std::vector<std::int32_t>{10, 10}));
     for (const auto& row : op->block_tables.at("state")) {
-        EXPECT_EQ(row.size(), 4u);  // aligned checkpoint, endpoint, and growth
+        // Four logical slots, but only three physical blocks: the skipped
+        // token-4 checkpoint stays null; token-8, token-10 and growth are live.
+        ASSERT_EQ(row.size(), 4u);
+        EXPECT_EQ(row[0], 0);
+        EXPECT_GT(row[1], 0);
+        EXPECT_GT(row[2], 0);
+        EXPECT_GT(row[3], 0);
     }
 }
 
@@ -362,20 +368,7 @@ protected:
     }
 };
 
-TEST_F(MambaStateCheckpointPrefillRoleSuite, KeepsLocalFinalExtentWhole) {
-    RequestSpec spec = MakeRequestSpec("r1", /*num_pages=*/3);
-    spec.tokens.resize(10);
-    Submit(spec);
-    SendBootstrapped("r1");
-
-    ExecutionPlan plan = PlanOnce();
-    const ForwardBatch* batch = FindForwardBatch(plan);
-    ASSERT_NE(batch, nullptr);
-    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
-    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{10});
-}
-
-TEST_F(MambaStateCheckpointPrefillRoleSuite, HoldsRemoteDecodeUntilTheFinalChunkResultLands) {
+TEST_F(MambaStateCheckpointPrefillRoleSuite, CompletesOneForwardBeforeRemoteDecode) {
     // A request turns PrefillDone when its last chunk is SCHEDULED, and its
     // remote decode needs the bootstrap token that lands with that chunk's
     // result.  The plan must hold the remote decode until then -- and emit
@@ -388,7 +381,14 @@ TEST_F(MambaStateCheckpointPrefillRoleSuite, HoldsRemoteDecodeUntilTheFinalChunk
     ExecutionPlan final_plan = PlanOnce();
     const ForwardBatch* final = FindForwardBatch(final_plan);
     ASSERT_NE(final, nullptr);
+    EXPECT_EQ(final->extend_prefix_lens, std::vector<std::int32_t>{0});
     EXPECT_EQ(final->input_lengths, std::vector<std::int32_t>{10});
+    // A prefill-only worker owns the two outputs, but no local decode reserve.
+    const auto& state_row = final->block_tables.at("state").at(0);
+    ASSERT_EQ(state_row.size(), 3u);
+    EXPECT_EQ(state_row[0], 0);
+    EXPECT_GT(state_row[1], 0);
+    EXPECT_GT(state_row[2], 0);
     // r1 is PrefillDone from here on.
     EXPECT_FALSE(final_plan.remote_decode.has_value());
 

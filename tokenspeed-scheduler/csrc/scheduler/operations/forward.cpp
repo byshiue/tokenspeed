@@ -102,7 +102,7 @@ void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<co
         // A completing prefill may end off a prefix boundary. Materialize the
         // last completed checkpoint as well as the final continuation state:
         // the runtime writes both from this one model forward. Earlier slots
-        // remain holes, preserving absolute state-page identity.
+        // remain holes, preserving absolute block-table positions.
         const std::int32_t first_materialized_token =
             StateCheckpointMaterializationStart(before_tokens, after_tokens, coordinator.PrefixGranularity());
         demands[i].materialized_suffix_start = (first_materialized_token - 1) / block_granularity;
@@ -133,7 +133,7 @@ struct PrefillReserve {
 // round is accountable for, including the prepaid prompt headroom: a
 // partially prefetched request must never be stranded. Sliding-window groups
 // recycle slid-out pages, so the rest of the prompt costs them nothing and
-// they hold only the decode slot. Snapshot-state groups bank one
+// they hold only the decode slot. Snapshot-state groups bank at least one
 // growth block (max(block_granularity, decode)) on the admission that
 // finishes shaping them, so the first boundary crossing never needs an empty
 // parent; every other round reserves 0 there.

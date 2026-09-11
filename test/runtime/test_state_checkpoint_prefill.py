@@ -30,12 +30,17 @@ from tokenspeed.runtime.engine.scheduler_utils import make_config
 @pytest.mark.parametrize("disable_prefix_cache", [False, True])
 @pytest.mark.parametrize("with_state", [False, True])
 @pytest.mark.parametrize("token_budget, lengths", [(1024, [868]), (768, [768, 100])])
-def test_final_extent_obeys_only_token_budget(
+def test_final_extent_and_decode_through_runtime_config(
     disable_prefix_cache: bool,
     with_state: bool,
     token_budget: int,
     lengths: list[int],
 ) -> None:
+    """Cover whole/chunked prefill and decode across cache and model families.
+
+    There is no prefix hit or promotion here: only the token budget can shorten
+    the 868-token extent. This checks scheduling, not GPU checkpoint contents.
+    """
     groups = [
         ts.CacheGroupConfig(
             group_id="history",

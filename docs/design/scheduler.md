@@ -43,8 +43,8 @@ group's retention, never by call site:
   of the prompt costs them nothing: they hold only the decode slot.
   Broadcasting the headroom to them once kept a 54K-token DeepSeek-V4 prompt
   waiting on a pool that had room for it.
-- *Snapshot-state* groups bank one growth block at the admission that finishes
-  shaping them and nothing on any other round (§1.2).
+- *Snapshot-state* groups reserve at least one growth block on a decoding
+  role's completing chunk or remote landing, and nothing on other rounds (§1.2).
 
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
@@ -87,18 +87,24 @@ A stateful prompt may finish off a prefix boundary. Its final state is needed
 to continue decode, while the preceding aligned state is needed to publish the
 last reusable prefix page. The scheduler schedules the whole final extent in
 one forward, materializing both the aligned checkpoint and the final,
-request-local continuation state. `AlignPrefillChunk` still enforces token
-budget and prefix-promotion boundaries; checkpoint output alone never creates
-an extra forward.
+request-local continuation state. This applies when the remaining extent fits
+the round's token budget and has no pending prefix-promotion boundary inside it.
+`AlignPrefillChunk` still enforces those limits; checkpoint output alone never
+creates an extra forward.
 
 For example, after a 50,432-token cache hit with an 868-token extent and
 128-token prefix granularity, the scheduler submits `[868]`. This produces an
-aligned checkpoint at token 51,200 and a final state at token 51,300.
+aligned checkpoint at token 51,200 and a final state at token 51,300. With only
+800 tokens of budget left, the same request instead schedules 768 tokens and
+leaves 100 for a later round: ordinary chunking is still required.
 
 Admission allocates the sparse state suffix beginning at the aligned checkpoint
-when one falls inside the chunk. It includes the final state page and ordinary
-decode reserve atomically. Only materialized aligned checkpoints are cached;
-an off-page endpoint is never keyed as a complete prefix.
+when one falls inside the chunk. It includes the final state block and any
+role-appropriate decode reserve atomically. Only the latest internal aligned
+checkpoint is materialized, not every prefix boundary traversed by the chunk.
+An aligned endpoint is itself the checkpoint; an extent crossing no boundary
+needs only its final output. Only materialized aligned checkpoints are cached;
+an off-boundary endpoint is never keyed as a complete prefix.
 
 `CacheProgress::materialized_state_boundary_tokens` records the aligned
 boundary produced by the admitted local prefill. Publication of the preceding
@@ -110,15 +116,13 @@ an aligned accepted endpoint remains publishable without an internal snapshot.
 accepted feedback, not the conservative admission frontier. Capacity and
 retention continue to use their existing conservative token progress.
 
-Within one forward, the runtime prepares one variable-length body/tail plan for
-the whole batch. Conv snapshots use one batched gather/write, while recurrent
-execution uses two batched phases: a body scan stops crossing rows at the
-aligned checkpoint (and completes all other rows), then a tail scan continues
-only crossing rows from the body final state. Their outputs are merged in
-original token order. Thus every recurrent token is evaluated once: the
-50,432 + 868 example scans 768 body tokens plus 100 tail tokens, rather than a
-768-token checkpoint prefix plus a repeated 868-token full scan. The scheduler
-still submits one 868-token forward and carries no body/tail execution metadata.
+One forward means one model dispatch, not one kernel launch. The state backend
+handles checkpoint outputs within it: the example's recurrent scan evaluates
+768 body tokens and then the remaining 100 tokens from the body state. These
+are not two scheduler requests or repeated full-model forwards. The batched
+conv/state writes and scan continuation contract are described in
+[Cache concepts](cache-concepts.md#snapshot-state-prefill-checkpoints); the scheduler
+only supplies the full extent and block tables, not a body/tail execution plan.
 
 An incomplete prefill holds the head of line; a completing prefill releases
 it within the same plan build. The same rule applies with prefix caching
@@ -130,14 +134,14 @@ The capacity guarantees are retention-specific:
 - **History and sliding-window groups reserve decode tokens.** A decoding
   role's first chunk additionally raises full-history reserve to the remaining
   prompt plus admission headroom; sliding-window groups do not hold headroom.
-- **Every state group banks one growth block at the admission that finishes
-  shaping it** (completing chunk or remote landing): `groupReserveTokens`
-  reserves `max(block_granularity, decode_input_tokens)`, at least one block
-  beyond the endpoint for every prompt length.
-  Without it an endpoint that lands alone in its block (aligned prompt, remote
-  landing, `disable_prefix_cache`) needs a fresh **empty** parent per state
-  group at its first boundary crossing, and a full pool deadlocks because
-  residents are retraction-exempt. Invariant: *no request needs an empty parent
+- **Snapshot-state groups on decoding roles reserve growth at the admission
+  that finishes shaping them** (completing chunk or remote landing):
+  `groupReserveTokens` reserves `max(block_granularity, decode_input_tokens)`,
+  at least one block beyond the endpoint for every prompt length.
+  Without it an endpoint with no spare block needs a fresh **empty** parent
+  per state group at its first boundary crossing. A full pool can deadlock
+  when residents are retraction-exempt because their generation is covered by
+  admission headroom (§4). Invariant: *no request needs an empty parent
   for its first crossing* — it already owns the block. Later crossings
   re-acquire from the shared pool and depend on the capacity bound (§1.3) and
   admission back-pressure.

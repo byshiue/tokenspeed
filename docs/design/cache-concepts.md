@@ -151,15 +151,19 @@ entry *values*, however, are **`CacheBlock` ids** — handles to the physical
 storage the cache layer allocated. The scheduler owns allocation, so its output names that storage directly.
 Consumers outside the cache layer treat the ids as opaque.
 
+#### Snapshot-state prefill checkpoints
+
 Logical width does not imply dense physical residency. Full-history KV and
 retained sliding-window rows materialize every block their kernels read, but a
 full-history snapshot-state prefill normally needs only its input, aligned
-prefix output, and final continuation checkpoints. One forward materializes
-the aligned and final outputs, with capacity for both secured at admission.
-The next decode admission rolls the
-expired input block forward, including under overlap scheduling. The table
-keeps absolute slot positions while representing other skipped intermediate
-checkpoints as null holes (`0`). State consumers may gather only the declared
+prefix output, and final continuation checkpoints. When the extent contains an
+internal checkpoint, one forward materializes it and the final output, with
+capacity for both secured at admission. A completing forward on a decoding
+role also reserves growth storage, which is not an additional computed state
+([Scheduler §1.2](scheduler.md#12-state-checkpoints-one-forward)). The next
+decode admission rolls the expired input block forward, including under overlap
+scheduling. The table keeps absolute slot positions while representing other
+skipped intermediate checkpoints as null holes (`0`). State consumers may gather only the declared
 input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
@@ -190,9 +194,11 @@ At most one internal checkpoint per eligible request is selected. Its token
 position and packed-prefix metadata are computed once on the host; the GPU
 views share one immutable, pinned asynchronous upload. Decode has no such batch
 and does not compute checkpoint indices. Recurrent execution partitions the
-batch into a body scan and a tail scan. Every request participates in the body:
-rows crossing a checkpoint stop at that boundary, while other rows run to
-completion. Only crossing rows enter the packed tail scan, initialized directly
+batch into a body scan and a tail scan when an internal checkpoint is needed.
+Otherwise the ordinary prefill scan runs once. Every request in a checkpoint
+batch participates in the body: rows crossing a checkpoint stop at that
+boundary, while other rows run to completion. Only crossing rows enter the
+packed tail scan, initialized directly
 from their body final states. Body and tail outputs are scattered back to
 original token order, so every token is evaluated exactly once while the aligned
 and final states are both retained. Batch size one uses zero-copy body/tail
