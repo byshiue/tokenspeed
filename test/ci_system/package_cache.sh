@@ -1,13 +1,5 @@
 #!/bin/bash
 
-_prepare_package_cache_dir() {
-    local cache_dir="$1"
-    local probe
-    mkdir -p "${cache_dir}" || return 1
-    probe="$(mktemp "${cache_dir}/.tokenspeed-cache.XXXXXXXXXX")" || return 1
-    rm -f "${probe}"
-}
-
 configure_package_cache() {
     local cache_root="${CI_CACHE_ROOT:-}"
     case "${CI_RUNNER_LABEL:-}" in
@@ -21,25 +13,8 @@ configure_package_cache() {
         *) return 0 ;;
     esac
 
-    local pip_cache_dir="${PIP_CACHE_DIR:-${cache_root}/pip}"
-    local wheel_cache_dir="${CI_WHEEL_CACHE_DIR:-${cache_root}/wheelhouse}"
-    if [[ "${CI_RUNNER_LABEL:-}" == b200v2-* ]]; then
-        # A node-local cache is optional; explicit package-cache paths are not.
-        local fallback_root="${XDG_CACHE_HOME:-${HOME:+${HOME}/.cache}}"
-        if [ -z "${CI_CACHE_ROOT:-}" ] && [ -n "${fallback_root}" ]; then
-            if [ -z "${PIP_CACHE_DIR:-}" ] && ! _prepare_package_cache_dir "${pip_cache_dir}" 2>/dev/null; then
-                pip_cache_dir="${fallback_root}/pip"
-            fi
-            if [ -z "${CI_WHEEL_CACHE_DIR:-}" ] && ! _prepare_package_cache_dir "${wheel_cache_dir}" 2>/dev/null; then
-                wheel_cache_dir="${fallback_root}/wheelhouse"
-            fi
-        fi
-        _prepare_package_cache_dir "${pip_cache_dir}" || return 1
-        _prepare_package_cache_dir "${wheel_cache_dir}" || return 1
-    fi
-
-    export PIP_CACHE_DIR="${pip_cache_dir}"
-    export CI_WHEEL_CACHE_DIR="${wheel_cache_dir}"
+    export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${cache_root}/pip}"
+    export CI_WHEEL_CACHE_DIR="${CI_WHEEL_CACHE_DIR:-${cache_root}/wheelhouse}"
     mkdir -p "${PIP_CACHE_DIR}" "${CI_WHEEL_CACHE_DIR}"
     echo "Package cache: pip=${PIP_CACHE_DIR}, wheels=${CI_WHEEL_CACHE_DIR}"
 }
