@@ -107,7 +107,10 @@ pip downloads from `/raid/cache/pip` and explicitly downloaded release wheels
 from `/raid/cache/wheelhouse`; when `FLASHINFER_CACHE_DIR` points elsewhere,
 the two directories are created beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
-that node. Other runner families keep their existing cache behavior because
+that node. Unwritable automatic package-cache directories fall back to
+`XDG_CACHE_HOME` or `~/.cache`. Explicit `CI_CACHE_ROOT`, `PIP_CACHE_DIR`, and
+`CI_WHEEL_CACHE_DIR` settings are honored and must be writable.
+Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
 
 The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
