@@ -103,11 +103,17 @@ def test_hint_reaches_wrapper_calls(stubbed_wrapper):
     assert stubbed_wrapper["boundaries"].dtype == torch.int64
 
 
-def test_cutedsl_original_wrapper_preserves_state_and_int64_boundaries(stubbed_wrapper):
+@pytest.mark.parametrize("transpose_state", [False, True])
+def test_cutedsl_wrapper_preserves_state_and_int64_boundaries(
+    stubbed_wrapper, transpose_state
+):
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     boundaries = torch.tensor([0, T], dtype=torch.int64)
     host_boundaries = torch.tensor([0, T], dtype=torch.int64)
-    state = torch.arange(HV * K * V, dtype=torch.float32).view(1, HV, K, V)
+    state = torch.arange(HV * K * V, dtype=torch.float32).view(1, HV, V, K)
+
+    if transpose_state:
+        state = state.transpose(-1, -2)
 
     _, final_state = cutedsl_op.cutedsl_kda_chunk_prefill(
         q,
@@ -125,7 +131,9 @@ def test_cutedsl_original_wrapper_preserves_state_and_int64_boundaries(stubbed_w
     )
 
     assert stubbed_wrapper["boundaries"] is boundaries
-    torch.testing.assert_close(stubbed_wrapper["state"], state.transpose(-1, -2))
+    torch.testing.assert_close(stubbed_wrapper["state"], state)
+    if not transpose_state:
+        assert stubbed_wrapper["state"] is state
     assert stubbed_wrapper["state"].is_contiguous()
     torch.testing.assert_close(final_state, state)
 
@@ -168,9 +176,12 @@ def test_flash_original_wrapper_preserves_state_and_int64_boundaries(monkeypatch
     torch.testing.assert_close(final_state, state)
 
 
-@pytest.mark.parametrize("solution", ["cutedsl_kda", "flashkda"])
-def test_original_adapters_preserve_runtime_v_major_state(
-    monkeypatch, stubbed_wrapper, solution
+@pytest.mark.parametrize(
+    ("solution", "expected_layout"),
+    [("cutedsl_kda", "v_major"), ("flashkda", "k_major")],
+)
+def test_adapters_preserve_runtime_v_major_state(
+    monkeypatch, stubbed_wrapper, solution, expected_layout
 ):
     import tokenspeed_kernel.ops.attention.kda as attn
     from tokenspeed_kernel.registry import KernelRegistry
@@ -189,7 +200,7 @@ def test_original_adapters_preserve_runtime_v_major_state(
         else "flashkda_nvidia_kda_paged_prefill"
     )
     spec = KernelRegistry.get().get_by_name(name)
-    assert spec.traits["recurrent_layout"] == frozenset({"k_major"})
+    assert spec.traits["recurrent_layout"] == frozenset({expected_layout})
     adapter = cutedsl_op if solution == "cutedsl_kda" else flash_op
     selected = SelectedKernel(name, getattr(adapter, name))
     monkeypatch.setattr(attn, "select_kernel", lambda *args, **kwargs: selected)
@@ -211,6 +222,8 @@ def test_original_adapters_preserve_runtime_v_major_state(
         solution=solution,
         recurrent_layout="v_major",
     )
+    if solution == "cutedsl_kda":
+        assert stubbed_wrapper["state"] is state
     torch.testing.assert_close(result.final_state, state)
     torch.testing.assert_close(result.out, v)
 
@@ -388,6 +401,7 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
 
     monkeypatch.setattr(kd_triton, "_nvidia_kda_prefill", fake_prefill)
     monkeypatch.setattr(kd_cuda, "_nvidia_kda_prefill", fake_prefill)
+    monkeypatch.setattr(cutedsl_op, "_nvidia_kda_prefill", fake_prefill)
 
     q, k, v, g, beta, a_log, dt_bias = _inputs()
     cu = torch.tensor([0, T], dtype=torch.int32)
@@ -412,6 +426,6 @@ def test_solution_wrappers_forward_host_boundaries(monkeypatch):
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
     assert implementations[-1] == "flash_kda_chunk_prefill"
 
-    kd.cutedsl_kda_nvidia_paged_prefill(**dict(kwargs))
+    cutedsl_op.cutedsl_kda_nvidia_paged_prefill(**dict(kwargs))
     assert received[-1]["cu_seqlens_cpu"] is kwargs["cu_seqlens_cpu"]
     assert implementations[-1] == "cutedsl_kda_chunk_prefill"
