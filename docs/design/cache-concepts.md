@@ -194,7 +194,12 @@ The prefill path calls that batched write before causal convolution updates
 the final continuation state; no write is needed without an internal checkpoint.
 At most one internal checkpoint per eligible request is selected. Its token
 position and packed-prefix metadata are computed once on the host; the GPU
-views share one immutable, pinned asynchronous upload. Decode has no such batch
+views share one immutable, pinned asynchronous upload. The reusable
+`runtime.utils.tensor.upload_packed` helper aligns each typed view and owns a
+fresh staging buffer per call, so preparing the next forward cannot overwrite
+an upload still in flight. Checkpoint writers widen page IDs to int64 before
+multiplying by pool strides; an int32 page ID can address an element offset
+beyond the int32 range. Decode has no such batch
 and does not compute checkpoint indices. Recurrent execution partitions the
 batch into a body scan and a tail scan when an internal checkpoint is needed.
 Otherwise the ordinary prefill scan runs once. `_run_prefill_recurrent` owns

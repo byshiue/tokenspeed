@@ -72,10 +72,13 @@ def _write_prefill_conv_checkpoints_kernel(
     request_row = tl.load(rows + checkpoint_row, mask=live, other=0)
     sequence_start = tl.load(sequence_starts + checkpoint_row, mask=live, other=0)
     checkpoint_len = tl.load(checkpoint_seq_lens + checkpoint_row, mask=live, other=0)
-    state_in = tl.load(state_in_blocks + request_row, mask=live, other=0)
-    state_out = tl.load(state_out_blocks + request_row, mask=live, other=0)
+    # Page IDs fit int32, but their element offsets in large pools may not.
+    state_in = tl.load(state_in_blocks + request_row, mask=live, other=0).to(tl.int64)
+    state_out = tl.load(state_out_blocks + request_row, mask=live, other=0).to(tl.int64)
     source = tl.where(state_in > 0, state_in, state_out)
-    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0)
+    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0).to(
+        tl.int64
+    )
 
     relative_token = checkpoint_len - state_len + positions
     from_raw = relative_token >= 0
@@ -561,7 +564,9 @@ def _write_prefill_recurrent_checkpoints_kernel(
     feature = offsets % state_width
     live = (row < num_rows) & (feature < state_width)
     request_row = tl.load(rows + row, mask=live, other=0)
-    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0)
+    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0).to(
+        tl.int64
+    )
     dim_1_index = feature // (state_dim_2 * state_dim_3)
     remainder = feature % (state_dim_2 * state_dim_3)
     dim_2_index = remainder // state_dim_3

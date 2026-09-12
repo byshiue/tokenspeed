@@ -35,6 +35,68 @@ def _device() -> torch.device:
     return torch.device("cuda")
 
 
+@pytest.fixture
+def large_offset_pool():
+    device = _device()
+    # Keep the stride itself in int32: a larger stride would make Triton
+    # promote the product even before the fix. Page 2 crosses INT32_MAX.
+    page_stride = 2**30 + 4096
+    storage_bytes = 2 * page_stride + 4
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    if free_bytes < storage_bytes + 512 * 1024**2:
+        pytest.skip("large-offset regression requires 2.5 GiB of free GPU memory")
+    storage = torch.empty(storage_bytes, dtype=torch.uint8, device=device)
+    # Sparse views require only ~2 GiB and touch a few bytes. Never clone or
+    # initialize the entire pool. Without widened IDs the kernels below access
+    # a wrapped negative offset, which can poison the GPU context.
+    return storage, page_stride
+
+
+@pytest.mark.parametrize(
+    ("source", "continuation", "destination"), [(2, 1, 1), (0, 2, 1), (1, 1, 2)]
+)
+def test_conv_checkpoint_offsets_beyond_int32(
+    large_offset_pool, source, continuation, destination
+):
+    storage, stride = large_offset_pool
+    pool = storage.as_strided((3, 1, 4), (stride, 4, 1))
+    pool[0].fill_(99)
+    pool[1].copy_(torch.tensor([[11, 12, 13, 14]], device=storage.device))
+    pool[2].copy_(torch.tensor([[21, 22, 23, 24]], device=storage.device))
+    raw = torch.tensor([[101]], dtype=torch.uint8, device=storage.device)
+    expected = torch.cat((pool[source or continuation, :, 1:].clone(), raw), dim=1)
+    write_prefill_conv_checkpoints(
+        raw,
+        pool,
+        torch.tensor([source], dtype=torch.int32, device=storage.device),
+        torch.tensor([continuation], dtype=torch.int32, device=storage.device),
+        torch.tensor([destination], dtype=torch.int32, device=storage.device),
+        torch.tensor([0], dtype=torch.int64, device=storage.device),
+        torch.tensor([0], dtype=torch.int64, device=storage.device),
+        torch.tensor([1], dtype=torch.int64, device=storage.device),
+    )
+    torch.testing.assert_close(pool[destination], expected, rtol=0, atol=0)
+    assert torch.all(pool[0] == 99)
+
+
+def test_recurrent_checkpoint_offsets_beyond_int32(large_offset_pool):
+    storage, stride = large_offset_pool
+    pool = storage.as_strided((3, 1, 2, 2), (stride, 4, 2, 1))
+    pool[1].fill_(99)
+    pool[2].zero_()
+    checkpoint = torch.tensor(
+        [[[[41, 42], [43, 44]]]], dtype=torch.float32, device=storage.device
+    )
+    write_prefill_recurrent_checkpoints(
+        checkpoint,
+        pool,
+        torch.tensor([2], dtype=torch.int32, device=storage.device),
+        torch.tensor([0], dtype=torch.int64, device=storage.device),
+    )
+    torch.testing.assert_close(pool[2], checkpoint[0].to(torch.uint8), rtol=0, atol=0)
+    assert torch.all(pool[1] == 99)
+
+
 def _reference_conv(
     raw_inputs: torch.Tensor,
     conv_states: torch.Tensor,
