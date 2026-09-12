@@ -1068,9 +1068,8 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         self.gdn_replay_commit_supported = gdn_replay_commit_supported
         torch.manual_seed(0)
 
-    def _make_backend(
-        self, conv_slab, ssm_slab, spec_num_tokens=1, *, replay_ssm=False
-    ):
+    def _make_backend(self, pool, spec_num_tokens, *, replay_ssm):
+        """Bind the final pool geometry before initializing graph state."""
         torch = self.torch
         backend = self.MambaAttnBackend(
             *_mamba_config_pair(
@@ -1082,11 +1081,7 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                 replay_ssm=replay_ssm,
             )
         )
-        stub_pool = _ContractPool(
-            self.P,
-            {0: ("linear_attention", conv_slab, ssm_slab)},
-        )
-        backend.set_kv_pool(stub_pool)
+        backend.set_kv_pool(pool)
         self.assertTrue(backend.state_paging_active)
         backend.init_cuda_graph_state(max_bs=2)
         return backend
@@ -1164,14 +1159,13 @@ class GDNStatePagingGPUTest(unittest.TestCase):
                     recurrent = torch.zeros(
                         5, h, d, d, device="cuda", dtype=torch.float32
                     )
-                    backend = self._make_backend(
-                        conv, recurrent, spec_num_tokens=1, replay_ssm=False
-                    )
                     pool = _ContractPool(
                         granularity, {0: ("linear_attention", conv, recurrent)}
                     )
                     pool.arena.runtime_contract.prefix_granularity = prefix
-                    backend.set_kv_pool(pool)
+                    backend = self._make_backend(
+                        pool, spec_num_tokens=1, replay_ssm=False
+                    )
                     states.append((conv, recurrent))
                     backends.append(backend)
                 candidate, reference = backends
@@ -1216,9 +1210,8 @@ class GDNStatePagingGPUTest(unittest.TestCase):
         ssm_slab[5].fill_(5)
         if not self.gdn_replay_commit_supported(torch.bfloat16):
             self.skipTest("GDN ReplaySSM kernel unavailable")
-        backend = self._make_backend(
-            conv_slab, ssm_slab, spec_num_tokens=4, replay_ssm=True
-        )
+        pool = _ContractPool(self.P, {0: ("linear_attention", conv_slab, ssm_slab)})
+        backend = self._make_backend(pool, spec_num_tokens=4, replay_ssm=True)
         backend.refresh_decode_metadata(
             2,
             2,
@@ -1321,7 +1314,8 @@ class GDNStatePagingGPUTest(unittest.TestCase):
             num_pages, conv_dim, self.WIDTH - 1, device="cuda", dtype=torch.bfloat16
         )
         ssm_slab = torch.zeros(num_pages, H, D, D, device="cuda", dtype=torch.float32)
-        backend = self._make_backend(conv_slab, ssm_slab)
+        pool = _ContractPool(self.P, {0: ("linear_attention", conv_slab, ssm_slab)})
+        backend = self._make_backend(pool, spec_num_tokens=1, replay_ssm=False)
 
         req_pool_indices = torch.tensor([1], dtype=torch.int32, device="cuda")
         common = dict(
