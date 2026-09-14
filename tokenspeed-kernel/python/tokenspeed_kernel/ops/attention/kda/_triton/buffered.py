@@ -52,24 +52,25 @@ def _check_recurrent_blocks(
     STATE_GRAIN: tl.constexpr,
     T: tl.constexpr,
     L: tl.constexpr,
+    HANDOFF: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     width = tl.load(VALID + row)
-    if width == 0 or not tl.load(OK + row):
+    if (width == 0 and not HANDOFF) or not tl.load(OK + row):
         return
     end = tl.load(END + row).to(tl.int64)
     checkpoint = tl.load(CHECKPOINT + row)
     length = tl.load(LENGTH + row).to(tl.int64)
     flush = tl.load(FLUSH + row)
     ok = (
-        (width > 0)
+        (width == 0 if HANDOFF else width > 0)
         & (width <= T)
         & (checkpoint >= 0)
         & (end >= checkpoint)
         & (length == end - checkpoint)
         & (length <= L - T)
-        & (flush == (length + 2 * T > L))
+        & (flush == (False if HANDOFF else length + 2 * T > L))
     )
     # Check the entire read/write range before the first candidate or state
     # store. Separate validation avoids cross-head races on the validity flag.
@@ -77,6 +78,8 @@ def _check_recurrent_blocks(
     last = (end + width - 1) // ROWS
     columns = first + tl.arange(0, BLOCK)
     needed = columns <= last
+    if HANDOFF:
+        needed &= length > 0
     in_bounds = needed & (columns >= 0) & (columns < HISTORY_COLUMNS)
     blocks = tl.load(HISTORY_TABLE + row * HISTORY_TABLE_STRIDE + columns, in_bounds, 0)
     ok &= (
@@ -94,9 +97,10 @@ def _check_recurrent_blocks(
     src = tl.load(STATE_TABLE + row * STATE_TABLE_STRIDE + src_column, src_in_bounds, 0)
     ok &= (checkpoint == 0) | (src_in_bounds & (src > 0) & (src < STATE_BLOCKS))
     dst_column = (end - 1) // STATE_GRAIN
-    dst_in_bounds = flush & (end > 0) & (dst_column < STATE_COLUMNS)
+    needs_dst = (end > 0) if HANDOFF else flush
+    dst_in_bounds = needs_dst & (end > 0) & (dst_column < STATE_COLUMNS)
     dst = tl.load(STATE_TABLE + row * STATE_TABLE_STRIDE + dst_column, dst_in_bounds, 0)
-    ok &= (~flush) | (dst_in_bounds & (dst > 0) & (dst < STATE_BLOCKS))
+    ok &= (~needs_dst) | (dst_in_bounds & (dst > 0) & (dst < STATE_BLOCKS))
     tl.store(OK + row, ok)
 
 
@@ -116,6 +120,7 @@ def validate_recurrent_blocks(
     state_block_tokens,
     capacity,
     max_window,
+    for_handoff,
 ) -> None:
     """Validate a group's entire recurrent read/write range before any layer runs.
 
@@ -130,6 +135,8 @@ def validate_recurrent_blocks(
     covers them all. Tables/positions must not change between validation and
     the last recurrence consumer. This check does not grant publication or
     request-writable ownership of a checkpoint.
+    for_handoff validates zero-width live rows and only [c,e), plus the exact
+    destination S_e. It requires no candidate backing and no completed flush.
     """
     geometry = (
         history_blocks,
@@ -203,6 +210,7 @@ def validate_recurrent_blocks(
             state_block_tokens,
             max_window,
             capacity,
+            for_handoff,
             triton.next_power_of_2(triton.cdiv(capacity, history_block_tokens) + 1),
         )
 

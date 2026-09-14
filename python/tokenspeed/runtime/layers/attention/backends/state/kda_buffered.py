@@ -224,6 +224,8 @@ class KDAReplayMetadata:
         actual_bs: int,
         seq_lens: torch.Tensor,
         block_tables: Mapping[str, torch.Tensor],
+        *,
+        for_handoff: bool,
     ) -> None:
         """Refill raw tables and endpoint/width buffers for eager or graph use.
 
@@ -231,10 +233,14 @@ class KDAReplayMetadata:
         stride; reject oversized tables instead of silently truncating them.
         Idle refresh clears the requested rows. Position stamps are read later
         by ``prepare``, in the same stream order as the model forward.
+        With for_handoff, seq_lens contains exact accepted endpoints instead;
+        all rows must be live, and width is zero (no candidate input).
         """
         self._batch(bs)
         if not 0 <= actual_bs <= bs:
             raise ValueError("need 0 <= actual_bs <= bs")
+        if for_handoff and actual_bs != bs:
+            raise ValueError("handoff rows must all be live")
         if actual_bs:
             for gid in self.tables.group_ids:
                 if gid not in block_tables:
@@ -256,9 +262,10 @@ class KDAReplayMetadata:
             self.width[:bs],
             actual_bs=actual_bs,
             max_window=self.layout.max_window,
+            for_handoff=for_handoff,
         )
 
-    def prepare(self, bs: int) -> None:
+    def prepare(self, bs: int, *, for_handoff: bool) -> None:
         """Read and validate positions once per group before any layer consumes them."""
         for gid, view in self._batch(bs).items():
             prepare_positions(
@@ -272,6 +279,7 @@ class KDAReplayMetadata:
                 view.ok,
                 capacity=self.layout.capacity,
                 max_window=self.layout.max_window,
+                for_handoff=for_handoff,
             )
             validate_recurrent_blocks(
                 view.history_table,
@@ -288,24 +296,33 @@ class KDAReplayMetadata:
                 state_block_tokens=self._state_grains[gid],
                 capacity=self.layout.capacity,
                 max_window=self.layout.max_window,
+                for_handoff=for_handoff,
             )
 
             # Convolution reads at e, not at the lagging recurrent checkpoint c.
             # Its possible acceptance destinations must be backed even when
             # this round does not flush recurrent state.
-            prepare_conv_blocks(
-                view.state_table,
-                view.end,
-                view.width,
-                view.ok,
-                view.conv_read,
-                view.conv_writes,
-                blocks=self._state_counts[gid],
-                grain=self._state_grains[gid],
-            )
+            # Handoff retains the already-accepted conv window and must not
+            # consume stale candidate descriptors or raw payload.
+            if not for_handoff:
+                prepare_conv_blocks(
+                    view.state_table,
+                    view.end,
+                    view.width,
+                    view.ok,
+                    view.conv_read,
+                    view.conv_writes,
+                    blocks=self._state_counts[gid],
+                    grain=self._state_grains[gid],
+                )
 
     def commit(
-        self, bs: int, accepted: torch.Tensor, materialized: torch.Tensor
+        self,
+        bs: int,
+        accepted: torch.Tensor,
+        materialized: torch.Tensor,
+        *,
+        for_handoff: bool,
     ) -> None:
         """Commit live acceptance after all recurrent/conv stores have completed.
 
@@ -337,6 +354,7 @@ class KDAReplayMetadata:
                 view.flushed[:live],
                 view.ok[:live],
                 materialized[index, :live],
+                for_handoff=for_handoff,
             )
 
 
@@ -356,6 +374,7 @@ class KDAReplayWorkspace:
         self.metadata = KDAReplayMetadata(
             pool, max_bs=max_bs, max_context_len=max_context_len
         )
+        self._pool = pool
         self.layer_ids = tuple(pool.state_group_by_layer)
         self._row = {layer: row for row, layer in enumerate(self.layer_ids)}
         self._state = {layer: pool.get_state_buffers(layer) for layer in self.layer_ids}
@@ -593,7 +612,12 @@ class KDAReplayWorkspace:
         return out
 
     def commit(
-        self, bs: int, accepted: torch.Tensor, force_materialize: torch.Tensor
+        self,
+        bs: int,
+        accepted: torch.Tensor,
+        force_materialize: torch.Tensor,
+        *,
+        for_handoff: bool,
     ) -> None:
         """Commit accepted conv windows and required endpoints before group stamps.
 
@@ -602,9 +626,14 @@ class KDAReplayWorkspace:
         live-batch GPU handoff mask. Aligned accepted endpoints are automatic.
         Completion/publication and handoff scheduling still belong to the owner;
         launching materialization alone does not establish those obligations.
+        for_handoff is used by materialize_current after fresh zero-width
+        preparation, without a forward: acceptance must be zero and conv
+        windows are already exact, so only recurrent endpoints and stamps run.
         """
         if accepted.numel() > bs or bs > self.metadata.max_bs:
             raise ValueError("acceptance or batch exceeds prepared capacity")
+        if for_handoff and accepted.numel() != bs:
+            raise ValueError("handoff rows must all be live")
         live = accepted.numel()
         for index, view in enumerate(self.metadata._batch(bs).values()):
             prepare_endpoint_commit(
@@ -617,18 +646,20 @@ class KDAReplayWorkspace:
                 force_materialize,
                 self.materialized[index, :live],
                 prefix_granularity=self._prefix_granularity,
+                for_handoff=for_handoff,
             )
-        commit_conv_windows(
-            self.payload,
-            self.conv_ptrs,
-            self.group_indices,
-            self.metadata.conv_read,
-            self.metadata.conv_writes,
-            self.metadata.width,
-            self.metadata.ok,
-            accepted,
-            conv_strides=self._conv_strides,
-        )
+        if not for_handoff:
+            commit_conv_windows(
+                self.payload,
+                self.conv_ptrs,
+                self.group_indices,
+                self.metadata.conv_read,
+                self.metadata.conv_writes,
+                self.metadata.width,
+                self.metadata.ok,
+                accepted,
+                conv_strides=self._conv_strides,
+            )
         materialize_endpoints(
             self.endpoint_descriptors,
             self.group_indices,
@@ -650,4 +681,29 @@ class KDAReplayWorkspace:
             decay_strides=self._history_strides[2],
             max_programs=self._max_materialize_programs,
         )
-        self.metadata.commit(bs, accepted, self.materialized)
+        self.metadata.commit(bs, accepted, self.materialized, for_handoff=for_handoff)
+
+    def materialize_current(
+        self, endpoints: torch.Tensor, block_tables: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Materialize quiescent requests without a candidate forward.
+
+        endpoints is a live-only int32 GPU vector of exact accepted positions;
+        tables name those requests in the same order, not the previous batch.
+        The owner must retain exclusive cache ownership through completion and
+        consume the returned borrowed [group,live] validity before handoff. A
+        stream-ordered call is not by itself scheduler feedback or provenance.
+
+        Only [c,e) is read. Conv already represents e and is left untouched.
+        All payload fences precede the shared endpoint kernel, and all layer
+        stores precede stamps. No new persistent request state is allocated.
+        """
+        bs = endpoints.numel()
+        self.metadata.refresh(bs, bs, endpoints, block_tables, for_handoff=True)
+        self.metadata.prepare(bs, for_handoff=True)
+        for layer in self.layer_ids:
+            self._pool.get_replay_buffers(layer)
+        self.commit(
+            bs, self.metadata.width[:bs], self.no_handoff[:bs], for_handoff=True
+        )
+        return self.metadata.ok[:, :bs]

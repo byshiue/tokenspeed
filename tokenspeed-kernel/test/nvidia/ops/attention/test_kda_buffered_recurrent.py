@@ -163,6 +163,7 @@ def test_buffered_rounds_and_graph_match_sequential(
             ok,
             capacity=capacity,
             max_window=width,
+            for_handoff=False,
         )
         validate_recurrent_blocks(
             ht,
@@ -179,6 +180,7 @@ def test_buffered_rounds_and_graph_match_sequential(
             state_block_tokens=grain,
             capacity=capacity,
             max_window=width,
+            for_handoff=False,
         )
         buffered_recurrent(
             q,
@@ -217,6 +219,7 @@ def test_buffered_rounds_and_graph_match_sequential(
             flush,
             ok,
             endpoint_materialized,
+            for_handoff=False,
         )
 
     stream = torch.cuda.Stream()
@@ -469,6 +472,7 @@ def test_invalid_backing_rejects_entire_row_before_stores(graph_mode):
             state_block_tokens=1,
             capacity=8,
             max_window=width,
+            for_handoff=False,
         )
         buffered_recurrent(
             q,

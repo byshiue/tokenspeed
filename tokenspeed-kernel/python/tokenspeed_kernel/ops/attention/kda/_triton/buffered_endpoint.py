@@ -37,6 +37,7 @@ def _prepare_endpoint_commit(
     MATERIALIZED,
     B: tl.constexpr,
     PREFIX: tl.constexpr,
+    HANDOFF: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -55,12 +56,14 @@ def _prepare_endpoint_commit(
         & (endpoint <= 2**31 - 1)
     )
     source = tl.where(flush, end, checkpoint)
+    if HANDOFF:
+        ok &= (width == 0) & (~flush)
     needed = (
         live
         & ok
-        & (width > 0)
+        & ((width > 0) | HANDOFF)
         & (endpoint > source)
-        & (force | (endpoint % PREFIX == 0))
+        & (force | HANDOFF | (endpoint % PREFIX == 0))
     )
     tl.store(MATERIALIZED + row, needed, live)
     tl.store(OK + row, ok, live)
@@ -77,6 +80,7 @@ def prepare_endpoint_commit(
     materialized,
     *,
     prefix_granularity,
+    for_handoff,
 ):
     """Choose exact-endpoint writes after acceptance, without CPU readback.
 
@@ -88,6 +92,8 @@ def prepare_endpoint_commit(
     is reconstructed. The materialized output means a write is needed, not that
     it has completed. Run materialize_endpoints before publishing its stamp.
     Invalid acceptance clears ok before any commit stores. Returns None.
+    for_handoff selects every lagging endpoint, irrespective of prefix identity;
+    width/acceptance and flushed must be zero after fresh handoff preparation.
     """
     batch = end.numel()
     if (
@@ -128,6 +134,7 @@ def prepare_endpoint_commit(
             materialized,
             batch,
             prefix_granularity,
+            for_handoff,
             128,
             num_warps=4,
         )
@@ -275,8 +282,9 @@ def materialize_endpoints(
     rounds return after checking live flags; active programs stride over all
     selected tiles without a host decision or a different graph.
 
-    Preparation must validate the full history/state backing before forward;
-    prepare_endpoint_commit must validate acceptance after all layer forwards.
+    Preparation must validate the full history/state backing before data stores;
+    prepare_endpoint_commit validates acceptance after all layer forwards, or
+    zero acceptance after fresh quiescent-handoff preparation.
     Destinations must be request-writable, never published immutable snapshots.
     A following stamp commit, completion fence and owner protocol are required
     before any external handoff. Returns None; no allocations or host readback.

@@ -69,6 +69,7 @@ def test_paged_positions_reordering_acceptance_and_graph(
             ok,
             capacity=capacity,
             max_window=max_window,
+            for_handoff=False,
         )
         commit_positions(
             (stamps,),
@@ -81,6 +82,7 @@ def test_paged_positions_reordering_acceptance_and_graph(
             flush,
             ok,
             materialized,
+            for_handoff=False,
         )
 
     stream = torch.cuda.Stream()
@@ -177,6 +179,7 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
         ok,
         capacity=8,
         max_window=4,
+        for_handoff=False,
     )
     assert ok.tolist() == [False, True, True, True]
     commit_positions(
@@ -190,6 +193,7 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
         flush,
         ok,
         materialized,
+        for_handoff=False,
     )
     assert ok.tolist() == [False, False, False, True]
     initial[7, 5] = 6
@@ -207,6 +211,7 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
         ok,
         capacity=8,
         max_window=4,
+        for_handoff=False,
     )
     assert checkpoint[0] == 5 and length[0] == 0 and ok[0]
     with pytest.raises(ValueError, match="maximum windows"):
@@ -221,6 +226,7 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
             ok,
             capacity=7,
             max_window=4,
+            for_handoff=False,
         )
     with pytest.raises(ValueError, match="accepted"):
         commit_positions(
@@ -234,4 +240,5 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
             flush,
             ok,
             materialized,
+            for_handoff=False,
         )

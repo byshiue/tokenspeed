@@ -186,6 +186,7 @@ def main():
                             ok,
                             capacity=capacity,
                             max_window=width,
+                            for_handoff=False,
                         )
                         validate_recurrent_blocks(
                             table,
@@ -202,6 +203,7 @@ def main():
                             state_block_tokens=1,
                             capacity=capacity,
                             max_window=width,
+                            for_handoff=False,
                         )
                         buffered_recurrent(
                             q,
@@ -240,6 +242,7 @@ def main():
                             flushed,
                             ok,
                             materialized,
+                            for_handoff=False,
                         )
 
                     timing = measure(buffered)

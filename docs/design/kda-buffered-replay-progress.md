@@ -40,9 +40,9 @@ against the frozen baseline before the work meets its completion gate.
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
-| B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Live endpoint materialization and handoff still pending |
+| B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Owner-triggered handoff and recovery integration still pending |
 | C. Unified GPU forward and commit | M12 connects the workspace to KDA decode and accepted commit, with rank-agreed failure feedback | Lifecycle handoff and mixed batches remain pending; recurrence not registered and factory still gated |
-| D. Graphs, overlap and lifecycle integration | M10 isolated producer-stream pipeline tests pass in eager/graph; serving integration pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
+| D. Graphs, overlap and lifecycle integration | M10–M13 pipeline and endpoint checks pass in eager/graph; owner lifecycle still pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
 ## Recording a result
@@ -1090,3 +1090,56 @@ The invalid-acceptance check refreshes the actual next endpoint and first
 asserts valid backing, so an unrelated metadata failure cannot hide a missed
 acceptance check. The full TP8 tensor workspace is **11,211,756 bytes per rank**
 at context 65,536, batch four and width four, four bytes above M11.
+
+### M13: quiescent endpoint materialization
+
+Source: based on `7f4ee451` (M12 record), not yet committed.
+
+`KDAReplayWorkspace.materialize_current` accepts fresh request tables and exact
+accepted endpoints without running a candidate forward. It reuses the shared
+position, backing-validation, endpoint and stamp operations with explicit
+handoff semantics. Handoff has zero width and acceptance, validates only
+committed history and the exact state destination, and never treats a planned
+capacity flush as completed. It skips conv preparation and commit: the short
+window already represents the accepted endpoint. All local payload fences
+precede the batched endpoint writer; stamps follow all layer stores. The
+operation returns borrowed live validity for the owner's completion check.
+Already-exact endpoints perform no pool stores. Workspace tensor bytes are
+unchanged; no persistent request map or independent storage pool was added.
+
+The first focused GPU run passed **6 cases** (22 warnings, 28.36s): T1/L8,
+T4/L8 and T4/L37 in eager and captured execution, using TP8 per-layer dimensions
+across six local KDA layers and two cache groups. It checks missing candidate
+capacity, a checkpoint that would trigger the next forward's capacity flush,
+an implicit zero seed, reordered rows, exact recurrent output, unchanged conv,
+duplicate handoff and invalid state backing. Subsequent tests add an exact
+nonzero prefill seed and a missing middle history block. Final regression
+results are recorded below once complete. Tolerances remain FP32 state
+`atol=2e-5, rtol=2e-4`; conv and no-op pool comparisons are exact.
+
+Environment is the same persistent four-GB300 allocation, cached image,
+serving venv and scheduler extension as M12. This is not a real-model run.
+Scheduler-triggered handoff, mixed-batch integration, registration/configuration
+and the full-model NVFP4 TP8 Eagle3/AIME/NSYS gates remain pending. In particular,
+this operation does not change retraction's stream-ordered writeback policy,
+authorize page reuse or enable PD transfer of request-local history.
+
+Final results: **76 kernel/reference cases passed** (15 warnings, 134.51s);
+**162 integration cases plus 62 subtests passed** (23 warnings, 41.65s), with
+the same three optional/vendor-specific skips as M12; **523 scheduler/cache/GDN
+cases plus 317 subtests passed** (28 warnings, 36.74s). The final integration
+also covers smaller and empty handoff batches. Counts overlap across suites.
+All-files hooks formatted eight files; final hooks are required before commit.
+
+A same-GPU native-input microbenchmark compares the normal buffered decode
+operations against frozen M12 `931eeaf2`, not the original Eagle3 implementation.
+It covers 48 configurations: B1/B8, T1/T4, four capacities per width and
+empty/no-flush/flush history. Two pairs run in before/after/after/before order;
+each configuration uses five event samples, 32 calls per graph and 50 replays
+per sample. New/old latency ratios range **0.998666–1.001094** across both pairs
+(within ±0.14%). T4/L8/flush stays approximately **11.21 µs at B1** and
+**14.26 µs at B8**. No distinguishable regression appears in this graph
+microbenchmark. It excludes model execution, conv/gate producers, CPU feedback,
+scheduler and quiescent handoff latency; it cannot satisfy the full-model
+Eagle3 no-regression gate. Raw samples, source extraction, comparison script
+and environment are retained in the local M13 artifacts.

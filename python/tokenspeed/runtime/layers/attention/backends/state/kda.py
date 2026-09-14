@@ -569,10 +569,12 @@ class KdaAttnBackend(MambaAttnBackend):
             raise RuntimeError("buffered refresh requires a pure decode batch")
         self._buffered_bs, self._buffered_actual_bs = bs, actual_bs
         self._buffered_commit_pending = actual_bs > 0
-        workspace.metadata.refresh(bs, actual_bs, seq_lens, block_tables)
+        workspace.metadata.refresh(
+            bs, actual_bs, seq_lens, block_tables, for_handoff=False
+        )
         # These stamps are request-local, zeroed fields, never transferred.
         # State payload load fences remain at each layer's first consumption.
-        workspace.metadata.prepare(bs)
+        workspace.metadata.prepare(bs, for_handoff=False)
         # Expose every captured tensor to the existing graph pointer guard.
         # The inherited slot carries prefill metadata, not buffered decode.
         self.forward_metadata = None
@@ -1075,6 +1077,7 @@ class KdaAttnBackend(MambaAttnBackend):
                 self._buffered_bs,
                 accepted_length,
                 self._buffered_replay.no_handoff[: accepted_length.numel()],
+                for_handoff=False,
             )
             self._buffered_commit_pending = False
             return

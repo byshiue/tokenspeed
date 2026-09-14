@@ -103,6 +103,7 @@ def test_endpoint_identity_zero_seed_rejection_and_graph(width, captured):
                 force,
                 needed[group],
                 prefix_granularity=prefix,
+                for_handoff=False,
             )
         materialize_endpoints(
             descriptors,

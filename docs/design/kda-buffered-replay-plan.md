@@ -20,6 +20,9 @@ M11 增加 acceptance 之后的跨层 endpoint 物化，复用 forward 的 FP32 
 M12 已将工作区接入 KDA backend 的统一 decode/commit，并将有效性随输出拷回
 CPU，在 scheduler 接受结果前作跨 rank 检查。生命周期交接、mixed batch、配置
 启用与完整模型验收仍待完成；本阶段不据此选择默认容量。
+M13 增加不依赖本轮 forward 的 quiescent endpoint 物化：重新载入请求表和
+accepted endpoint，仅重建已接受历史，不要求 candidate 空间，也不改 conv。
+这提供生命周期交接所需的计算操作；scheduler 的触发与完成反馈仍未接入。
 
 ## 1. 目标与范围
 

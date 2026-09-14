@@ -312,6 +312,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         ok,
         capacity=replay.layout.capacity,
         max_window=replay.layout.max_window,
+        for_handoff=False,
     )
     assert checkpoint.item() == 3 and length.item() == 0 and ok.item()
     state = pool.get_component(layer, "recurrent_state")
@@ -340,6 +341,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         state_block_tokens=128,
         capacity=replay.layout.capacity,
         max_window=replay.layout.max_window,
+        for_handoff=False,
     )
     buffered_recurrent(
         q,
@@ -391,6 +393,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         flush,
         ok,
         materialized,
+        for_handoff=False,
     )
     assert replay.checkpoint[1, 3] == 4 and ok.item()
     # Continue through a history-block boundary and a capacity flush using
@@ -411,6 +414,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             ok,
             capacity=replay.layout.capacity,
             max_window=replay.layout.max_window,
+            for_handoff=False,
         )
         validate_recurrent_blocks(
             table,
@@ -427,6 +431,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             state_block_tokens=128,
             capacity=replay.layout.capacity,
             max_window=replay.layout.max_window,
+            for_handoff=False,
         )
         buffered_recurrent(
             q,
@@ -480,6 +485,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             flush,
             ok,
             materialized,
+            for_handoff=False,
         )
         end.add_(1)
     assert saw_flush
@@ -522,13 +528,13 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
     seq_lens = torch.zeros(5, dtype=torch.int32, device="cuda")
     accepted = torch.zeros_like(seq_lens)
     materialized = torch.zeros_like(metadata.ok)
-    metadata.refresh(2, 0, seq_lens, tables)
+    metadata.refresh(2, 0, seq_lens, tables, for_handoff=False)
 
     def run(bs, live):
-        metadata.prepare(bs)
+        metadata.prepare(bs, for_handoff=False)
         # There are no numerical payloads in this metadata-only fixture.
         # Serving must put all layer stores between these two operations.
-        metadata.commit(bs, accepted[:live], materialized)
+        metadata.commit(bs, accepted[:live], materialized, for_handoff=False)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -568,7 +574,7 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
             seq_lens[:actual_bs].copy_(torch.tensor([ends[r] + width for r in order]))
         accepted.zero_()
         accepted[:actual_bs].fill_(1)
-        metadata.refresh(bs, actual_bs, seq_lens, current)
+        metadata.refresh(bs, actual_bs, seq_lens, current, for_handoff=False)
         if captured and bs == 2:
             graph.replay()
         else:
@@ -603,18 +609,18 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
     # is needed by the group commit. Invalid live counts suppress their stamps.
     accepted[:2].fill_(width + 1)
     before = {gid: stamps[0].clone() for gid, stamps in metadata._stamps.items()}
-    metadata.commit(2, accepted[:2], materialized)
+    metadata.commit(2, accepted[:2], materialized, for_handoff=False)
     for gid, stamps in metadata._stamps.items():
         assert not metadata._batch(2)[gid].ok.any()
         for stamp in stamps:
             torch.testing.assert_close(stamp, before[gid], atol=0, rtol=0)
     with pytest.raises(ValueError, match="missing"):
-        metadata.refresh(2, 2, seq_lens, {})
+        metadata.refresh(2, 2, seq_lens, {}, for_handoff=False)
     gid = next(iter(groups))
     malformed = dict(tables)
     malformed[gid] = tables[gid][:, ::2]
     with pytest.raises(ValueError, match="invalid"):
-        metadata.refresh(2, 2, seq_lens, malformed)
+        metadata.refresh(2, 2, seq_lens, malformed, for_handoff=False)
     with pytest.raises(ValueError, match="capacity"):
         metadata.layer(layers[0], 6)
     # Rebinding builds a new owner; old graph addresses and old cache fields
@@ -642,6 +648,196 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
         assert any(
             stamp is replay.checkpoint for stamp in pp_metadata._stamps[replay.group_id]
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width,capacity", [(1, 8), (4, 8), (4, 37)])
+@pytest.mark.parametrize("captured", [False, True])
+def test_quiescent_endpoint_without_candidate_backing(width, capacity, captured):
+    """Fresh handoff metadata, not a replay of the previous forward's commit.
+
+    One row would capacity-flush on its next forward, another would not, and
+    two rows are exact seeds (zero and nonzero). Candidate pages are missing.
+    Reordering, duplicate handoff and failed backing cannot consume raw payload
+    or overwrite any conv window or previously materialized source block.
+    """
+    from tokenspeed.runtime.layers.attention.backends.state.kda_buffered import (
+        KDAReplayWorkspace,
+    )
+
+    torch.manual_seed(719)
+    batch, context = 4, 256
+    recipe = _recipe(
+        capacity, decode_input_tokens=width, max_bs=batch, context_len=context
+    )
+    plan = _layout(recipe).bind(24).narrow_to_layers(28, 36)
+    _, pool = _pool(recipe, plan, "cuda", 28, 36)
+    workspace = KDAReplayWorkspace(pool, max_bs=batch, max_context_len=context)
+    meta, layers = workspace.metadata, workspace.layer_ids
+    ends = [152 if capacity == 37 else 136, 144, 0, 160]
+    checkpoints = [
+        ends[0] - (capacity - width),
+        ends[1] - min(3, capacity - width),
+        0,
+        160,
+    ]
+    tables = {}
+    for index, (gid, group) in enumerate(meta._groups.items()):
+        first = index * 72 + 1
+        ht = torch.zeros((batch, 20), dtype=torch.int32, device="cuda")
+        ht[:2, 8:20].copy_(torch.arange(first, first + 24).view(2, 12))
+        for row, end in enumerate(ends):
+            ht[row, end // 8 :] = 0  # No space for even one future input token.
+        st = torch.zeros((batch, 2), dtype=torch.int32, device="cuda")
+        st[:2].copy_(torch.arange(index * 12 + 5, index * 12 + 9).view(2, 2))
+        st[3].copy_(torch.arange(index * 12 + 9, index * 12 + 11))
+        tables[gid], tables[group[0].checkpoint_group_id] = ht, st
+        pool.zero_new_blocks({gid: list(range(first, first + 24))})
+    tables_cpu = {gid: table.cpu() for gid, table in tables.items()}
+    expected = {}
+    for layer in layers:
+        history = pool.get_replay_buffers(layer)
+        conv, state = pool.get_state_buffers(layer)
+        ht, st = tables_cpu[history.group_id], tables_cpu[history.checkpoint_group_id]
+        for row in (0, 1, 3):
+            c, e = checkpoints[row], ends[row]
+            src, dst = int(st[row, (c - 1) // 128]), int(st[row, (e - 1) // 128])
+            conv[st[row].long()] = torch.randn_like(conv[st[row].long()])
+            state[dst].fill_(float("nan"))
+            value = torch.randn(state[src].shape) * 0.02
+            state[src].copy_(value)
+            for position in range(c, e):
+                page, slot = int(ht[row, position // 8]), position % 8
+                k = torch.randn((workspace.heads, workspace.key_dim)) * 0.1
+                u = torch.randn((workspace.heads, workspace.value_dim)) * 0.02
+                d = torch.full_like(k, 0.97)
+                for field, data in zip(
+                    (history.key, history.correction, history.decay),
+                    (k, u, d),
+                    strict=True,
+                ):
+                    field[page, slot].copy_(data)
+                value = value * d[:, None, :] + u[:, :, None] * k[:, None, :]
+            if c != e:
+                history.checkpoint[int(ht[row, (e - 1) // 8]), (e - 1) % 8] = c + 1
+            expected[layer, row] = value
+    saved = {
+        layer: tuple(t.clone() for t in pool.get_state_buffers(layer))
+        for layer in layers
+    }
+    workspace.payload.fill_(float("nan"))
+    meta.conv_read.fill_(-1)
+    meta.conv_writes.fill_(-1)
+    # Decoy refresh represents an unrelated/idle prior batch. Handoff must
+    # replace these endpoints, including the pending (not completed) flush.
+    meta.end.fill_(2**31 - 1)
+    meta.checkpoint.fill_(-1)
+    meta.flushed.fill_(True)
+    order = [1, 0, 3, 2]
+    delivery = {gid: table[order] for gid, table in tables.items()}
+    endpoints = torch.tensor(
+        [ends[row] for row in order], dtype=torch.int32, device="cuda"
+    )
+    pool.layerwise_load_tracker = Mock()
+
+    def run():
+        return workspace.materialize_current(endpoints, delivery)
+
+    if capacity == 37:
+        # Lose a middle history block without losing the final stamp. The
+        # validator must reject before any of this request's layers write.
+        original = pool.arena.buffer.clone()
+        for gid in meta._groups:
+            delivery[gid][1, 15] = 0
+        assert not run()[:, 1].any()
+        for layer in layers:
+            st = tables_cpu[pool.get_replay_buffers(layer).checkpoint_group_id]
+            _, state = pool.get_state_buffers(layer)
+            torch.testing.assert_close(
+                state[st[0].long()],
+                saved[layer][1][st[0].long()],
+                atol=0,
+                rtol=0,
+                equal_nan=True,
+            )
+        pool.arena.buffer.copy_(original)
+        for gid in delivery:
+            delivery[gid].copy_(tables[gid][order])
+
+    if captured:
+        # Warm up kernels on a side stream, then restore the exact initial
+        # representation before capture and again before the actual replay.
+        original = pool.arena.buffer.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        pool.arena.buffer.copy_(original)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        pool.arena.buffer.copy_(original)
+        graph.replay()
+        validity = meta.ok[:, :batch]
+    else:
+        validity = run()
+    assert validity.all() and not meta.flushed.any() and not meta.width.any()
+    assert {
+        call.args[0]
+        for call in pool.layerwise_load_tracker.wait_for_layer.call_args_list
+    } == set(layers)
+    for layer in layers:
+        history = pool.get_replay_buffers(layer)
+        conv, state = pool.get_state_buffers(layer)
+        ht, st = tables_cpu[history.group_id], tables_cpu[history.checkpoint_group_id]
+        torch.testing.assert_close(
+            conv, saved[layer][0], atol=0, rtol=0, equal_nan=True
+        )
+        for row in (0, 1, 3):
+            c, e = checkpoints[row], ends[row]
+            src, dst = int(st[row, (c - 1) // 128]), int(st[row, (e - 1) // 128])
+            torch.testing.assert_close(
+                state[dst].cpu(), expected[layer, row], atol=2e-5, rtol=2e-4
+            )
+            if src != dst:
+                torch.testing.assert_close(
+                    state[src], saved[layer][1][src], atol=0, rtol=0
+                )
+            if row != 3:
+                assert (
+                    int(history.checkpoint[int(ht[row, (e - 1) // 8]), (e - 1) % 8])
+                    == e + 1
+                )
+    exact = pool.arena.buffer.clone()
+    # The same endpoint now has zero history and must not be reconstructed a
+    # second time. Reordering still uses current tables, not prior row slots.
+    endpoints.copy_(torch.tensor(ends, dtype=torch.int32))
+    for gid in delivery:
+        delivery[gid].copy_(tables[gid])
+    if captured:
+        graph.replay()
+    else:
+        run()
+    assert meta.ok.all() and not workspace.materialized.any()
+    torch.testing.assert_close(pool.arena.buffer, exact, atol=0, rtol=0)
+
+    # A missing checkpoint source/destination is an invariant failure, even
+    # for an already-exact endpoint. Failed rows perform no pool stores.
+    for group in meta._groups.values():
+        delivery[group[0].checkpoint_group_id][0] = 0
+    if captured:
+        graph.replay()
+    else:
+        run()
+    assert not meta.ok[:, 0].any() and meta.ok[:, 1:].all()
+    torch.testing.assert_close(pool.arena.buffer, exact, atol=0, rtol=0)
+    for live in (1, 0):
+        validity = workspace.materialize_current(
+            endpoints[:live], {gid: table[:live] for gid, table in tables.items()}
+        )
+        assert validity.shape == (len(meta._groups), live) and validity.all()
+        torch.testing.assert_close(pool.arena.buffer, exact, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -779,7 +975,7 @@ def test_buffered_workspace_forward_commit_and_budget(
 
     def refresh(live, delivered):
         if backend is None:
-            meta.refresh(batch, live, seq_lens, delivered)
+            meta.refresh(batch, live, seq_lens, delivered, for_handoff=False)
         else:
             backend.refresh_decode_metadata(
                 batch,
@@ -801,7 +997,7 @@ def test_buffered_workspace_forward_commit_and_budget(
 
     def run():
         if backend is None:
-            meta.prepare(batch)
+            meta.prepare(batch, for_handoff=False)
         for index, layer in enumerate(layers):
             if backend is None:
                 output = workspace.forward(
@@ -846,6 +1042,7 @@ def test_buffered_workspace_forward_commit_and_budget(
                 batch,
                 accepted if captured else accepted[:requests],
                 force if captured else force[:requests],
+                for_handoff=False,
             )
 
     stream = torch.cuda.Stream()
@@ -907,7 +1104,7 @@ def test_buffered_workspace_forward_commit_and_budget(
         f_a.normal_(std=0.1)
         beta.normal_()
         # Run the rounding oracle before commit changes the conv input windows.
-        meta.prepare(batch)
+        meta.prepare(batch, for_handoff=False)
         conv_cpu, gates_cpu = [], []
         for index, layer in enumerate(layers):
             view = meta.layer(layer, batch)
@@ -1084,7 +1281,7 @@ def test_buffered_workspace_forward_commit_and_budget(
     accepted.fill_(width + 1)
     force.fill_(True)
     if backend is None:
-        workspace.commit(batch, accepted, force)
+        workspace.commit(batch, accepted, force, for_handoff=False)
         assert not meta.ok.any()
     else:
         # Re-enter through refresh: duplicate commit must never reconstruct an

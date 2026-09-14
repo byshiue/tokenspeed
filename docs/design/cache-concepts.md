@@ -451,6 +451,15 @@ The writer starts from the capacity-flushed state when present and stops at
 describe this ordered work; they do not publish a scheduler result or authorize
 reuse, transfer or reclamation. Those owner-level transitions remain gated.
 
+A quiescent endpoint operation refreshes its own request tables and positions;
+it cannot reuse the most recent forward's batch or its planned flush flags.
+It reconstructs only `[c,e)`, leaves the accepted conv window at `e` intact,
+and stamps `e` after all layer stores. It does not require candidate capacity,
+which may be unavailable when the owner needs to reclaim pages. This is an
+execution primitive, not a new cache-transfer policy: the owner must still
+retain the source/destination through completion and reject invalid backing
+before handing off the result.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables

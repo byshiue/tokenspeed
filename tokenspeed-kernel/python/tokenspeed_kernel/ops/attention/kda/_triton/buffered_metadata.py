@@ -50,13 +50,14 @@ def _prepare_positions(
     TABLE_STRIDE: tl.constexpr,
     CAPACITY: tl.constexpr,
     MAX_WINDOW: tl.constexpr,
+    HANDOFF: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = row < B
     end = tl.load(END + row, live, 0).to(tl.int64)
     width = tl.load(WIDTH + row, live, 0)
-    active = live & (width > 0)
+    active = live & ((width > 0) | HANDOFF)
     previous = end - 1
     column = previous // ROWS
     in_table = active & (previous >= 0) & (column < COLUMNS)
@@ -84,9 +85,17 @@ def _prepare_positions(
         & (page < PAGES)
     )
     ok = ok & (width >= 0)
+    if HANDOFF:
+        ok &= width == 0
     tl.store(CHECKPOINT + row, tl.where(active & ok, checkpoint, 0), live)
     tl.store(LENGTH + row, tl.where(active & ok, length, 0), live)
-    tl.store(FLUSH + row, active & ok & (length + 2 * MAX_WINDOW > CAPACITY), live)
+    # Handoff has no forward to perform a capacity flush: reconstruction must
+    # start at the actual S_c, even when the next forward would have flushed.
+    tl.store(
+        FLUSH + row,
+        active & ok & (length + 2 * MAX_WINDOW > CAPACITY) & (not HANDOFF),
+        live,
+    )
     tl.store(OK + row, ok, live)
 
 
@@ -108,6 +117,7 @@ def _commit_positions(
     PAGE_STRIDE: tl.constexpr,
     ROW_STRIDE: tl.constexpr,
     TABLE_STRIDE: tl.constexpr,
+    HANDOFF: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -119,8 +129,12 @@ def _commit_positions(
     flush = tl.load(FLUSH + row, live, False)
     materialized = tl.load(MATERIALIZED + row, live, False)
     ok = tl.load(OK + row, live, False) & (accepted >= 0) & (accepted <= width)
+    if HANDOFF:
+        ok &= (width == 0) & (~flush)
     # Zero acceptance still advances c after a flush of old accepted history.
-    write = live & ok & (width > 0) & ((accepted > 0) | flush | materialized)
+    write = (
+        live & ok & ((width > 0) | HANDOFF) & ((accepted > 0) | flush | materialized)
+    )
     token = end + accepted - 1
     column = token // ROWS
     in_table = write & (token >= 0) & (column < COLUMNS)
@@ -188,6 +202,7 @@ def prepare_positions(
     *,
     capacity,
     max_window,
+    for_handoff,
 ):
     """Fill caller-owned batch positions from the last committed history row.
 
@@ -204,6 +219,9 @@ def prepare_positions(
         ok: Bool [batch] output validity; false must prevent forward/publication.
         capacity: Fixed logical history capacity, independent of block span.
         max_window: Fixed maximum valid width, for both ordinary/speculative use.
+        for_handoff: All rows name quiescent endpoints, with zero input width.
+            Read their stamps but never plan a capacity flush; there is no
+            forward to execute it. Handoff batches contain no padding rows.
 
     Returns:
         None. Outputs are overwritten in place without allocation or readback.
@@ -238,6 +256,7 @@ def prepare_positions(
             block_table.stride(0),
             capacity,
             max_window,
+            for_handoff,
             128,
         )
 
@@ -253,6 +272,8 @@ def commit_positions(
     flush,
     ok,
     materialized,
+    *,
+    for_handoff,
 ):
     """Stamp all layers' last accepted input rows after data stores complete.
 
@@ -268,6 +289,8 @@ def commit_positions(
     materialized is an explicit bool [batch] flag: when true, endpoint state
     at e+a must also have completed its stores, and that exact position is
     stamped even with zero acceptance. It does not itself fence those stores.
+    for_handoff permits zero-width rows to stamp an endpoint reconstructed
+    without a forward; all such rows are live and acceptance is zero.
 
     Returns None. Invalid acceptance or an unbacked destination clears the
     corresponding ok output and suppresses its store. The caller must consume
@@ -323,6 +346,7 @@ def commit_positions(
             first.shape[1],
             *first.stride(),
             block_table.stride(0),
+            for_handoff,
             128,
         )
 
@@ -335,16 +359,19 @@ def _refresh_decode_inputs(
     B: tl.constexpr,
     LIVE,
     WINDOW: tl.constexpr,
+    HANDOFF: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     active = (row < B) & (row < LIVE)
     seq_len = tl.load(SEQ_LENS + row, active, WINDOW)
-    tl.store(END + row, tl.where(active, seq_len - WINDOW, 0), row < B)
-    tl.store(WIDTH + row, tl.where(active, WINDOW, 0), row < B)
+    tl.store(
+        END + row, tl.where(active, seq_len - (0 if HANDOFF else WINDOW), 0), row < B
+    )
+    tl.store(WIDTH + row, tl.where(active, 0 if HANDOFF else WINDOW, 0), row < B)
 
 
-def refresh_decode_inputs(seq_lens, end, width, *, actual_bs, max_window):
+def refresh_decode_inputs(seq_lens, end, width, *, actual_bs, max_window, for_handoff):
     """Refresh fixed-address int32 endpoint/width vectors for one decode batch.
 
     ``seq_lens`` includes the fixed target input window. Live rows therefore
@@ -353,10 +380,15 @@ def refresh_decode_inputs(seq_lens, end, width, *, actual_bs, max_window):
     ``end``/``width`` have the padded batch shape and contiguous storage;
     ``seq_lens`` need only contain the live rows. Negative live endpoints remain
     invalid for position preparation rather than being silently clamped.
+    for_handoff takes exact accepted endpoints instead of decode sequence
+    lengths, sets width zero and requires an unpadded batch. No candidates are
+    implied by this refresh.
     """
     batch = end.numel()
     if not 0 <= actual_bs <= batch or max_window <= 0:
         raise ValueError("invalid live batch or maximum window")
+    if for_handoff and actual_bs != batch:
+        raise ValueError("handoff rows must all be live")
     for tensor in (seq_lens, end, width):
         if (
             tensor.ndim != 1
@@ -376,5 +408,6 @@ def refresh_decode_inputs(seq_lens, end, width, *, actual_bs, max_window):
             batch,
             actual_bs,
             max_window,
+            for_handoff,
             128,
         )

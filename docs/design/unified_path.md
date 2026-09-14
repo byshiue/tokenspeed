@@ -540,6 +540,23 @@ No additional state store is needed when the source is already exact. The
 per-group `materialized` flag records a required write, not its completion;
 stamp commit may consume it only after all layer stores finish. The caller's
 handoff mask grants neither writable ownership nor publication provenance.
+
+Quiescent endpoint materialization uses `materialize_current`: the caller
+supplies fresh tables and exact accepted endpoints for a live-only batch,
+which may differ from the last forward's requests and order. The shared
+metadata/endpoint/stamp operations take explicit `for_handoff=True`; ordinary
+forward and commit pass false. Handoff has width and acceptance zero, validates
+only committed history `[c,e)` and the exact state destination, and never plans
+a capacity flush. There is no forward to execute such a flush, so treating its
+decision as completed would read stale `S_e` instead of reconstructing `S_c`.
+Missing future candidate pages do not prevent handoff. Conv is already at `e`
+and is not rewritten; cached raw payload and conv candidate indices are ignored.
+All local payload fences precede the batched state writer, followed by stamps.
+An already-exact endpoint is a no-op. The owner must preserve exclusive page
+ownership through completion and check the returned live validity before any
+handoff or reuse. Scheduler-triggered lifecycle integration remains pending;
+this operation alone does not authorize a transfer or release.
+
 The KDA backend now dispatches buffered decode for an explicitly planned replay
 pool. Width one and verify use the same refresh, forward and accepted commit;
 the persistent workspace exists before capture, with no legacy verify tape.
