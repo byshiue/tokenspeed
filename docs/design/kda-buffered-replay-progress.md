@@ -28,6 +28,8 @@ M9 source commit: `eb55b1dac8195dd6aca06238c018dd959c0bd0ca`
 (`perf(kda): share replay metadata and stamp commits across layers`).
 M10 source commit: `014c7a6f6b17ceba6fbfce6ef52cc78d31d079e5`
 (`feat(kda): compose buffered conv and recurrent workspace`).
+M11 source commit: `c86d483db192b4bb72c01dbe0c305ff6c2d19d11`
+(`feat(kda): materialize accepted replay endpoints`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -928,9 +930,10 @@ attributes, so retaining old tensor references cannot hide a rebound buffer.
 
 ### M11: accepted-endpoint materialization
 
-Source: based on `d8014a642ad829c4648d2df8550ab67e3bb85f0f` (M10 record);
-source commit will be recorded after final checks. No serving or real-model
-result yet.
+Source commit: `c86d483db192b4bb72c01dbe0c305ff6c2d19d11` (signed off),
+based on `d8014a642ad829c4648d2df8550ab67e3bb85f0f` (M10 record).
+No serving or real-model result yet. The exact `pre-commit run --all-files`
+command passed after formatting and before the source commit.
 
 The workspace now makes its endpoint decision after acceptance. It selects
 an aligned accepted endpoint, or a caller-supplied GPU handoff mask, only when
