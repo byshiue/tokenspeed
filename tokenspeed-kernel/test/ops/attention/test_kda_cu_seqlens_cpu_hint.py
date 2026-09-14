@@ -372,7 +372,10 @@ def test_facade_requires_host_boundaries(monkeypatch):
     cu = torch.tensor([0, T], dtype=torch.int32)
     cu_cpu = torch.tensor([0, T], dtype=torch.int64)
     common = dict(
-        initial_state=torch.zeros(1, HV, K, V), cu_seqlens=cu, lower_bound=-5.0
+        capacity=None,
+        initial_state=torch.zeros(1, HV, K, V),
+        cu_seqlens=cu,
+        lower_bound=-5.0,
     )
 
     with pytest.raises(TypeError):

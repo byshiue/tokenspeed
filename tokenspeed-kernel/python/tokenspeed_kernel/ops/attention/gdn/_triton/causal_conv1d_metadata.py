@@ -28,6 +28,52 @@ from tokenspeed_kernel._triton import tl, triton
 CAUSAL_CONV1D_BLOCK_M = 8
 
 
+@triton.jit
+def _refresh_conv_capacity_kernel(
+    boundaries,
+    batches,
+    offsets,
+    CHUNKS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    length = tl.load(boundaries + row + 1) - tl.load(boundaries + row)
+    for start in range(tl.cdiv(CHUNKS, BLOCK)):
+        chunk = start * BLOCK + tl.arange(0, BLOCK)
+        destination = row * CHUNKS + chunk
+        valid = chunk * BLOCK_M < length
+        tl.store(batches + destination, tl.where(valid, row, -1), chunk < CHUNKS)
+        tl.store(offsets + destination, chunk, chunk < CHUNKS)
+
+
+def refresh_causal_conv1d_capacity_metadata(query_start_loc, metadata, token_capacity):
+    """Refresh fixed-capacity conv maps once for all layers in a forward.
+
+    Args:
+        query_start_loc: Live device packed boundaries [sequences+1].
+        metadata: Writable graph-owned maps, each with sequences times
+            ceil(token_capacity / block_m) entries.
+        token_capacity: Per-sequence scheduling capacity in tokens.
+
+    Returns:
+        None. Inactive programs receive PAD_SLOT_ID (-1), causing the existing
+        convolution kernel to exit before its unmasked history loads.
+    """
+    chunks = triton.cdiv(token_capacity, metadata.block_m)
+    sequences = query_start_loc.numel() - 1
+    if metadata.batch_indices.numel() != sequences * chunks:
+        raise ValueError("Conv capacity map extent differs from planning capacity")
+    _refresh_conv_capacity_kernel[(sequences,)](
+        query_start_loc,
+        metadata.batch_indices,
+        metadata.chunk_offsets,
+        CHUNKS=chunks,
+        BLOCK_M=metadata.block_m,
+        BLOCK=256,
+    )
+
+
 @dataclass(frozen=True)
 class CausalConv1dPrefillMetadata:
     """Read-only program-to-request and program-to-chunk maps for one forward."""

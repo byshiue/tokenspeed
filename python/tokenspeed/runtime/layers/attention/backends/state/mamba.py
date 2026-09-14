@@ -365,6 +365,13 @@ class MambaForwardMetadata:
     state_checkpoint_blocks_by_group: dict[str, torch.Tensor] | None = None
     prefill_checkpoint_batch: _PrefillCheckpointBatch | None = None
 
+    @property
+    def prefill_token_extent(self) -> int | None:
+        """Live packed extent; capacity metadata may override storage geometry."""
+        if self.extend_seq_lens_cpu is None:
+            return None
+        return int(sum(int(x) for x in self.extend_seq_lens_cpu))
+
 
 @dataclass
 class _GDNReplayWorkspace:
@@ -2074,7 +2081,7 @@ class MambaAttnBackend(AttentionBackend):
             # Zero padded rows so garbage can't reach recurrent state (see scrub_padding_tail).
             num_real_tokens = seq_len
             if extend_seq_lens_cpu is not None:
-                num_real_tokens = int(sum(int(x) for x in extend_seq_lens_cpu))
+                num_real_tokens = self.forward_metadata.prefill_token_extent
                 scrub_padding_tail(num_real_tokens, mixed_qkv, a, b)
 
             if checkpoint_blocks is not None and checkpoint_batch is not None:

@@ -120,6 +120,7 @@ def _run_case(
 ) -> None:
     operator_inputs = _slice_kda_prefill_inputs(call_tokens, *packed_inputs)
     result = kda_paged_prefill(
+        capacity=None,
         *operator_inputs,
         *parameters,
         initial_state=recurrent_state,

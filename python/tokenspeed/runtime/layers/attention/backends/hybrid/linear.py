@@ -150,6 +150,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
         self.linear_attn_backend.init_cuda_graph_state(max_bs, **kwargs)
 
+    def init_prefill_graph_state(self, max_num_tokens: int, max_bs: int) -> None:
+        self.full_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+        self.linear_attn_backend.init_prefill_graph_state(max_num_tokens, max_bs)
+
     def register_step_counter(self, step_counter):
         # Hybrid layerwise transfer needs one global step per model layer,
         # including both full-attention and mamba layers. Normal attention

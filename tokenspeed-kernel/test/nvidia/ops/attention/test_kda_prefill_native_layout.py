@@ -53,6 +53,7 @@ def _inputs(device, lengths):
 
 def _actual(inputs, state, bounds, cpu, layout):
     return kda_paged_prefill(
+        capacity=None,
         *inputs,
         initial_state=state,
         cu_seqlens=bounds,

@@ -680,6 +680,57 @@ handoff buffer. No output-buffer extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
+## Experimental KDA prefill subgraphs
+
+`TOKENSPEED_KDA_PREFILL_GRAPH=1` opts into capacity-based subgraphs within
+the existing breakable-prefill attention break. The default remains off.
+The cache calls the same extend implementation for warmup and capture;
+capture failures propagate. Decode, outer graph capture and ordinary eager
+forwards retain their existing behavior. PD cache-step recording and the
+break-output copy/padding stay outside the subgraph in their original order.
+
+Each backend retains at most eight schedules per sequence count, keyed by
+sequence count, padded token count, CUDA stream and PDL setting. Layer entries also
+require identical input addresses, shapes, strides, dtypes and scalar
+arguments, and retain input references against allocator address recycling.
+Incompatible inputs or schedules beyond capacity run the same eager callable.
+The first execution warms native plans normally; the second records a graph
+and replays once, so in-place cache state is never advanced by extra warmups.
+
+Schedules own private metadata snapshots. Actual CPU/GPU boundaries and
+state-page indices are refreshed once per new forward, on the same stream
+that consumes them. All layers in that schedule share the snapshot. This
+does not mutate the original per-forward metadata or change scheduler page
+ownership. Publishing a replacement cache pool drops all subgraphs, under
+the existing orchestrator-owned graph-release/rebind lifecycle.
+
+Subgraphs on one replay stream share a private graph memory pool and one
+capture stream. Other replay streams use separate pools, so concurrent
+consumers cannot overwrite each other's scratch. The outer breakable graph
+pool remains separate: its intermediates are live across attention breaks.
+Every subgraph produces its output before the existing immediate handoff
+copy consumes it; no captured temporary is an eager-call cache. Output
+tensors remain strongly owned by their graph entries.
+
+The private KDA metadata overrides only the packed execution extent; real
+host lengths and GPU boundaries still agree. An explicit
+`KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths
+and reserves the padded token capacity independently for each sequence.
+The CuTeDSL adapter alone converts this descriptor to native planning bounds.
+The convolution map has fixed per-sequence capacity. One GPU metadata refresh
+per forward marks inactive programs with PAD_SLOT_ID before all layers run:
+the convolution kernel otherwise performs unmasked prior-token loads even
+for an excess chunk. Scan inputs are cleared past the live device boundary
+inside the graph, since a capacity descriptor makes padding addressable to
+native full-tile loads. Both conv and scan read live GPU boundaries;
+total live tokens must fit the physical packed extent. Empty sequence slots
+are not admitted. Batch-count changes require another schedule.
+Other solutions retain exact live-length planning and reject capacity mode.
+
+This is an experimental capacity contract.
+Full-model overlap, memory use and performance must be validated before
+enabling it by default.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path

@@ -79,10 +79,30 @@ __all__ = ["cutedsl_kda_chunk_prefill", "cutedsl_kda_supported"]
     ),
     signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
-    traits={"recurrent_layout": frozenset({"v_major"})},
+    traits={
+        "recurrent_layout": frozenset({"v_major"}),
+        "prefill_capacity": frozenset({True}),
+    },
     tags={"nvidia", "paged_cache"},
 )
 def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
+    # Capacity admission is checked against the actual CPU mirror by the
+    # facade. Only native host planning receives the larger synthetic bounds;
+    # device boundaries continue to identify the real packed token ranges.
+    capacity = kwargs.pop("capacity", None)
+    if capacity is not None:
+        # Capacity descriptors make padding physically addressable to native
+        # full-tile loads. Conv output padding is undefined, so scrub all scan
+        # inputs from the live device boundary before normalization can see NaN.
+        padding = (
+            torch.arange(capacity.token_capacity, device=kwargs["q"].device)
+            >= kwargs["cu_seqlens"][-1]
+        )
+        for name in ("q", "k", "v", "g_raw", "beta_logits"):
+            tensor = kwargs[name]
+            mask = padding.view(1, -1, *([1] * (tensor.ndim - 2)))
+            kwargs[name] = tensor.masked_fill(mask, 0)
+        kwargs["cu_seqlens_cpu"] = capacity.boundaries_cpu()
     return _nvidia_kda_prefill(cutedsl_kda_chunk_prefill, **kwargs)
 
 
@@ -117,8 +137,10 @@ def cutedsl_kda_chunk_prefill(
             zero.
         cu_seqlens: Cumulative sequence boundaries ``[N + 1]`` (``B`` must
             be 1); ``None`` treats each batch row as one sequence.
-        cu_seqlens_cpu: Host int64 copy of ``cu_seqlens`` whose contents
-            MUST equal it; REQUIRED whenever ``cu_seqlens`` is given. The
+        cu_seqlens_cpu: Host int64 copy of ``cu_seqlens``, REQUIRED whenever
+            ``cu_seqlens`` is given. Direct callers must supply equal contents.
+            The registered adapter may instead supply validated per-sequence
+            capacity bounds after explicit facade capacity admission. The
             kernel wrapper plans launch grids, routing, and workspace
             partitioning on the host from the boundary values; reading them
             back instead would be a stream-synchronizing D2H copy on every
