@@ -341,10 +341,11 @@ Consumers must use the initialized-history endpoint, not assume every row in
 an allocated block is valid. Ordinary sliding attention still allocates the
 whole prefill extent because its kernels actually write those rows.
 
-An empty sparse suffix is legal only at an aligned extent with no reserve. Otherwise the table
-would advertise writable tail capacity in a null block. Allocation planning and
-commit share this check; failed admission does not advance the table. Decode
-continues through normal dense admission and sliding reclamation.
+An empty sparse suffix is legal only at an aligned extent with no reserve.
+Otherwise the table would advertise writable tail capacity in a null block.
+Allocation planning and commit share this check; failed admission does not
+advance the table. Decode continues through normal dense admission and sliding
+reclamation.
 
 Replay capacity excludes prefill chunk rows, but still includes the retained
 window, candidates and overlap. Decode's conservative reclamation frontier is

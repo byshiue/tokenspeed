@@ -14,6 +14,8 @@ M2 source commit: `3f3615e11bef462b2c1390ef29b289b612dc2f38`
 (`feat(cache): add bounded live-state retention`).
 M3 source commit: `24c69bf25ca09ab4417b7134593c6f8bebbaf60b`
 (`feat(cache): keep replay history request-local`).
+M4 source commit: `ac74d6785ee921efcd2b4c061e74a562b82ac47f`
+(`feat(cache): reserve only replay history decode tails`).
 No default capacity or performance benefit has been established. M1 adds
 an unregistered prototype, not the complete serving feature.
 
@@ -356,8 +358,8 @@ real-weight TP8 performance, AIME 2026 and full-model NSYS are still pending.
 
 ### M4: empty-history prefill allocation
 
-Source: worktree changes based on `e6e99fbf8ab1665a7d0d9d1ea2ba05681768b66f`
-(M3 validation record), tested before committing.
+Source: M4 commit above (tested before committing), based on
+`e6e99fbf8ab1665a7d0d9d1ea2ba05681768b66f` (M3 validation record).
 
 This milestone closes an allocation prerequisite before KDA field binding.
 Prefill materializes an exact state and starts empty replay history, so reserving
@@ -398,16 +400,24 @@ Validation results:
   chunked/one-forward prefill, Device prefix reuse, aligned/unaligned endpoints,
   partial acceptance, bounded decode residency and finish-time release. This
   is cache scheduling evidence, not GPU metadata or in-flight overlap validation.
-  Allocator checks cover all-hole advancement, failed-admission atomicity,
-  partial-tail backing and int32-limit geometry.
+  The final rebuild also verifies underfunded startup rejection. Allocator
+  checks cover all-hole advancement, failed-admission atomicity, partial-tail
+  backing, rejection of an unbacked reserve and int32-limit geometry.
 - Runtime and scheduler bindings: **392 passed, 313 subtests**, 27 dependency
-  warnings, 28.99 seconds. The new budget case covers spans 1/2/4/128, T=1/4,
+  warnings. Initial/final runs took 28.99/30.30 seconds; these are test durations,
+  not a performance comparison. The new budget case covers spans 1/2/4/128, T=1/4,
   both overlap depths and prefill budgets 128/8192; ordinary sliding budgets
   remain unchanged. Existing Kimi, GDN GPU, prefill, Qwen and PD checks pass.
 - Buffered reference/GPU: **27 passed**, 15 dependency warnings, 6.97 seconds.
   These repeat the existing eager/captured prototype tests, not buffered serving.
 - Small CPU page-budget suite: **7 passed**. This repeats the pure math cases
   without the serving-container dependencies.
+
+The final formatted source was rebuilt and repeated all **487 C++** and
+**392 runtime** tests with the restaged scheduler extension. The mandatory
+`pre-commit run --all-files` passed before the signed-off source commit;
+the earlier formatter changes are included. Raw logs, the source patch,
+environment and checksums are retained in the local runbook.
 
 The remaining field/metadata work is unchanged. In particular, none of these
 tests proves that a lagging checkpoint may be published at the accepted
