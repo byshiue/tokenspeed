@@ -23,6 +23,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
+    merge_prefill_checkpoint_outputs,
     pack_prefill_recurrent_checkpoint_inputs,
     write_prefill_conv_checkpoints,
     write_prefill_recurrent_checkpoints,
@@ -33,6 +34,51 @@ def _device() -> torch.device:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for Triton checkpoint kernels")
     return torch.device("cuda")
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+@pytest.mark.parametrize("token_dim", [0, 1])
+def test_padded_checkpoint_pack_and_output_merge(device_name, token_dim):
+    device = _device() if device_name == "cuda" else torch.device("cpu")
+    # Noncontiguous token rows and state features match projection/scan views.
+    q = torch.arange(7 * 3 * 2 * 4, dtype=torch.float32, device=device).view(
+        1, 7, 3, 2, 4
+    )[:, :, 1]
+    state = (
+        torch.arange(3 * 2 * 4 * 4, dtype=torch.float32, device=device)
+        .view(3, 2, 4, 4)
+        .transpose(-1, -2)
+    )
+    rows = torch.tensor([2, 0], device=device)
+    body_indices = torch.tensor([0, 1, 4, -1, -1, -1, -1, -1], device=device)
+    tail_indices = torch.tensor([2, 3, 5, 6, -1], device=device)
+    gate = q.squeeze(0)
+
+    def pack(indices):
+        return pack_prefill_recurrent_checkpoint_inputs(
+            q, q, q, state, rows, indices, gate, gate, gate, gate, gate
+        )
+
+    body, tail = pack(body_indices), pack(tail_indices)
+    for name in ("query", "key", "value", "a", "b", "g_raw", "f_a_out", "beta_raw"):
+        actual = getattr(body, name)
+        if actual.ndim == q.ndim:
+            actual = actual.squeeze(0)
+        torch.testing.assert_close(actual[:3], gate[[0, 1, 4]], rtol=0, atol=0)
+        assert torch.count_nonzero(actual[3:]) == 0
+    torch.testing.assert_close(body.recurrent_state, state[rows], rtol=0, atol=0)
+    # Exercise feature strides in scan outputs as well as token-axis conventions.
+    body_out, tail_out = body.value.transpose(-1, -2), tail.value.transpose(-1, -2)
+    expected = q.transpose(-1, -2)
+    if token_dim == 0:
+        body_out, tail_out, expected = (
+            x.squeeze(0) for x in (body_out, tail_out, expected)
+        )
+    merged = merge_prefill_checkpoint_outputs(
+        body_out, tail_out, body_indices, tail_indices, token_dim, 9
+    )
+    torch.testing.assert_close(merged.narrow(token_dim, 0, 7), expected, rtol=0, atol=0)
+    assert torch.count_nonzero(merged.narrow(token_dim, 7, 2)) == 0
 
 
 @pytest.fixture

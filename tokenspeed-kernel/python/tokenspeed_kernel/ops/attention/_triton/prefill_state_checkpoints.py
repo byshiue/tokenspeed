@@ -261,7 +261,11 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         query_out + token * query_width + feature,
-        tl.load(query + source_token * query_stride + feature, mask=mask),
+        tl.load(
+            query + source_token * query_stride + feature,
+            mask=mask & (source_token >= 0),
+            other=0,
+        ),
         mask=mask,
     )
 
@@ -271,7 +275,11 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         key_out + token * key_width + feature,
-        tl.load(key + source_token * key_stride + feature, mask=mask),
+        tl.load(
+            key + source_token * key_stride + feature,
+            mask=mask & (source_token >= 0),
+            other=0,
+        ),
         mask=mask,
     )
 
@@ -281,7 +289,11 @@ def _pack_prefill_recurrent_inputs_kernel(
     source_token = tl.load(token_indices + token, mask=mask, other=0)
     tl.store(
         value_out + token * value_width + feature,
-        tl.load(value + source_token * value_stride + feature, mask=mask),
+        tl.load(
+            value + source_token * value_stride + feature,
+            mask=mask & (source_token >= 0),
+            other=0,
+        ),
         mask=mask,
     )
 
@@ -312,7 +324,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             a_out + token * a_width + feature,
-            tl.load(a + source_token * a_stride + feature, mask=mask),
+            tl.load(
+                a + source_token * a_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_B:
@@ -322,7 +338,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             b_out + token * b_width + feature,
-            tl.load(b + source_token * b_stride + feature, mask=mask),
+            tl.load(
+                b + source_token * b_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_G:
@@ -332,7 +352,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             g_raw_out + token * g_width + feature,
-            tl.load(g_raw + source_token * g_stride + feature, mask=mask),
+            tl.load(
+                g_raw + source_token * g_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_F_A:
@@ -342,7 +366,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             f_a_packed + token * f_a_width + feature,
-            tl.load(f_a_out + source_token * f_a_stride + feature, mask=mask),
+            tl.load(
+                f_a_out + source_token * f_a_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
     if HAS_BETA:
@@ -352,7 +380,11 @@ def _pack_prefill_recurrent_inputs_kernel(
         source_token = tl.load(token_indices + token, mask=mask, other=0)
         tl.store(
             beta_raw_out + token * beta_width + feature,
-            tl.load(beta_raw + source_token * beta_stride + feature, mask=mask),
+            tl.load(
+                beta_raw + source_token * beta_stride + feature,
+                mask=mask & (source_token >= 0),
+                other=0,
+            ),
             mask=mask,
         )
 
@@ -399,7 +431,8 @@ def pack_prefill_recurrent_checkpoint_inputs(
         recurrent_state: Per-request initial recurrent states. Row and feature
             strides may be noncontiguous, including transposed scan results.
         rows: Request rows selected for checkpoint scans.
-        token_indices: Source-token indices for all selected checkpoint prefixes.
+        token_indices: Source-token indices for all selected checkpoint prefixes;
+            negative entries produce zero rows for capacity padding.
         a: Optional token-major GDN scan input.
         b: Optional token-major GDN scan input.
         g_raw: Optional token-major KDA gate input.
@@ -412,20 +445,23 @@ def pack_prefill_recurrent_checkpoint_inputs(
     num_rows = rows.numel()
     optional_inputs = (a, b, g_raw, f_a_out, beta_raw)
     if not query.is_cuda:
+
+        def gather(tensor, dim):
+            selected = tensor.index_select(dim, token_indices.clamp_min(0))
+            shape = [1] * selected.ndim
+            shape[dim] = num_tokens
+            return selected.masked_fill((token_indices < 0).view(shape), 0)
+
         return PackedPrefillCheckpointInputs(
-            query=query.index_select(1, token_indices),
-            key=key.index_select(1, token_indices),
-            value=value.index_select(1, token_indices),
+            query=gather(query, 1),
+            key=gather(key, 1),
+            value=gather(value, 1),
             recurrent_state=recurrent_state.index_select(0, rows),
-            a=None if a is None else a.index_select(0, token_indices),
-            b=None if b is None else b.index_select(0, token_indices),
-            g_raw=None if g_raw is None else g_raw.index_select(0, token_indices),
-            f_a_out=(
-                None if f_a_out is None else f_a_out.index_select(0, token_indices)
-            ),
-            beta_raw=(
-                None if beta_raw is None else beta_raw.index_select(0, token_indices)
-            ),
+            a=None if a is None else gather(a, 0),
+            b=None if b is None else gather(b, 0),
+            g_raw=None if g_raw is None else gather(g_raw, 0),
+            f_a_out=(None if f_a_out is None else gather(f_a_out, 0)),
+            beta_raw=(None if beta_raw is None else gather(beta_raw, 0)),
         )
 
     query_out = _allocate_token_pack(query, 1, num_tokens)
@@ -537,6 +573,81 @@ def pack_prefill_recurrent_checkpoint_inputs(
         f_a_out=optional_outputs[3],
         beta_raw=optional_outputs[4],
     )
+
+
+@triton.jit
+def _scatter_checkpoint_output_kernel(
+    source,
+    indices,
+    output,
+    STRIDES: tl.constexpr,
+    SHAPE: tl.constexpr,
+    TOKENS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    token, feature = offset // WIDTH, offset % WIDTH
+    destination = tl.load(indices + token, token < TOKENS, other=-1)
+    source_offset = token * STRIDES[0]
+    for dim in tl.static_range(len(SHAPE) - 1, 0, -1):
+        source_offset += (feature % SHAPE[dim]) * STRIDES[dim]
+        feature = feature // SHAPE[dim]
+    live = (token < TOKENS) & (destination >= 0)
+    value = tl.load(source + source_offset, live, other=0)
+    tl.store(output + destination * WIDTH + offset % WIDTH, value, live)
+
+
+def merge_prefill_checkpoint_outputs(
+    body: torch.Tensor,
+    tail: torch.Tensor,
+    body_indices: torch.Tensor,
+    tail_indices: torch.Tensor,
+    token_dim: int,
+    token_extent: int,
+) -> torch.Tensor:
+    """Restore packed body/tail outputs to original token order.
+
+    Args:
+        body: Body scan output, with dense or strided feature dimensions.
+        tail: Tail scan output with the same feature geometry as body.
+        body_indices: Original token indices, with negative padding entries.
+        tail_indices: Original token indices, disjoint from body indices.
+        token_dim: Token axis; any preceding dimensions must be singleton.
+        token_extent: Output token capacity; unwritten padding stays zero.
+
+    Returns:
+        Contiguous output with the original token order and zero bucket padding.
+        Nonnegative indices must cover each live output token exactly once.
+    """
+    if any(size != 1 for size in body.shape[:token_dim]):
+        raise ValueError("checkpoint outputs require singleton leading dimensions")
+    shape = list(body.shape)
+    shape[token_dim] = token_extent
+    output = torch.zeros(shape, dtype=body.dtype, device=body.device)
+    for source, indices in ((body, body_indices), (tail, tail_indices)):
+        if source.shape[token_dim] != indices.numel():
+            raise ValueError("checkpoint output extent differs from token indices")
+        if not source.is_cuda:
+            live = indices >= 0
+            output.index_copy_(
+                token_dim,
+                indices[live],
+                source.index_select(token_dim, torch.nonzero(live).flatten()),
+            )
+            continue
+        width = source.numel() // source.shape[token_dim]
+        _scatter_checkpoint_output_kernel[(triton.cdiv(source.numel(), 256),)](
+            source,
+            indices,
+            output,
+            STRIDES=source.stride()[token_dim:],
+            SHAPE=source.shape[token_dim:],
+            TOKENS=indices.numel(),
+            WIDTH=width,
+            BLOCK=256,
+        )
+    return output
 
 
 @triton.jit(do_not_specialize=["num_rows", "state_width"])

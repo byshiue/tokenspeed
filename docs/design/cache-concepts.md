@@ -240,7 +240,12 @@ packed tail scan, initialized directly
 from their body final states. Body and tail outputs are scattered back to
 original token order, so every token is evaluated exactly once while the aligned
 and final states are both retained. Batch size one uses zero-copy body/tail
-views; larger batches use the same batched pack/scatter contract. This split
+views; larger batches use the same batched pack/scatter contract. Capacity
+graphs also use that pack/scatter contract for one request because its live
+body/tail boundary cannot be encoded as a capture-time Python slice. Negative
+token indices mark inactive capacity rows: packing zeroes them and scattering
+ignores them. GPU boundaries still determine the real tokens in each scan.
+This split
 does not change cache ownership or scheduler metadata.
 
 The body/tail split uses the existing prefill-op state-layout contract. KDA

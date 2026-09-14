@@ -179,7 +179,9 @@ class AttentionBackend(CachePoolBinding, ABC):
 
     prefill_graph_inline: bool = False
 
-    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+    def prepare_prefill_graph_bindings(
+        self, bucket: int, with_checkpoint: bool
+    ) -> list:
         """Return stable metadata bindings for inline capture at `bucket`.
 
         A binding owns capture metadata, checks replay compatibility and

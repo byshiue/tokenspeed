@@ -20,12 +20,19 @@ with the same request count used at capture. The original outer graph remains
 available for mixed batches and other request counts. Layerwise PD transfer
 and data parallelism retain that original route.
 
-Forwards that materialize an internal checkpoint also use the original
-attention break. Their body/tail scans have separate packed extents and
-checkpoint destinations, so neither the merged capture nor the separate KDA
-capacity cache admits them. Their checkpoint computation remains unchanged.
+An additional merged capture handles internal checkpoints. It records the
+same body scan, checkpoint write and tail scan as eager prefill. Both scans
+use stable token-index buffers; negative entries denote padding. The body
+reserves the outer bucket's capacity. Each checkpointed request contributes
+at most `prefix_granularity - 1` tail tokens, so the packed tail capacity is
+bounded separately. Replay refreshes both scans' live boundaries and indices,
+along with the scheduler's checkpoint page IDs, once before the first layer.
+The captured request count and checkpoint-row count must match the live batch;
+row identities, lengths and page IDs may change. Startup seeds all captured
+request slots with a checkpoint using only placeholder state pages. Other
+checkpoint-row counts use the ordinary attention break.
 
-Both capture variants belong to the outer graph owner and share its pool;
+All capture variants belong to the outer graph owner and share its pool;
 they are never replayed concurrently. This adds capture work and retained
 metadata. Its memory cost and full-model speedup have not yet been measured.
 
@@ -112,6 +119,14 @@ regions at live lengths 58, 76, 94, 1536, 3584 and 6656. Each region captured
 as one graph; 54 shared-pool replays in forward and reverse order matched
 eager outputs and convolution/recurrent states bit-for-bit on each of two
 GPUs. This is operator-level validation, not a new full-model benchmark.
+
+Checkpoint regressions additionally replay an 837-token extend (768-token
+body plus 69-token tail), changing lengths within the same 1024-token bucket,
+fresh and resumed state, and different checkpoint/continuation pages. A
+two-request test moves the checkpoint between request rows. Each replay must
+match eager token outputs and the entire convolution/recurrent state pools
+bit-for-bit, with zero output padding. Padded pack/scatter tests also cover
+strided scan outputs and both KDA and GDN token-axis conventions.
 
 The following larger validation runs were performed on the earlier separate
 subgraphs:

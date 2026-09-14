@@ -35,6 +35,8 @@ from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaForwardMetadata,
+    _build_prefill_checkpoint_batch,
+    _PrefillCheckpointBatch,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,9 +51,51 @@ class KdaPrefillGraphMetadata(MambaForwardMetadata):
         return self.capacity.token_capacity
 
 
-def _capacity_metadata(source, bucket):
-    if source.prefill_checkpoint_batch is not None:
-        raise ValueError("internal checkpoint scans require eager prefill metadata")
+@dataclass(frozen=True)
+class _CheckpointCapacityBatch(_PrefillCheckpointBatch):
+    packed_capacity: int
+
+    @property
+    def use_token_views(self) -> bool:
+        # Live body/tail offsets change between replays; Python slices would
+        # freeze their capture-time values. Both scans use the shared packer.
+        return False
+
+    @property
+    def token_extent(self) -> int:
+        return self.packed_capacity
+
+
+def checkpoint_capture_source(source, prefix_granularity):
+    """Seed a checkpoint topology using only startup placeholder state pages."""
+    lengths = source.extend_seq_lens_cpu
+    if prefix_granularity <= 1 or (lengths < 2).any().item():
+        return None
+    # A one-token tail seeds every captured request slot. Page ownership still
+    # belongs to the scheduler: warmup only uses the existing placeholder pool.
+    prefixes = (1 - lengths).remainder(prefix_granularity)
+    batch = _build_prefill_checkpoint_batch(
+        lengths,
+        prefixes,
+        lengths.numel(),
+        prefix_granularity,
+        source.query_start_loc.device,
+    )
+    batch = replace(
+        batch,
+        body_query_start_loc=batch.body_query_start_loc.to(torch.int64),
+        tail_query_start_loc=batch.tail_query_start_loc.to(torch.int64),
+    )
+    return replace(
+        source,
+        prefill_checkpoint_batch=batch,
+        state_checkpoint_blocks_by_group=_clone_metadata(
+            source.state_out_blocks_by_group
+        ),
+    )
+
+
+def _capacity_metadata(source, bucket, tail_capacity):
     capacity = KdaPrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
     capacity.validate(source.cu_extend_seq_lens_cpu, bucket)
     cloned = _clone_metadata(source)
@@ -62,6 +106,27 @@ def _capacity_metadata(source, bucket):
         },
         capacity=capacity,
     )
+    checkpoint = cloned.prefill_checkpoint_batch
+    if checkpoint is not None:
+        # Each tail is shorter than the prefix grain. Bound its packed scratch
+        # independently instead of paying the full token bucket for both scans.
+        padded = {}
+        for name in ("body_token_indices", "tail_token_indices"):
+            indices = getattr(checkpoint, name)
+            padded[name] = torch.full(
+                (bucket if name == "body_token_indices" else tail_capacity,),
+                -1,
+                dtype=indices.dtype,
+                device=indices.device,
+            )
+            padded[name][: indices.numel()].copy_(indices)
+        result.prefill_checkpoint_batch = _CheckpointCapacityBatch(
+            **{
+                field.name: padded.get(field.name, getattr(checkpoint, field.name))
+                for field in fields(_PrefillCheckpointBatch)
+            },
+            packed_capacity=bucket,
+        )
     # Build immutable per-request capacity maps once, independently of live
     # packed boundaries. Overscheduled conv programs honor the live bounds.
     host_bounds = capacity.boundaries_cpu()
@@ -110,12 +175,21 @@ class KdaOuterGraphBinding:
     Args:
         backend: KDA leaf whose metadata is temporarily bound.
         bucket: Packed token capacity selected by the outer graph.
+        source: Live or startup placeholder metadata defining the scan topology.
     """
 
-    def __init__(self, backend, bucket):
+    def __init__(self, backend, bucket, source):
         self.backend = backend
         self.pool = backend.cache_pool
-        self.metadata = _capacity_metadata(backend.forward_metadata, bucket)
+        checkpoint = source.prefill_checkpoint_batch
+        tail_capacity = (
+            None
+            if checkpoint is None
+            else min(
+                bucket, checkpoint.rows.numel() * (backend._prefix_granularity - 1)
+            )
+        )
+        self.metadata = _capacity_metadata(source, bucket, tail_capacity)
 
     def compatible(self, ctx):
         """Return whether the live context matches this captured request geometry."""
@@ -125,7 +199,7 @@ class KdaOuterGraphBinding:
             and self.backend.step_counter is None
             and ctx.forward_mode.is_extend()
             and ctx.num_extends == ctx.bs == self.metadata.capacity.num_sequences
-            and source.prefill_checkpoint_batch is None
+            and _checkpoint_geometry(source) == _checkpoint_geometry(self.metadata)
             and source.extend_seq_lens_cpu is not None
             and source.extend_seq_lens_cpu.numel()
             == self.metadata.capacity.num_sequences
@@ -148,6 +222,11 @@ class KdaOuterGraphBinding:
             backend.prefill_graph_inline = previous_inline
 
 
+def _checkpoint_geometry(metadata):
+    batch = metadata.prefill_checkpoint_batch
+    return None if batch is None else batch.rows.numel()
+
+
 def _refresh_capacity_metadata(target, source):
     target.capacity.validate(
         source.cu_extend_seq_lens_cpu, target.capacity.token_capacity
@@ -165,8 +244,31 @@ def _refresh_capacity_metadata(target, source):
         target.conv_prefill_metadata,
         target.capacity.token_capacity,
     )
-    for name in ("state_in_blocks_by_group", "state_out_blocks_by_group"):
+    checkpoint = target.prefill_checkpoint_batch
+    if checkpoint is not None:
+        live = source.prefill_checkpoint_batch
+        if _checkpoint_geometry(target) != _checkpoint_geometry(source):
+            raise ValueError("KDA checkpoint request geometry changed")
+        for name in ("body", "tail"):
+            capacity = getattr(checkpoint, f"{name}_token_indices").numel()
+            KdaPrefillCapacity(
+                capacity, getattr(live, f"{name}_seq_lens_cpu").numel()
+            ).validate(getattr(live, f"{name}_cu_seqlens_cpu"), capacity)
+        for field in fields(_PrefillCheckpointBatch):
+            old, new = getattr(checkpoint, field.name), getattr(live, field.name)
+            if field.name in ("body_token_indices", "tail_token_indices"):
+                old.fill_(-1)
+                old[: new.numel()].copy_(new)
+            else:
+                old.copy_(new)
+    for name in (
+        "state_in_blocks_by_group",
+        "state_out_blocks_by_group",
+        "state_checkpoint_blocks_by_group",
+    ):
         old, new = getattr(target, name), getattr(source, name)
+        if old is None and new is None:
+            continue
         if old.keys() != new.keys():
             raise RuntimeError("KDA graph state groups changed without pool rebind")
         for group, indices in old.items():
@@ -211,7 +313,7 @@ class KdaPrefillGraphCache:
         schedule = self.schedules.get(key)
         if schedule is None:
             schedule = {
-                "metadata": _capacity_metadata(source, bucket),
+                "metadata": _capacity_metadata(source, bucket, None),
                 "source": source,
                 "layers": {},
             }

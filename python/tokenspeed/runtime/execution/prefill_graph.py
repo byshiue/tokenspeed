@@ -338,18 +338,22 @@ class PrefillGraph:
                     self._capture_bucket(bucket, decode_wrapper)
                     # Retain the ordinary graph for mixed/different-count batches.
                     # DP admission must be rank-uniform; keep its existing route.
-                    bindings = (
-                        self.attn_backend.prepare_prefill_graph_bindings(bucket)
-                        if self.dp_size == 1
-                        else []
-                    )
-                    if bindings:
+                    for with_checkpoint in (False, True):
+                        bindings = (
+                            self.attn_backend.prepare_prefill_graph_bindings(
+                                bucket, with_checkpoint
+                            )
+                            if self.dp_size == 1
+                            else []
+                        )
+                        if not bindings:
+                            continue
                         ordinary = self._captures[bucket], self._outputs[bucket]
                         with ExitStack() as stack:
                             for binding in bindings:
                                 stack.enter_context(binding.bind(refresh=False))
                             self._capture_bucket(bucket, decode_wrapper)
-                        self._inline_captures[bucket] = (
+                        self._inline_captures[bucket, with_checkpoint] = (
                             self._captures[bucket],
                             self._outputs[bucket],
                             bindings,
@@ -641,16 +645,17 @@ class PrefillGraph:
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
         cap, output = self._captures[bucket], self._outputs[bucket]
-        inline = self._inline_captures.get(bucket)
         with ExitStack() as stack:
-            if (
-                inline is not None
-                and self.attn_backend.step_counter is None
-                and all(binding.compatible(ctx) for binding in inline[2])
-            ):
-                cap, output, bindings = inline
-                for binding in bindings:
-                    stack.enter_context(binding.bind(refresh=True))
+            if self.attn_backend.step_counter is None:
+                for with_checkpoint in (False, True):
+                    inline = self._inline_captures.get((bucket, with_checkpoint))
+                    if inline is not None and all(
+                        binding.compatible(ctx) for binding in inline[2]
+                    ):
+                        cap, output, bindings = inline
+                        for binding in bindings:
+                            stack.enter_context(binding.bind(refresh=True))
+                        break
             with self._padded_to(ctx, bucket):
                 cap.replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = output.sliced(num_tokens)

@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.activation.triton import rmsnorm_gated_sigmoid
 from tokenspeed_kernel.ops.attention.kda import (
+    KdaPrefillCapacity,
     kda_batched_replay_uses_raw_gate,
     kda_fused_paged_verify_uses_split_producers,
     kda_paged_decode,
@@ -65,6 +66,7 @@ from tokenspeed.runtime.layers.attention.backends.state.prefill_graph import (
     KdaOuterGraphBinding,
     KdaPrefillGraphCache,
     KdaPrefillGraphMetadata,
+    checkpoint_capture_source,
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
@@ -149,14 +151,22 @@ class KdaAttnBackend(MambaAttnBackend):
         self._prefill_graph_cache = None
         super().init_prefill_graph_state(max_num_tokens, max_bs)
 
-    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+    def prepare_prefill_graph_bindings(
+        self, bucket: int, with_checkpoint: bool
+    ) -> list:
         if (
             self._prefill_graph_enabled
             and self.kda_backend == "cutedsl_kda"
             and self.step_counter is None
-            and self.forward_metadata.prefill_checkpoint_batch is None
         ):
-            return [KdaOuterGraphBinding(self, bucket)]
+            source = self.forward_metadata
+            if with_checkpoint:
+                source = checkpoint_capture_source(source, self._prefix_granularity)
+                if source is None:
+                    return []
+            elif source.prefill_checkpoint_batch is not None:
+                return []
+            return [KdaOuterGraphBinding(self, bucket, source)]
         return []
 
     def forward_extend(
@@ -1045,7 +1055,7 @@ class KdaAttnBackend(MambaAttnBackend):
             cu_seqlens=query_start_loc,
             cu_seqlens_cpu=cu_seqlens_cpu,
             capacity=(
-                self.forward_metadata.capacity
+                KdaPrefillCapacity(seq_len, query_start_loc.numel() - 1)
                 if isinstance(self.forward_metadata, KdaPrefillGraphMetadata)
                 else None
             ),

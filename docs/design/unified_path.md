@@ -698,16 +698,22 @@ inside the graph, replacing the KDA break's handoff copy and tail scrub.
 The outer graph owns these allocations and their pool.
 
 The ordinary outer capture is retained for mixed batches and other request
-counts. Both variants share the outer pool and execute serially, as existing
+counts. All variants share the outer pool and execute serially, as existing
 bucket captures do. Layerwise PD transfer and data parallelism retain the
 ordinary route: host cache-step callbacks must remain live, and DP admission
 must stay rank-uniform. A binding rejects a replacement cache pool; graph
 release and recapture remain the orchestrator's responsibility.
 
-Internal-checkpoint forwards retain the ordinary attention break as well.
-Their body/tail scans carry distinct token extents and destination indices;
-the full-batch capacity contract does not cover them. Both capture admission
-and separate-subgraph admission reject this metadata. Replay refresh includes
+Internal-checkpoint forwards have a merged capture with two scan capacities.
+Stable body/tail token maps use negative indices for inactive rows; packing
+zeros those rows and output scattering ignores them. Each scan consumes its
+own live GPU boundaries and CPU mirror. Checkpoint writes retain the eager
+ordering: convolution snapshots precede convolution updates, and recurrent
+snapshots precede the tail scan. The graph binds scheduler-owned checkpoint
+destinations, not backend-owned cache pages. Replay requires the captured
+request and checkpoint-row counts; row identities and lengths can change.
+Other checkpoint topologies retain the ordinary attention break, whose
+separate-subgraph cache still rejects internal checkpoints. Replay refresh includes
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
 the convolution boundary and existing int64 mirror.
 

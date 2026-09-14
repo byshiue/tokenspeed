@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention._triton.prefill_state_checkpoints import (
     PackedPrefillCheckpointInputs,
+    merge_prefill_checkpoint_outputs,
     pack_prefill_recurrent_checkpoint_inputs,
     write_prefill_conv_checkpoints,
     write_prefill_recurrent_checkpoints,
@@ -137,6 +138,14 @@ class _PrefillCheckpointBatch:
     tail_query_start_loc: torch.Tensor
     tail_seq_lens_cpu: torch.Tensor
     tail_cu_seqlens_cpu: torch.Tensor
+
+    @property
+    def use_token_views(self) -> bool:
+        return self.body_seq_lens_cpu.numel() == 1
+
+    @property
+    def token_extent(self) -> int:
+        return self.body_token_indices.numel() + self.tail_token_indices.numel()
 
 
 def _slice_prefill_recurrent_inputs(
@@ -1551,7 +1560,7 @@ class MambaAttnBackend(AttentionBackend):
 
         num_body_tokens = checkpoint_batch.body_token_indices.numel()
         single_request = checkpoint_batch.body_seq_lens_cpu.numel() == 1
-        if single_request:
+        if checkpoint_batch.use_token_views:
             body = _slice_prefill_recurrent_inputs(
                 query,
                 key,
@@ -1616,7 +1625,7 @@ class MambaAttnBackend(AttentionBackend):
         )
 
         num_tail_tokens = checkpoint_batch.tail_token_indices.numel()
-        if single_request:
+        if checkpoint_batch.use_token_views:
             tail = _slice_prefill_recurrent_inputs(
                 query,
                 key,
@@ -1680,16 +1689,17 @@ class MambaAttnBackend(AttentionBackend):
             raise RuntimeError(
                 "prefill checkpoint split returned incompatible body/tail outputs"
             )
-        if single_request:
+        if checkpoint_batch.use_token_views:
             return torch.cat((body_output, tail_output), dim=token_dim), tail_state
 
-        output_shape = list(body_output.shape)
-        output_shape[token_dim] = num_body_tokens + num_tail_tokens
-        output = torch.empty(
-            output_shape, dtype=body_output.dtype, device=body_output.device
+        output = merge_prefill_checkpoint_outputs(
+            body_output,
+            tail_output,
+            checkpoint_batch.body_token_indices,
+            checkpoint_batch.tail_token_indices,
+            token_dim,
+            checkpoint_batch.token_extent,
         )
-        output.index_copy_(token_dim, checkpoint_batch.body_token_indices, body_output)
-        output.index_copy_(token_dim, checkpoint_batch.tail_token_indices, tail_output)
         body_state.index_copy_(0, checkpoint_batch.rows, tail_state)
         return output, body_state
 
