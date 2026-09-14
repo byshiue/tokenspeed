@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kda_replay import (
     KDA_REPLAY_BLOCK_TOKENS,
     KDAReplayLayout,
+    kda_buffered_workspace_bytes,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
@@ -434,7 +435,30 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def workspace_bytes(self) -> int:
-        """KDA verify staging reserved outside the cache arena."""
+        """KDA execution scratch reserved outside the cache arena."""
+        if self.buffered_replay is not None:
+            state_groups = [
+                (spec, fields)
+                for spec, fields in self.groups()
+                if spec.family == "state"
+            ]
+            heads, value_dim, key_dim = self._kda_shapes[1]
+            return kda_buffered_workspace_bytes(
+                layers=sum(
+                    field.field_id.endswith(".conv_state")
+                    for _, fields in state_groups
+                    for field in fields
+                ),
+                max_bs=self.attn_config.max_bs,
+                max_context_len=self.attn_config.context_len,
+                max_window=self.buffered_replay.max_window,
+                heads=heads,
+                key_dim=key_dim,
+                value_dim=value_dim,
+                groups=len(state_groups),
+                state_grain=self.prefix_granularity,
+                history_block_tokens=self.buffered_replay.block_tokens,
+            )
         if self.server_args.speculative_algorithm is None:
             return 0
         if self.replay_kda:

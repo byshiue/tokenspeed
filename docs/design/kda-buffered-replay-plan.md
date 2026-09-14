@@ -12,6 +12,9 @@ M8 接通普通/speculative decode 的共同 commit hook，并在未注册的 re
 中融合原生 conv/gate 输入的转换。共享 runtime metadata refresh、buffered
 serving dispatch、端点物化与完整提交顺序仍待接入。M9 新增按 cache group
 共享的固定地址 metadata owner 与跨层 stamp commit；尚未接入 serving dispatch。
+M10 将 conv producer、raw candidate capture、gate GEMM、recurrent 和跨层 conv
+commit 接入同一个实验工作区，并核对实际分配与 recipe 预算。端点物化、生命周期
+交付及完整模型验收仍未完成，不能据此启用 serving。
 
 ## 1. 目标与范围
 

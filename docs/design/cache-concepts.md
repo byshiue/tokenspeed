@@ -425,6 +425,20 @@ differ. Positive block ids and valid tensor bounds do not establish ownership.
 No kernel in this prototype grants allocation, prefix-publication, transfer or
 in-flight-reuse permission.
 
+The experimental conv pipeline reads the short window at accepted endpoint
+`e`, not lagging recurrent checkpoint `c`. It stages only this round's raw
+inputs and commits the accepted suffix into slot `(e+a-1)/G`, for `a>0`.
+Zero acceptance leaves the window unchanged; a recurrent capacity flush can
+still advance its checkpoint stamp. Convolution backing is validated for
+every possible acceptance destination before any layer writes.
+
+An unpublished live state block may therefore hold a conv window at `e` and
+recurrent state at `c`. It represents the endpoint only together with the
+accepted replay history. It is not an exact snapshot for prefill, prefix reuse
+or transfer until recurrent endpoint materialization completes. Committing a
+conv window or stamp alone does not change that rule. Published snapshots
+remain immutable, and all destinations must be request-writable.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables

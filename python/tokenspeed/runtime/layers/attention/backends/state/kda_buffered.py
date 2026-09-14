@@ -21,8 +21,8 @@
 """Fixed-address, per-group metadata for cache-owned KDA buffered replay.
 
 This is execution scratch, not a request-state pool: stamps and history remain
-in LCM fields. The serving backend stays gated until conv commit and exact
-endpoint handoff are integrated. No ordinary/speculative or eager/graph fork.
+in LCM fields. The serving backend stays gated until exact endpoint handoff
+and failure feedback are integrated. No ordinary/speculative or eager/graph fork.
 """
 
 from __future__ import annotations
@@ -32,7 +32,13 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
+    buffered_recurrent,
     validate_recurrent_blocks,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_conv import (
+    buffered_conv,
+    commit_conv_windows,
+    prepare_conv_blocks,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
     commit_positions,
@@ -48,6 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
     KDAReplayLayer,
 )
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -68,6 +75,8 @@ class KDAReplayGroupMetadata:
     length: torch.Tensor
     flushed: torch.Tensor
     ok: torch.Tensor
+    conv_read: torch.Tensor
+    conv_writes: torch.Tensor
 
 
 class KDAReplayMetadata:
@@ -172,6 +181,10 @@ class KDAReplayMetadata:
         self.length = torch.zeros(shape, dtype=torch.int32, device=device)
         self.flushed = torch.zeros(shape, dtype=torch.bool, device=device)
         self.ok = torch.zeros_like(self.flushed)
+        self.conv_read = torch.full(shape, -1, dtype=torch.int32, device=device)
+        self.conv_writes = torch.full(
+            (*shape, layout.max_window), -1, dtype=torch.int32, device=device
+        )
         self._views: dict[int, dict[str, KDAReplayGroupMetadata]] = {}
 
     def _batch(self, bs: int) -> dict[str, KDAReplayGroupMetadata]:
@@ -188,6 +201,8 @@ class KDAReplayMetadata:
                     length=self.length[index, :bs],
                     flushed=self.flushed[index, :bs],
                     ok=self.ok[index, :bs],
+                    conv_read=self.conv_read[index, :bs],
+                    conv_writes=self.conv_writes[index, :bs],
                 )
                 for index, (gid, group) in enumerate(self._groups.items())
             }
@@ -269,6 +284,20 @@ class KDAReplayMetadata:
                 max_window=self.layout.max_window,
             )
 
+            # Convolution reads at e, not at the lagging recurrent checkpoint c.
+            # Its possible acceptance destinations must be backed even when
+            # this round does not flush recurrent state.
+            prepare_conv_blocks(
+                view.state_table,
+                view.end,
+                view.width,
+                view.ok,
+                view.conv_read,
+                view.conv_writes,
+                blocks=self._state_counts[gid],
+                grain=self._state_grains[gid],
+            )
+
     def commit(self, bs: int, accepted: torch.Tensor) -> None:
         """Commit live acceptance after all recurrent/conv stores have completed.
 
@@ -291,3 +320,231 @@ class KDAReplayMetadata:
                 view.flushed[:live],
                 view.ok[:live],
             )
+
+
+class KDAReplayWorkspace:
+    """One width-parameterized conv/gate/recurrent forward and accepted commit.
+
+    Persistent request data belongs to the bound pool. This owner keeps only
+    per-round raw candidates, shared output scratch, descriptors and metadata.
+    Call refresh/prepare once, forward for every local layer, then commit once.
+    Outputs alias shared scratch and must be consumed before the next layer.
+    Serving dispatch remains gated on endpoint materialization/publication.
+    """
+
+    def __init__(
+        self, pool: HybridKDATokenToKVPool, *, max_bs: int, max_context_len: int
+    ) -> None:
+        self.metadata = KDAReplayMetadata(
+            pool, max_bs=max_bs, max_context_len=max_context_len
+        )
+        self.layer_ids = tuple(pool.state_group_by_layer)
+        self._row = {layer: row for row, layer in enumerate(self.layer_ids)}
+        self._state = {layer: pool.get_state_buffers(layer) for layer in self.layer_ids}
+        self._history = {
+            layer: pool.get_replay_buffers(layer) for layer in self.layer_ids
+        }
+        conv, recurrent = self._state[self.layer_ids[0]]
+        if not conv.is_cuda or conv.dtype != torch.bfloat16:
+            raise ValueError("buffered workspace requires BF16 GPU convolution state")
+        self.heads, self.value_dim, self.key_dim = recurrent.shape[1:]
+        self.channels = self.heads * (2 * self.key_dim + self.value_dim)
+        if conv.shape[1:] != (self.channels, 3):
+            raise ValueError("buffered KDA requires a four-tap convolution")
+        for current_conv, current_state in self._state.values():
+            if (
+                current_conv.shape[1:] != conv.shape[1:]
+                or current_conv.stride() != conv.stride()
+                or current_conv.dtype != conv.dtype
+                or current_conv.device != conv.device
+                or current_state.shape[1:] != recurrent.shape[1:]
+                or current_state.dtype != torch.float32
+            ):
+                raise ValueError(
+                    "buffered workspace requires uniform local layer geometry"
+                )
+        self._conv_strides = conv.stride()
+        layout = self.metadata.layout
+        common = (max_bs, layout.max_window)
+        device = conv.device
+        self.payload = torch.empty(
+            (len(self.layer_ids), *common, self.channels),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self.conv_output = torch.empty(
+            (*common, self.channels), dtype=torch.bfloat16, device=device
+        )
+        self.gate_output = torch.empty(
+            (*common, self.heads, self.key_dim), dtype=torch.bfloat16, device=device
+        )
+        self.output = torch.empty(
+            (*common, self.heads, self.value_dim), dtype=torch.bfloat16, device=device
+        )
+        self.conv_ptrs = torch.tensor(
+            [self._state[layer][0].data_ptr() for layer in self.layer_ids],
+            dtype=torch.int64,
+            device=device,
+        )
+        group_rows = {gid: row for row, gid in enumerate(self.metadata._groups)}
+        self.group_indices = torch.tensor(
+            [group_rows[self._history[layer].group_id] for layer in self.layer_ids],
+            dtype=torch.int32,
+            device=device,
+        )
+        self._producer_stream = torch.cuda.Stream(device=device, priority=-1)
+        self._forks = {
+            layer: StreamFork(self._producer_stream) for layer in self.layer_ids
+        }
+        self._views: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
+
+    @property
+    def nbytes(self) -> int:
+        """Allocated tensor bytes, excluding LCM fields and CUDA event overhead."""
+        meta = self.metadata
+        return sum(
+            t.nbytes
+            for t in (
+                self.payload,
+                self.conv_output,
+                self.gate_output,
+                self.output,
+                self.conv_ptrs,
+                self.group_indices,
+                meta.tables.tables,
+                meta.tables.decode_locs,
+                meta.tables.page_sizes,
+                meta.end,
+                meta.width,
+                meta.checkpoint,
+                meta.length,
+                meta.flushed,
+                meta.ok,
+                meta.conv_read,
+                meta.conv_writes,
+            )
+        )
+
+    def _layer_views(self, layer_id: int, bs: int) -> tuple[torch.Tensor, ...]:
+        key = (layer_id, bs)
+        self.metadata.layer(layer_id, bs)  # Validate layer and runtime batch capacity.
+        if key not in self._views:
+            conv = self.conv_output[:bs]
+            q, k, v = conv.split(
+                (
+                    self.heads * self.key_dim,
+                    self.heads * self.key_dim,
+                    self.heads * self.value_dim,
+                ),
+                dim=-1,
+            )
+            window = self.metadata.layout.max_window
+            self._views[key] = (
+                conv,
+                self.payload[self._row[layer_id], :bs],
+                q.view(bs, window, self.heads, self.key_dim),
+                k.view(bs, window, self.heads, self.key_dim),
+                v.view(bs, window, self.heads, self.value_dim),
+                self.gate_output[:bs],
+                self.output[:bs],
+            )
+        return self._views[key]
+
+    def forward(
+        self,
+        layer_id: int,
+        bs: int,
+        raw_qkv: torch.Tensor,
+        conv_weight: torch.Tensor,
+        f_a: torch.Tensor,
+        f_b_weight: torch.Tensor,
+        beta: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """Run one layer from BF16 raw QKV and low-rank gate producers.
+
+        raw_qkv is [B,T,C], f_a [B*T,rank], f_b_weight [H*K,rank], beta logits
+        [B,T,H], A_log FP32 [H], dt_bias FP32 [H*K]. Metadata preparation must
+        have validated the group before this call. The conv producer captures
+        raw candidates; gate GEMM overlaps it using the existing StreamFork
+        protocol. All outputs have stable, preallocated storage on both paths.
+        """
+        conv_out, payload, q, k, v, gate, out = self._layer_views(layer_id, bs)
+        if (
+            raw_qkv.shape != conv_out.shape
+            or f_a.ndim != 2
+            or f_a.shape[0] != bs * self.metadata.layout.max_window
+            or f_b_weight.shape != (self.heads * self.key_dim, f_a.shape[1])
+            or f_a.dtype != torch.bfloat16
+            or f_b_weight.dtype != torch.bfloat16
+        ):
+            raise ValueError("buffered raw/gate input geometry is inconsistent")
+        meta = self.metadata.layer(layer_id, bs)
+        conv, state = self._state[layer_id]
+        with self._forks[layer_id].scope(enable=True, overlap=True) as fork:
+            with fork.branch():
+                torch.mm(
+                    f_a, f_b_weight.t(), out=gate.view(-1, self.heads * self.key_dim)
+                )
+            buffered_conv(
+                raw_qkv,
+                conv_weight,
+                conv,
+                meta.conv_read,
+                meta.width,
+                meta.ok,
+                conv_out,
+                payload,
+            )
+        history = self._history[layer_id]
+        buffered_recurrent(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state,
+            history.key,
+            history.correction,
+            history.decay,
+            meta.history_table,
+            meta.state_table,
+            meta.end,
+            meta.checkpoint,
+            meta.length,
+            meta.width,
+            meta.flushed,
+            meta.ok,
+            out,
+            capacity=history.layout.capacity,
+            state_block_tokens=self.metadata._state_grains[history.group_id],
+            transform_inputs=True,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+        )
+        return out
+
+    def commit(self, bs: int, accepted: torch.Tensor) -> None:
+        """Commit accepted conv windows, then every local layer's replay stamp.
+
+        Call only after all local layer forwards complete, with live accepted
+        input counts (no added token). This does not materialize an endpoint
+        for external consumers or grant snapshot publication provenance.
+        """
+        if accepted.numel() > bs or bs > self.metadata.max_bs:
+            raise ValueError("acceptance or batch exceeds prepared capacity")
+        commit_conv_windows(
+            self.payload,
+            self.conv_ptrs,
+            self.group_indices,
+            self.metadata.conv_read,
+            self.metadata.conv_writes,
+            self.metadata.width,
+            self.metadata.ok,
+            accepted,
+            conv_strides=self._conv_strides,
+        )
+        self.metadata.commit(bs, accepted)

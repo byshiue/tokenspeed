@@ -31,7 +31,10 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.kda_replay import KDAReplayLayout
+from tokenspeed.runtime.layers.attention.kda_replay import (
+    KDAReplayLayout,
+    kda_buffered_workspace_bytes,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
 )
@@ -154,7 +157,18 @@ def test_replay_geometry_and_capacity_budget(tp, mla_packing):
             recipe.parents_needed(layout, setup.spec.token_capacity)
             <= setup.spec.memory_plan.num_lcm_blocks
         )
-        assert recipe.workspace_bytes() == 0
+        assert recipe.workspace_bytes() == kda_buffered_workspace_bytes(
+            layers=69,
+            max_bs=4,
+            max_context_len=recipe.attn_config.context_len,
+            max_window=width,
+            heads=96 // tp,
+            key_dim=128,
+            value_dim=128,
+            groups=3,
+            state_grain=128,
+            history_block_tokens=8,
+        )
         if tp == 8:
             assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
 
@@ -614,3 +628,300 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
         assert any(
             stamp is replay.checkpoint for stamp in pp_metadata._stamps[replay.group_id]
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width,capacity", [(1, 8), (4, 8), (4, 37)])
+@pytest.mark.parametrize("captured", [False, True])
+def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured):
+    """Packed fields and producer streams, not scheduler/model integration.
+
+    Existing GPU producers fix BF16 conv/gate rounding. Independent CPU
+    recurrence keeps M8's FP32 tolerance and BF16 output half-ULP allowance.
+    Poisoning rejected raw candidates checks that commit only consumes acceptance.
+    """
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_kda_verify_conv_update,
+    )
+
+    from tokenspeed.runtime.layers.attention.backends.state.kda_buffered import (
+        KDAReplayWorkspace,
+    )
+
+    torch.manual_seed(711)
+    batch, requests, heads, dim, rank, context = 3, 2, 12, 128, 128, 256
+    channels = 3 * heads * dim
+    recipe = _recipe(
+        capacity, decode_input_tokens=width, max_bs=batch, context_len=context
+    )
+    plan = _layout(recipe).bind(24)
+    arena, full = _pool(recipe, plan, "cuda", 0, 93)
+    full_workspace = KDAReplayWorkspace(full, max_bs=batch, max_context_len=context)
+    assert full_workspace.nbytes == recipe.workspace_bytes()
+    del full_workspace, full, arena
+    # A nonzero PP window crossing a state-group boundary; pool IDs are local.
+    arena, pool = _pool(recipe, plan.narrow_to_layers(28, 36), "cuda", 28, 36)
+    workspace = KDAReplayWorkspace(pool, max_bs=batch, max_context_len=context)
+    meta, layers = workspace.metadata, workspace.layer_ids
+    assert len(layers) == 6 and len(meta._groups) == 2
+    assert workspace.nbytes == kda_buffered_workspace_bytes(
+        layers=len(layers),
+        max_bs=batch,
+        max_context_len=context,
+        max_window=width,
+        heads=heads,
+        key_dim=dim,
+        value_dim=dim,
+        groups=2,
+        state_grain=128,
+        history_block_tokens=8,
+    )
+    tables = {}
+    for index, (gid, group) in enumerate(meta._groups.items()):
+        # Four history parents and four state parents per group. Field views
+        # overlay physical planes: zero only the group's owned child pages.
+        first = index * 8 * 6 + 1
+        tables[gid] = torch.zeros((batch, 26), dtype=torch.int32, device="cuda")
+        tables[gid][:requests, 14:26].copy_(
+            torch.arange(first, first + 24).view(requests, 12)
+        )
+        tables[group[0].checkpoint_group_id] = torch.zeros(
+            (batch, 2), dtype=torch.int32, device="cuda"
+        )
+        tables[group[0].checkpoint_group_id][:requests].copy_(
+            torch.arange(index * 8 + 5, index * 8 + 9).view(requests, 2)
+        )
+        pool.zero_new_blocks({gid: list(range(first, first + 24))})
+    tables_cpu = {gid: table.cpu() for gid, table in tables.items()}
+    ends, checkpoints = [120, 124], [120, 124]
+    states = torch.randn((len(layers), requests, heads, dim, dim)) * 0.02
+    windows = (
+        torch.randn((len(layers), requests, channels, 3), dtype=torch.bfloat16) * 0.1
+    )
+    for index, layer in enumerate(layers):
+        history = pool.get_replay_buffers(layer)
+        conv, state = pool.get_state_buffers(layer)
+        for req in range(requests):
+            page = int(tables_cpu[history.checkpoint_group_id][req, 0])
+            state[page].copy_(states[index, req])
+            conv[page].copy_(windows[index, req])
+    raw = torch.empty(
+        (len(layers), batch, width, channels), dtype=torch.bfloat16, device="cuda"
+    )
+    f_a = torch.empty(
+        (len(layers), batch * width, rank), dtype=torch.bfloat16, device="cuda"
+    )
+    f_b = (
+        torch.randn(
+            (len(layers), heads * dim, rank), dtype=torch.bfloat16, device="cuda"
+        )
+        * 0.05
+    )
+    weights = (
+        torch.randn((len(layers), channels, 4), dtype=torch.bfloat16, device="cuda")
+        * 0.2
+    )
+    beta = torch.empty(
+        (len(layers), batch, width, heads), dtype=torch.bfloat16, device="cuda"
+    )
+    a_log = torch.full((heads,), -1.0, device="cuda")
+    bias = torch.randn((len(layers), heads * dim), device="cuda") * 0.2
+    bias_cpu = bias.cpu().view(len(layers), 1, 1, heads, dim)
+    outputs = torch.empty(
+        (len(layers), batch, width, heads, dim), dtype=torch.bfloat16, device="cuda"
+    )
+    seq_lens = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    accepted = torch.zeros_like(seq_lens)
+    rejected = torch.zeros((1, batch, width, 1), dtype=torch.bool, device="cuda")
+    meta.refresh(batch, 0, seq_lens, tables)
+
+    def run():
+        meta.prepare(batch)
+        for index, layer in enumerate(layers):
+            output = workspace.forward(
+                layer,
+                batch,
+                raw[index],
+                weights[index],
+                f_a[index],
+                f_b[index],
+                beta[index],
+                a_log,
+                bias[index],
+                -0.3,
+            )
+            outputs[index].copy_(output)  # Consume shared scratch before next layer.
+        workspace.payload.masked_fill_(rejected, float("nan"))
+        workspace.commit(batch, accepted if captured else accepted[:requests])
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    if captured:
+        with torch.cuda.graph(graph):
+            run()
+    buffers = (
+        workspace.payload,
+        workspace.conv_output,
+        workspace.gate_output,
+        workspace.output,
+        meta.tables.tables,
+    )
+    pointers = [t.data_ptr() for t in buffers]
+    saw_flush = saw_no_flush = saw_zero_accept_flush = saw_split_state_slots = False
+    for step in range(32):
+        order = [step % 2, (step + 1) % 2]
+        counts = [(step + row) % (width + 1) for row in range(requests)]
+        flags = [ends[req] - checkpoints[req] + 2 * width > capacity for req in order]
+        if not saw_zero_accept_flush:
+            for row, flag in enumerate(flags):
+                if flag:
+                    counts[row] = 0
+        seq_lens.copy_(torch.tensor([ends[req] + width for req in order] + [2**31 - 1]))
+        accepted.copy_(torch.tensor(counts + [0]))
+        rejected.copy_(
+            torch.arange(width)[None, None, :, None]
+            >= torch.tensor(counts + [0])[None, :, None, None]
+        )
+        current = {gid: table[order + [requests]] for gid, table in tables.items()}
+        meta.refresh(batch, requests, seq_lens, current)
+        raw_cpu = torch.randn(raw.shape, dtype=torch.bfloat16) * 0.3
+        raw.copy_(raw_cpu)
+        f_a.normal_(std=0.1)
+        beta.normal_()
+        # Run the rounding oracle before commit changes the conv input windows.
+        meta.prepare(batch)
+        conv_cpu, gates_cpu = [], []
+        for index, layer in enumerate(layers):
+            view = meta.layer(layer, batch)
+            conv_cpu.append(
+                fused_kda_verify_conv_update(
+                    raw[index].view(batch * width, channels),
+                    weights[index],
+                    pool.get_component(layer, "conv_state"),
+                    view.conv_read,
+                    num_heads=heads,
+                    head_dim=dim,
+                    draft_token_num=width,
+                    out=None,
+                    block_c=256,
+                    num_warps=4,
+                )
+                .view(batch, width, 3, heads, dim)[:requests]
+                .cpu()
+                .float()
+            )
+            gates_cpu.append(
+                torch.mm(f_a[index], f_b[index].t())
+                .view(batch, width, heads, dim)[:requests]
+                .cpu()
+                .float()
+            )
+        query, key, value = torch.stack(conv_cpu).unbind(3)
+        query = query / (query.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+        key = key / (key.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+        decay = (
+            -0.3
+            * torch.sigmoid(
+                a_log.cpu().exp()[:, None] * (torch.stack(gates_cpu) + bias_cpu)
+            )
+        ).exp()
+        beta_cpu = beta[:, :requests].cpu().float().sigmoid()
+        candidate, previous = states[:, order].clone(), states.clone()
+        expected_outputs = []
+        for token in range(width):
+            candidate *= decay[:, :, token, :, None, :]
+            correction = beta_cpu[:, :, token, :, None] * (
+                value[:, :, token]
+                - torch.einsum("lbhvk,lbhk->lbhv", candidate, key[:, :, token])
+            )
+            candidate += correction[..., None] * key[:, :, token, :, None, :]
+            expected_outputs.append(
+                torch.einsum("lbhvk,lbhk->lbhv", candidate, query[:, :, token])
+                / dim**0.5
+            )
+            for row, req in enumerate(order):
+                if counts[row] == token + 1:
+                    states[:, req].copy_(candidate[:, row])
+        if captured:
+            graph.replay()
+        else:
+            run()
+        torch.testing.assert_close(
+            outputs[:, :requests].cpu().float(),
+            torch.stack(expected_outputs, dim=2),
+            atol=2e-5,
+            rtol=2e-4 + torch.finfo(torch.bfloat16).eps / 2,
+        )
+        assert meta.ok.all() and meta.flushed.tolist() == [flags + [False]] * 2
+        for index, layer in enumerate(layers):
+            history = pool.get_replay_buffers(layer)
+            conv, state = pool.get_state_buffers(layer)
+            for row, req in enumerate(order):
+                e, c, count, flushed = (
+                    ends[req],
+                    checkpoints[req],
+                    counts[row],
+                    flags[row],
+                )
+                state_table = tables_cpu[history.checkpoint_group_id][req]
+                saw_split_state_slots |= (c - 1) // 128 != (e - 1) // 128
+                if flushed:
+                    torch.testing.assert_close(
+                        state[state_table[(e - 1) // 128]].cpu(),
+                        previous[index, req],
+                        atol=2e-5,
+                        rtol=2e-4,
+                    )
+                if count:
+                    windows[index, req] = torch.cat(
+                        (windows[index, req], raw_cpu[index, row, :count].T), dim=-1
+                    )[:, -3:]
+                new_end, new_c = e + count, e if flushed else c
+                torch.testing.assert_close(
+                    conv[state_table[(new_end - 1) // 128]].cpu(),
+                    windows[index, req],
+                    atol=0,
+                    rtol=0,
+                )
+                stamp_page = int(tables_cpu[history.group_id][req, (new_end - 1) // 8])
+                stamp = int(history.checkpoint[stamp_page, (new_end - 1) % 8])
+                assert (new_end if stamp == 0 else stamp - 1) == new_c
+                reconstructed = state[state_table[(new_c - 1) // 128]].cpu().clone()
+                positions = torch.arange(new_c, new_end, device="cuda")
+                pages = tables[history.group_id][req, positions // 8]
+                cached = [
+                    field[pages, positions % 8].cpu()
+                    for field in (history.key, history.correction, history.decay)
+                ]
+                for k, u, d in zip(*cached, strict=True):
+                    reconstructed = (
+                        reconstructed * d[:, None, :] + u[:, :, None] * k[:, None, :]
+                    )
+                torch.testing.assert_close(
+                    reconstructed, states[index, req], atol=2e-5, rtol=2e-4
+                )
+        for row, req in enumerate(order):
+            if flags[row]:
+                checkpoints[req] = ends[req]
+                saw_flush = True
+                saw_zero_accept_flush |= counts[row] == 0
+            else:
+                saw_no_flush = True
+            ends[req] += counts[row]
+        assert [
+            t.data_ptr()
+            for t in (
+                workspace.payload,
+                workspace.conv_output,
+                workspace.gate_output,
+                workspace.output,
+                meta.tables.tables,
+            )
+        ] == pointers
+    assert saw_flush and saw_no_flush and saw_zero_accept_flush
+    if capacity == 37:
+        assert saw_split_state_slots

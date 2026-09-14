@@ -28,6 +28,61 @@ from dataclasses import dataclass
 KDA_REPLAY_BLOCK_TOKENS = 8
 
 
+def kda_buffered_workspace_bytes(
+    *,
+    layers: int,
+    max_bs: int,
+    max_context_len: int,
+    max_window: int,
+    heads: int,
+    key_dim: int,
+    value_dim: int,
+    groups: int,
+    state_grain: int,
+    history_block_tokens: int,
+) -> int:
+    """Tensor-storage budget for buffered decode, outside the LCM arena.
+
+    Count BF16 raw candidates per layer plus shared conv/gate/output scratch,
+    int64 conv pointers and int32 group indices, and the metadata owner's raw
+    table stacks/position buffers. Geometry is per rank and startup-fixed;
+    max_bs is runtime capacity, not the capture ladder. CUDA stream/event
+    implementation overhead is not tensor storage and is not included here.
+    """
+    if (
+        min(
+            layers,
+            max_bs,
+            max_context_len,
+            max_window,
+            heads,
+            key_dim,
+            value_dim,
+            groups,
+            state_grain,
+            history_block_tokens,
+        )
+        < 1
+    ):
+        raise ValueError("positive buffered workspace geometry required")
+    channels = heads * (2 * key_dim + value_dim)
+    activations = (
+        max_bs
+        * max_window
+        * ((layers + 1) * channels + heads * (key_dim + value_dim))
+        * 2
+    )
+    descriptors = layers * (8 + 4)
+    raw_groups = 2 * groups
+    table_grain = min(state_grain, history_block_tokens)
+    columns = (max_context_len + max_window + table_grain - 1) // table_grain
+    # GroupTableStacks also owns decode_locs and the page_sizes vector, even
+    # though this consumer uses only its ratio-one raw-table fill.
+    tables = raw_groups * (max_bs * columns + max_bs * max_window + 1) * 4
+    positions = max_bs * (8 + groups * (18 + 4 * max_window))
+    return activations + descriptors + tables + positions
+
+
 @dataclass(frozen=True, kw_only=True)
 class KDAReplayLayout:
     """Startup-fixed logical capacity and maximum target execution width.

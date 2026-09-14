@@ -35,8 +35,8 @@ against the frozen baseline before the work meets its completion gate.
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Live endpoint materialization and handoff still pending |
-| C. Unified GPU forward and commit | M7 tiles history; M8 adds the runner commit hook and native inputs; M9 adds shared metadata and group stamp commit | Conv production/commit, endpoint materialization and serving dispatch remain pending; recurrence not registered |
-| D. Graphs, overlap and lifecycle integration | M9 isolated metadata graph tests pass; serving integration pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
+| C. Unified GPU forward and commit | M10 composes conv/candidate capture, gate GEMM, recurrence and conv/stamp commit in one experimental workspace | Endpoint materialization and serving dispatch remain pending; recurrence not registered |
+| D. Graphs, overlap and lifecycle integration | M10 isolated producer-stream pipeline tests pass in eager/graph; serving integration pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
 ## Recording a result
@@ -838,3 +838,88 @@ passed after formatting. Validation preceded the signed-off source commit with
 the same code; source patches, environment, raw samples and hashes are retained
 in the local milestone runbook. There is still no real-model accuracy or
 Eagle3 throughput result for buffered serving.
+
+### M10: conv capture, accepted windows and the shared forward workspace
+
+Source: based on `291935c9fd0cbe5c76b15836f77824df8d7fb5b0` (M9 record).
+The signed-off source commit will be recorded after final validation.
+
+The four-tap BF16 conv producer now captures raw candidates in the same kernel
+that produces conv outputs. The later commit gathers the accepted raw suffix
+and previous window, then writes every local layer's conv window in one GPU
+launch. It loads a complete channel window before an in-place store. Conv
+addresses follow accepted endpoint `e`, independently of recurrent checkpoint
+`c`; possible destinations are validated once per group before layer work.
+This adds one preparation launch per group to M9's metadata protocol. M9's
+nine-launch metadata-only timing does not describe this expanded protocol.
+
+`KDAReplayWorkspace` composes conv/capture, low-rank gate GEMM, native-input
+recurrence and accepted conv/stamp commit. Gate and conv producers use the
+existing fork/join stream protocol; recurrence waits for both. Width one and
+four use the same code. Raw candidates are per-layer transient storage;
+conv/gate/output scratch is shared and must be consumed before the next
+layer. Long-lived state and history still belong to LCM. Recipe budgeting
+includes all owned tensor storage, even for ordinary width-one decode, and
+tests compare that budget against the actual full-model workspace allocation.
+PP-local workspaces count only their bound layers and groups.
+
+Initial validation used one GB300, no weights, in the M9 software environment:
+Python 3.12.3, PyTorch 2.13.0+cu130, CUDA 13.0, driver 580.167.08,
+tokenspeed-triton 3.8.10.post20260906, pytest 9.1.1, aarch64. The persistent
+allocation, cached container, commands and raw logs remain in the local
+milestone runbook. No C++ source or staged scheduler binary changed.
+
+The conv-only fixture passed **8 cases** (15 warnings, 4.76s): BF16 outputs
+are bitwise equal to the original GPU conv producer, and accepted windows
+are bitwise equal to a CPU suffix reference. It covers width one/four, small
+and TP8 per-layer dimensions, eager/graph, 32 rounds, request reordering,
+padding, zero acceptance, block crossings, strided storage, in-place writes
+and invalid backing/acceptance.
+
+The combined cache/runtime suite passed **19 cases** (22 warnings, 35.17s).
+Its six new pipeline cases use TP8 per-layer geometry, capacities 8/37,
+width one/four, two live requests plus padding, and six PP-local layers
+crossing two cache groups. They run the real producer streams and packed
+LCM fields for 32 rounds, compare outputs and reconstructed accepted state
+against independent CPU recurrence, and poison rejected raw candidates before
+commit. They also check zero-acceptance flushes, different conv/recurrent
+block slots and stable workspace addresses. FP32 tolerances remain
+`atol=2e-5, rtol=2e-4`; BF16 outputs retain M8's half-ULP relative allowance.
+The first fixture chose a PP window wholly inside one group while expecting
+three; correcting it to cross a real group boundary required no implementation
+or tolerance change.
+
+Serving is still gated. Exact endpoint materialization, publication/failure
+feedback and prefill/transfer/retraction handoff are not implemented by this
+workspace. These local tests do not establish model accuracy or the original
+Eagle3 no-regression requirement. Matched full NVFP4 TP8 runs, AIME 2026 and
+short before/after NSYS reports remain required.
+
+Isolated conv timing uses the same GPU and five samples of 50 graph replays,
+32 calls per graph, without a profiler. The following medians cover all 69
+layers at TP8 per-layer dimensions; they are not full model-step timings:
+
+| T=4 conv operation, microseconds | Batch 1 | Batch 8 |
+| --- | ---: | ---: |
+| Original conv producer, without raw capture | 100.03 | 127.48 |
+| Original producer plus a separate raw copy per layer | 179.83 | 257.07 |
+| New fused producer and raw capture | 116.09 | 159.80 |
+| Original batched conv-window commit | 3.09 | 11.78 |
+| New batched conv-window commit | 3.08 | 12.16 |
+
+Fusion saves time against the producer-plus-copy composition, but adds work
+relative to the producer alone. The new batch-eight commit is about 0.38 us
+slower. Timing excludes table preparation, gates, recurrence, stamps and
+endpoint handoff. Sources/destinations are fixed private same-block states
+with full acceptance; this isolates the kernels, not the original Eagle3
+round. Width-one samples are retained in the local raw report. No end-to-end
+speedup is claimed. At context 65,536, batch four and width four, the complete
+buffered workspace reserves **11,208,428 bytes per TP8 rank** (about 10.69 MiB),
+excluding cache-owned state/history and CUDA stream/event overhead.
+
+Final-source checks passed **72 reference/GPU cases** (15 warnings, 119.37s),
+**19 cache/runtime pipeline cases** (22 warnings, 22.45s), and **511 runtime
+cases plus 317 subtests** (28 warnings, 34.43s). The last suite includes the
+pipeline cases. The exact `pre-commit run --all-files` command passed after
+formatting. Final tests also verify stable pointers by rereading the workspace
+attributes, so retaining old tensor references cannot hide a rebound buffer.

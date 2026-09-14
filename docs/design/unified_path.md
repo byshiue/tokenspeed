@@ -502,8 +502,27 @@ its own local layers; a pool replacement creates a new metadata owner and
 requires recapture. Access to transferred layer fields must be fenced before
 preparation. A false validity flag suppresses GPU stores but does not itself
 reject a scheduler result or grant checkpoint provenance. Buffered KDA serving
-is still gated until conv commit and exact-endpoint handoff enforce those
-remaining obligations; this owner is not an alternate serving path.
+is still gated on exact-endpoint handoff and failure feedback; this owner is
+not an alternate serving path.
+
+The experimental `KDAReplayWorkspace` composes that metadata with one
+width-parameterized conv/gate/recurrent forward. Conv preparation validates
+the current endpoint's source and every possible acceptance destination once
+per group. The four-tap BF16 conv producer captures raw candidates while
+computing conv outputs; gate GEMM uses preallocated output on the existing
+`StreamFork` protocol, joined before recurrence. The workspace retains raw
+candidates per local layer but shares conv/gate/output scratch across layers.
+Each layer must consume its output before the following layer reuses it.
+These are per-round tensors, not private persistent request state.
+
+After all local layer forwards finish, one GPU launch commits accepted conv
+windows across layers, followed by the shared group stamp commits. It handles
+width one and verify identically; rejected candidates do not enter the conv
+window. The recipe reserves candidates, shared scratch, descriptors and raw
+table/position buffers at full runtime batch capacity before sizing the arena.
+The workspace reports the same tensor-byte total, excluding LCM fields and
+CUDA stream/event implementation overhead. Binding a different pool requires
+a new workspace and recapture; old descriptors must not survive it.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
