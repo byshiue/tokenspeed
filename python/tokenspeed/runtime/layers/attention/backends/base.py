@@ -396,13 +396,17 @@ class AttentionBackend(CachePoolBinding, ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Commit live acceptance after drafted decode/mixed execution or replay.
+        """Commit live acceptance after decode/mixed execution or graph replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
-        lead the mixed batch. Stateless backends inherit this no-op.
+        lead the mixed batch. Acceptance counts input tokens, including the
+        target input: ordinary decode passes one, without a separate commit
+        route or an added token. Only live rows are passed. Consumers that
+        already wrote their final state need no commit; stateless backends
+        inherit this no-op.
         """
 
     @contextmanager

@@ -33,12 +33,17 @@ import torch.nn.functional as F
 if not torch.cuda.is_available():
     pytest.skip("requires a GPU", allow_module_level=True)
 
+from tokenspeed_kernel._triton import tl, triton  # noqa: E402
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (  # noqa: E402
+    _input_offset,
     buffered_recurrent,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # noqa: E402
     commit_positions,
     prepare_positions,
+)
+from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E402
+    fused_recurrent_kda_pool,
 )
 
 
@@ -57,10 +62,23 @@ def direct(state, query, key, value, decay, beta):
     return torch.stack(outputs) if outputs else value[:0].clone(), state
 
 
+@triton.jit
+def _wide_input_offsets(out):
+    token = tl.arange(0, 4)
+    zero = tl.full((4,), 0, tl.int64)
+    offsets = _input_offset(
+        zero, token, zero, token.to(tl.int64), (1, 2**30 + 3, 128, 1)
+    )
+    tl.store(out + token, offsets)
+
+
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("extra_capacity", [0, 9, 56])
 @pytest.mark.parametrize("graph_mode", [False, True])
-def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph_mode):
+@pytest.mark.parametrize("input_kind", ["prepared", "softplus", "bounded"])
+def test_buffered_rounds_and_graph_match_sequential(
+    width, extra_capacity, graph_mode, input_kind
+):
     torch.manual_seed(93)
     rng = random.Random(93)
     requests, batch, heads, dk, dv = 3, 4, 12, 128, 128
@@ -91,11 +109,30 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
     states[2].zero_()  # c=0 uses implicit zero state, never null-block contents.
     for req in range(2):
         pool[state_tables[req, (ends[req] - 1) // grain]].copy_(states[req])
-    q = torch.empty((batch, width, heads, dk), device="cuda")
-    k, d = torch.empty_like(q), torch.empty_like(q)
-    v = torch.empty((batch, width, heads, dv), device="cuda")
-    beta = torch.empty((batch, width, heads), device="cuda")
-    out = torch.empty_like(v)
+    native = input_kind != "prepared"
+    dtype = torch.bfloat16 if native else torch.float32
+    if native:
+        # Zero-copy packed conv views with non-dense token/head strides.
+        packed = torch.empty(
+            (batch, width, 3, heads, dk + 3), device="cuda", dtype=dtype
+        )
+        q, k, v = packed[..., :dk].unbind(2)
+    else:
+        q = torch.empty((batch, width, heads, dk), device="cuda")
+        k = torch.empty_like(q)
+        v = torch.empty((batch, width, heads, dv), device="cuda")
+    gate_dtype = torch.float32 if extra_capacity == 9 else dtype
+    d = torch.empty((batch, width, heads, dk), device="cuda", dtype=gate_dtype)
+    beta = torch.empty((batch, width, heads), device="cuda", dtype=gate_dtype)
+    out = torch.empty((batch, width, heads, dv + 7), device="cuda", dtype=dtype)[
+        ..., :dv
+    ]
+    a_cpu = torch.full((heads,), -9.0 if extra_capacity == 56 else -1.0)
+    bias_cpu = torch.randn(heads * dk) * 0.2
+    a_log, dt_bias = a_cpu.cuda(), bias_cpu.cuda()
+    lower_bound = (
+        (-1e-4 if extra_capacity == 56 else -0.3) if input_kind == "bounded" else None
+    )
     ht = torch.full((batch, columns + 2), -1, dtype=torch.int32, device="cuda")[
         :, :columns
     ]
@@ -146,6 +183,10 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
             out,
             capacity=capacity,
             state_block_tokens=grain,
+            transform_inputs=native,
+            A_log=a_log if native else None,
+            dt_bias=dt_bias if native else None,
+            lower_bound=lower_bound,
         )
         commit_positions(stamps, ht, end, valid, accepted, cp, length, flush, ok)
 
@@ -214,20 +255,48 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
         accepted.copy_(torch.tensor(accepts, dtype=torch.int32))
         ht[:requests].copy_(histories[order])
         st[:requests].copy_(state_tables[order])
-        inputs = (
-            F.normalize(torch.randn(q.shape), dim=-1),
-            F.normalize(torch.randn(k.shape), dim=-1),
-            torch.randn(v.shape) * 0.2,
-            torch.exp(-torch.rand(d.shape) * (1e-4 if extra_capacity == 56 else 0.1)),
-            torch.rand(beta.shape),
-        )
-        if extra_capacity == 56:
+        if native:
+            raw = (
+                torch.randn(q.shape).to(dtype),
+                torch.randn(k.shape).to(dtype),
+                (torch.randn(v.shape) * 0.2).to(dtype),
+                torch.randn(d.shape).to(gate_dtype),
+                torch.randn(beta.shape).to(gate_dtype),
+            )
+            raw[0][0, 0].zero_()  # The normalization epsilon must handle zero Q.
+            raw[3][..., :3] = torch.tensor([-100.0, 20.0, 100.0], dtype=dtype)
+            q_cpu, k_cpu, v_cpu, gate_cpu, beta_cpu = (x.float() for x in raw)
+            gate_cpu = gate_cpu + bias_cpu.view(heads, dk)
+            log_decay = (
+                lower_bound * torch.sigmoid(a_cpu.exp()[:, None] * gate_cpu)
+                if lower_bound is not None
+                else -a_cpu.exp()[:, None] * F.softplus(gate_cpu, threshold=20)
+            )
+            inputs = (
+                q_cpu / torch.sqrt(q_cpu.square().sum(-1, keepdim=True) + 1e-6),
+                k_cpu / torch.sqrt(k_cpu.square().sum(-1, keepdim=True) + 1e-6),
+                v_cpu,
+                log_decay.exp(),
+                beta_cpu.sigmoid(),
+            )
+        else:
+            inputs = (
+                F.normalize(torch.randn(q.shape), dim=-1),
+                F.normalize(torch.randn(k.shape), dim=-1),
+                torch.randn(v.shape) * 0.2,
+                torch.exp(
+                    -torch.rand(d.shape) * (1e-4 if extra_capacity == 56 else 0.1)
+                ),
+                torch.rand(beta.shape),
+            )
+            raw = inputs
+        if extra_capacity == 56 and not native:
             # Weak decay retains rounding error across tiles and flushes. Include
             # identity and zero decay: suffix reconstruction must not divide by D.
             inputs[3][..., 0] = 1
             if step % 13 == 0:
                 inputs[3][..., 1] = 0
-        for dest, src in zip((q, k, v, d, beta), inputs, strict=True):
+        for dest, src in zip((q, k, v, d, beta), raw, strict=True):
             dest.copy_(src)
         before = pool.clone()
         out.fill_(float("nan"))
@@ -241,9 +310,39 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
         for row, req in enumerate(order):
             n, a, e, c = widths[row], accepts[row], ends[req], checkpoints[req]
             expected, _ = direct(states[req], *(x[row, :n] for x in inputs))
+            # Native outputs round once to BF16. Allow its half-ULP rounding
+            # bound in addition to the established FP32 computation tolerance;
+            # history and materialized-state checks retain the FP32 gate below.
+            output_rtol = 2e-4 + (torch.finfo(torch.bfloat16).eps / 2 if native else 0)
             torch.testing.assert_close(
-                out[row, :n].cpu(), expected, atol=2e-5, rtol=2e-4
+                out[row, :n].float().cpu(), expected, atol=2e-5, rtol=output_rtol
             )
+            if native and step == 0 and n:
+                # Pin native transform semantics to the existing GPU recurrence
+                # as well as the independent CPU equations (before any history).
+                original_pool = states[req].unsqueeze(0).cuda()
+                indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+                original = fused_recurrent_kda_pool(
+                    *(x[row : row + 1, :n].contiguous() for x in (q, k, v, d, beta)),
+                    a_log,
+                    dt_bias,
+                    original_pool,
+                    indices,
+                    indices,
+                    scale=dk**-0.5,
+                    cu_seqlens=None,
+                    lower_bound=lower_bound,
+                    use_qk_l2norm_in_kernel=True,
+                    use_gate_in_kernel=True,
+                    use_beta_sigmoid_in_kernel=True,
+                )
+                torch.testing.assert_close(
+                    original[0].float().cpu(), expected, atol=2e-5, rtol=output_rtol
+                )
+                _, expected_state = direct(states[req], *(x[row, :n] for x in inputs))
+                torch.testing.assert_close(
+                    original_pool[0].cpu(), expected_state, atol=2e-5, rtol=2e-4
+                )
             assert torch.isnan(out[row, n:]).all()
             if flags[row]:
                 block = int(state_tables[req, (e - 1) // grain])
@@ -290,6 +389,16 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
 
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_invalid_backing_rejects_entire_row_before_stores(graph_mode):
+    # Check overflow arithmetic without allocating a multi-gigabyte producer
+    # tensor. The token-times-stride product must widen before multiplication.
+    offsets = torch.empty(4, dtype=torch.int64, device="cuda")
+    _wide_input_offsets[(1,)](offsets)
+    if graph_mode:
+        offset_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(offset_graph):
+            _wide_input_offsets[(1,)](offsets)
+        offset_graph.replay()
+    assert offsets.tolist() == [i * (2**30 + 4) for i in range(4)]
     batch, width, heads, dim = 4, 4, 1, 16
     shape = (batch, width, heads, dim)
     q = torch.ones(shape, device="cuda") / 4
@@ -337,6 +446,10 @@ def test_invalid_backing_rejects_entire_row_before_stores(graph_mode):
             out,
             capacity=8,
             state_block_tokens=1,
+            transform_inputs=False,
+            A_log=None,
+            dt_bias=None,
+            lower_bound=None,
         )
 
     run()

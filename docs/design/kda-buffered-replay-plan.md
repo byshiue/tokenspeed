@@ -8,8 +8,9 @@
 Kimi-K3 history 字段规划、零拷贝 view，以及未注册的 GPU position 原型；
 M6 将未注册的 dense-ring GPU 原型改成通过 raw block table 读写 LCM 字段，
 并接上 position prepare/commit 原型；M7 将已接受历史的重建改为分块 FP32 计算。
-Runtime metadata refresh、serving dispatch、
-端点物化与提交顺序仍待接入。
+M8 接通普通/speculative decode 的共同 commit hook，并在未注册的 recurrence
+中融合原生 conv/gate 输入的转换。共享 runtime metadata refresh、buffered
+serving dispatch、端点物化与完整提交顺序仍待接入。
 
 ## 1. 目标与范围
 

@@ -465,9 +465,16 @@ recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
 verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
-The runner calls `commit_speculative_state_after_verify` once on the target
-after drafted decode/mixed execution or graph replay, with live acceptance
-and `num_extends`. Since forward mode is derived from the extend count,
+The runner calls `commit_state_after_verify` once on the target after
+decode/mixed execution or graph replay, with live acceptance and `num_extends`.
+This includes width-one decode without a drafter: acceptance already counts
+the target input and must not be incremented. The hook runs after successful
+execution and after replay outputs are sliced back to the live batch; failed
+forwards, pure prefill and idle execution do not commit. A consumer that wrote
+its final state during forward has no pending work and returns without a GPU
+operation. This lets a buffered recurrent consumer defer its commit without
+adding a second ordinary-decode path.
+Since forward mode is derived from the extend count,
 zero means decode at this entry. Hybrid commits GDN/KDA only then; the
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
 decode/mixed, excluding leading extends from QSA acceptance. Mixed rounds
@@ -717,8 +724,9 @@ mapping remains a separate consumer of the shared mapping helpers
 * `test/runtime/test_qsa_backend.py` — independent QSA raw-group metadata,
   target-only verify workspace, and live cache writes across eager execution
   and CUDA graph replay; `test_qsa_verify_lifecycle.py` — the Qwen4-Exp root
-  commits GDN/PLE on decode and QSA on decode/mixed, using real acceptance
-  rows once after execution, including PLE without GDN and failure cases.
+  commits GDN/PLE on decode and QSA on decode/mixed, using live acceptance
+  rows once after execution. It covers width-one/no-drafter and speculative
+  fan-out, PLE without GDN, failure ordering and real unstaged-consumer no-ops.
 * `test/runtime/test_qwen4_backend_composition.py` — local consumer selection,
   workspace accounting, draft hooks through the attention composite and one
   PD cache step per layer.

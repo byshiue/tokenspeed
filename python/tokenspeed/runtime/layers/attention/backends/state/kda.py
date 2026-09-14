@@ -829,8 +829,8 @@ class KdaAttnBackend(MambaAttnBackend):
 
         committed, tables, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
-        # Runtime accept lengths count draft matches; the target token itself
-        # always advances state, matching the established scratch commit.
+        # Acceptance already includes the target input. The page helper clamps
+        # that count to the verify window; it must not add another token.
         group_ids = list(self._replay_group_ids or self._state_groups())
         write_stack = torch.empty(
             (len(group_ids), bs), dtype=torch.int32, device=accepted_length.device

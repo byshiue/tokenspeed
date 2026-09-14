@@ -326,6 +326,10 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         out,
         capacity=replay.layout.capacity,
         state_block_tokens=128,
+        transform_inputs=False,
+        A_log=None,
+        dt_bias=None,
+        lower_bound=None,
     )
     expected_state = state[2].clone() * 0.9
     correction = 0.5 * (v[0, 0] - torch.einsum("hvk,hk->hv", expected_state, q[0, 0]))
@@ -384,6 +388,10 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             out,
             capacity=replay.layout.capacity,
             state_block_tokens=128,
+            transform_inputs=False,
+            A_log=None,
+            dt_bias=None,
+            lower_bound=None,
         )
         assert ok.item()
         if flush.item():

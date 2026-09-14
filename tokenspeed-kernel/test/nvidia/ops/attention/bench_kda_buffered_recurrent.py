@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Prepared-input recurrence microbenchmark; NOT a serving comparison."""
+"""Prepared/native-input recurrence microbenchmark; NOT a serving comparison."""
 
 import argparse
 import importlib.metadata
@@ -73,7 +73,9 @@ def measure(fn):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--input-kind", choices=("prepared", "native"), required=True)
     args = parser.parse_args()
+    native = args.input_kind == "native"
     torch.manual_seed(93)
     results = []
     for batch in (1, 8):
@@ -91,6 +93,16 @@ def main():
             state = torch.zeros(batch, heads, dim, dim, device="cuda")
             indices = torch.arange(batch, dtype=torch.int32, device="cuda")
             alog = torch.zeros(heads, device="cuda")
+            bias = torch.zeros(heads * dim, device="cuda") if native else None
+            lower_bound = -5.0 if native else None
+            if native:
+                # Serving split producers hand off packed BF16 conv Q/K/V and
+                # raw f_b gate. These views must not need a contiguous FP32 copy.
+                packed = torch.stack((q, k, v), dim=2).to(torch.bfloat16)
+                q, k, v = packed.unbind(2)
+                g = g.to(torch.bfloat16)
+                d = g
+                beta = beta.logit().to(torch.bfloat16)
 
             def baseline():
                 return fused_recurrent_kda_pool(
@@ -100,16 +112,16 @@ def main():
                     g,
                     beta,
                     alog,
-                    None,
+                    bias,
                     state,
                     indices,
                     indices,
                     scale=dim**-0.5,
                     cu_seqlens=None,
-                    lower_bound=None,
-                    use_qk_l2norm_in_kernel=False,
-                    use_gate_in_kernel=False,
-                    use_beta_sigmoid_in_kernel=False,
+                    lower_bound=lower_bound,
+                    use_qk_l2norm_in_kernel=native,
+                    use_gate_in_kernel=native,
+                    use_beta_sigmoid_in_kernel=native,
                 )
 
             baseline_time = measure(baseline)
@@ -194,6 +206,10 @@ def main():
                             out,
                             capacity=capacity,
                             state_block_tokens=1,
+                            transform_inputs=native,
+                            A_log=alog if native else None,
+                            dt_bias=bias,
+                            lower_bound=lower_bound,
                         )
                         commit_positions(
                             stamps,
@@ -218,6 +234,7 @@ def main():
                         "phase": phase,
                         "heads": heads,
                         "dim": dim,
+                        "input_kind": args.input_kind,
                         "baseline": baseline_time,
                         "buffered": timing,
                         "buffered_over_baseline": timing["median_us"]
@@ -228,7 +245,8 @@ def main():
     args.output.write_text(
         json.dumps(
             {
-                "scope": "fixed-round prepared-input recurrence, full acceptance, single layer/GPU, graph replay; paged path includes position prepare, backing validation, recurrence and stamp commit. Endpoints do not advance during timing; this is not an amortized rollout or serving comparison. Excludes model, conv/gates, scheduler, endpoint publication and baseline speculative replay commit",
+                "scope": "fixed-round recurrence, full acceptance, single layer/GPU, graph replay; paged path includes position prepare, backing validation, recurrence and stamp commit. Native inputs include in-kernel Q/K normalization and gate/beta transforms on both sides. Endpoints do not advance during timing; not an amortized rollout or serving comparison. Excludes model, conv/gate producers, scheduler, endpoint publication and baseline speculative replay commit",
+                "input_kind": args.input_kind,
                 "environment": {
                     "python": sys.version,
                     "machine": platform.machine(),

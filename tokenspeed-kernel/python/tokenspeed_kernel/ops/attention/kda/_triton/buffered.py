@@ -112,12 +112,26 @@ def _multiply(left, right):
 
 
 @triton.jit
+def _input_offset(row, token, head, feature, strides: tl.constexpr):
+    # Widen before multiplying: a strided producer view can span more than
+    # signed-int32 element offsets even though its logical T is small.
+    return (
+        row * strides[0]
+        + token.to(tl.int64) * strides[1]
+        + head * strides[2]
+        + feature * strides[3]
+    )
+
+
+@triton.jit
 def _buffered_recurrent(
     Q,
     K,
     V,
     D,
     BETA,
+    A_LOG,
+    DT_BIAS,
     STATE,
     HK,
     HU,
@@ -131,6 +145,14 @@ def _buffered_recurrent(
     FLUSH,
     OK,
     OUT,
+    Q_STRIDES: tl.constexpr,
+    K_STRIDES: tl.constexpr,
+    V_STRIDES: tl.constexpr,
+    D_STRIDES: tl.constexpr,
+    BETA_STRIDES: tl.constexpr,
+    OUT_STRIDES: tl.constexpr,
+    TRANSFORM_INPUTS: tl.constexpr,
+    LOWER_BOUND: tl.constexpr,
     H: tl.constexpr,
     DK: tl.constexpr,
     DV: tl.constexpr,
@@ -245,12 +267,43 @@ def _buffered_recurrent(
         # Only previously accepted history is flushed, never current candidates.
         # The destination must be request-writable, not a published snapshot.
         tl.store(STATE + dst * STATE_STRIDES[0] + state_feature, state, mask)
+    if TRANSFORM_INPUTS:
+        a_scale = tl.exp(tl.load(A_LOG + head).to(tl.float32))
+        bias = tl.load(DT_BIAS + head * DK + kk, kk < DK, 0).to(tl.float32)
     for token in range(width):
-        q = tl.load(Q + ((row * T + token) * H + head) * DK + kk, kk < DK, 0)
-        k = tl.load(K + ((row * T + token) * H + head) * DK + kk, kk < DK, 0)
-        v = tl.load(V + ((row * T + token) * H + head) * DV + vv, vv < DV, 0)
-        d = tl.load(D + ((row * T + token) * H + head) * DK + kk, kk < DK, 0)
-        beta = tl.load(BETA + (row * T + token) * H + head)
+        q = tl.load(Q + _input_offset(row, token, head, kk, Q_STRIDES), kk < DK, 0).to(
+            tl.float32
+        )
+        k = tl.load(K + _input_offset(row, token, head, kk, K_STRIDES), kk < DK, 0).to(
+            tl.float32
+        )
+        v = tl.load(V + _input_offset(row, token, head, vv, V_STRIDES), vv < DV, 0).to(
+            tl.float32
+        )
+        d = tl.load(D + _input_offset(row, token, head, kk, D_STRIDES), kk < DK, 0).to(
+            tl.float32
+        )
+        beta = tl.load(
+            BETA
+            + row * BETA_STRIDES[0]
+            + token.to(tl.int64) * BETA_STRIDES[1]
+            + head * BETA_STRIDES[2]
+        ).to(tl.float32)
+        if TRANSFORM_INPUTS:
+            # Consume the serving split producers directly: BF16 conv(+SiLU)
+            # Q/K/V and raw f_b gate. Keep normalized K, correction and decay
+            # in FP32; no per-layer prepared-input tensors or launches are needed.
+            q /= tl.sqrt(tl.sum(q * q, 0) + 1e-6)
+            k /= tl.sqrt(tl.sum(k * k, 0) + 1e-6)
+            raw_gate = d + bias
+            if LOWER_BOUND is not None:
+                log_decay = LOWER_BOUND * tl.sigmoid(a_scale * raw_gate)
+            else:
+                log_decay = -a_scale * tl.where(
+                    raw_gate < 20.0, tl.log(1 + tl.exp(raw_gate)), raw_gate
+                )
+            d = tl.exp(log_decay)
+            beta = tl.sigmoid(beta)
         state *= d[None, :]
         correction = beta * (v - tl.sum(state * k[None, :], 1))
         block, token_row = _history_offset(
@@ -286,7 +339,7 @@ def _buffered_recurrent(
         )
         state += correction[:, None] * k[None, :]
         out = tl.sum(state * q[None, :], 1) * (DK**-0.5)
-        tl.store(OUT + ((row * T + token) * H + head) * DV + vv, out, vv < DV)
+        tl.store(OUT + _input_offset(row, token, head, vv, OUT_STRIDES), out, vv < DV)
 
 
 def buffered_recurrent(
@@ -311,14 +364,28 @@ def buffered_recurrent(
     *,
     capacity,
     state_block_tokens,
+    transform_inputs,
+    A_log,
+    dt_bias,
+    lower_bound,
 ) -> None:
     """Compute paged candidate history/outputs and optionally flush accepted state.
 
     Args:
-        query/key/decay: Contiguous FP32 [B,T,H,K], with normalized Q/K and
-            multiplicative decay. T is the fixed maximum execution width.
-        value/out: Contiguous FP32 [B,T,H,V] input and caller-owned output.
-        beta: Contiguous FP32 [B,T,H] sigmoid-transformed update weights.
+        query/key/decay: [B,T,H,K] inputs; T is the fixed maximum execution
+            width. Positive strides allow zero-copy Q/K views of packed conv
+            output. Prepared inputs are FP32 normalized Q/K and decay factors.
+        value/out: [B,T,H,V] input and caller-owned output with positive strides.
+        beta: [B,T,H] update weights (already sigmoid in the prepared case).
+        transform_inputs: True consumes BF16 conv(+SiLU) Q/K/V and BF16/FP32
+            raw f_b gate and beta logits. Apply Q/K normalization, gate/decay
+            and beta transforms inside the recurrence. False consumes prepared
+            FP32 inputs for the reference/benchmark contract. This is an input
+            representation, not a standard/speculative execution mode.
+        A_log/dt_bias: Contiguous FP32 [H]/[H*K] gate parameters when transforming;
+            otherwise both must be None. No transformed-input workspace is built.
+        lower_bound: Optional nonpositive log-decay bound for transformed inputs;
+            None selects the softplus gate, and is required for prepared inputs.
         state_pool: FP32 [blocks,H,V,K] cache-owned recurrent checkpoints.
         history_key/history_correction/history_decay: FP32 [blocks,rows,H,K/V/K]
             LCM field views; all four cache fields accept explicit positive strides.
@@ -360,13 +427,58 @@ def buffered_recurrent(
         raise ValueError(
             "positive geometry and capacity >= two maximum windows required"
         )
+    if not isinstance(transform_inputs, bool):
+        raise ValueError(
+            "transform_inputs must explicitly select the input representation"
+        )
+    input_dtype = torch.bfloat16 if transform_inputs else torch.float32
+    data = (
+        (query, (batch, width, heads, key_dim), (input_dtype,)),
+        (key, query.shape, (input_dtype,)),
+        (value, (batch, width, heads, value_dim), (input_dtype,)),
+        (
+            decay,
+            query.shape,
+            (torch.bfloat16, torch.float32) if transform_inputs else (torch.float32,),
+        ),
+        (
+            beta,
+            (batch, width, heads),
+            (torch.bfloat16, torch.float32) if transform_inputs else (torch.float32,),
+        ),
+        (out, value.shape, (input_dtype,)),
+    )
+    for tensor, shape, dtypes in data:
+        if (
+            tensor.shape != shape
+            or tensor.dtype not in dtypes
+            or any(s <= 0 for s in tensor.stride())
+        ):
+            raise ValueError(
+                "input/output fields require declared shapes/dtypes and positive strides"
+            )
+    parameters = []
+    if transform_inputs:
+        for tensor, shape in ((A_log, (heads,)), (dt_bias, (heads * key_dim,))):
+            if (
+                tensor is None
+                or tensor.shape != shape
+                or tensor.dtype != torch.float32
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    "transformed inputs require contiguous FP32 A_log and dt_bias"
+                )
+            parameters.append(tensor)
+        if lower_bound is not None and (
+            not isinstance(lower_bound, (int, float))
+            or isinstance(lower_bound, bool)
+            or not -float("inf") < lower_bound <= 0
+        ):
+            raise ValueError("lower_bound must be finite and nonpositive")
+    elif A_log is not None or dt_bias is not None or lower_bound is not None:
+        raise ValueError("prepared inputs must not supply gate parameters")
     dense = (
-        (query, (batch, width, heads, key_dim), torch.float32),
-        (key, query.shape, torch.float32),
-        (decay, query.shape, torch.float32),
-        (value, (batch, width, heads, value_dim), torch.float32),
-        (beta, (batch, width, heads), torch.float32),
-        (out, value.shape, torch.float32),
         (end, (batch,), torch.int32),
         (checkpoint, (batch,), torch.int64),
         (length, (batch,), torch.int32),
@@ -406,14 +518,19 @@ def buffered_recurrent(
             raise ValueError(
                 "raw block tables must be int32 batch matrices with contiguous columns"
             )
-    tensors = [t for t, _, _ in dense] + [
-        state_pool,
-        history_key,
-        history_correction,
-        history_decay,
-        history_block_table,
-        state_block_table,
-    ]
+    tensors = (
+        [t for t, _, _ in dense]
+        + [t for t, _, _ in data]
+        + parameters
+        + [
+            state_pool,
+            history_key,
+            history_correction,
+            history_decay,
+            history_block_table,
+            state_block_table,
+        ]
+    )
     if any(not t.is_cuda or t.device != query.device for t in tensors):
         raise ValueError("all buffered recurrence tensors must share a GPU")
     if batch == 0:
@@ -439,12 +556,26 @@ def buffered_recurrent(
         capacity,
         triton.next_power_of_2(triton.cdiv(capacity, rows) + 1),
     )
-    _buffered_recurrent[(batch, heads, triton.cdiv(value_dim, 32))](
+    # The measured minimum-capacity native-input cases favor more, smaller
+    # programs. Longer histories retain the wider FP32 reconstruction tile.
+    narrow_tile = (
+        transform_inputs
+        and capacity == 2 * width
+        and width in (1, 4)
+        and key_dim == value_dim == 128
+    )
+    value_tile = 8 if narrow_tile else 32
+    history_tile = min(
+        4 if narrow_tile else 8, triton.next_power_of_2(capacity - width)
+    )
+    _buffered_recurrent[(batch, heads, triton.cdiv(value_dim, value_tile))](
         query,
         key,
         value,
         decay,
         beta,
+        A_log,
+        dt_bias,
         state_pool,
         history_key,
         history_correction,
@@ -458,6 +589,14 @@ def buffered_recurrent(
         flushed,
         ok,
         out,
+        query.stride(),
+        key.stride(),
+        value.stride(),
+        decay.stride(),
+        beta.stride(),
+        out.stride(),
+        transform_inputs,
+        lower_bound,
         heads,
         key_dim,
         value_dim,
@@ -471,9 +610,9 @@ def buffered_recurrent(
         history_correction.stride(),
         history_decay.stride(),
         triton.next_power_of_2(key_dim),
-        32,
-        min(8, triton.next_power_of_2(capacity - width)),
-        num_warps=4,
+        value_tile,
+        history_tile,
+        num_warps=1 if narrow_tile else 4,
         num_stages=1,
         enable_fp_fusion=False,
     )

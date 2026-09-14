@@ -440,7 +440,7 @@ def test_qsa_state_refreshes_layout_and_commits_live_verify_rows(
             # Replay fills staging on-device; its Python accessor is not called.
             # Both rounds must commit even without another host-side staging call.
             graph.replay()
-        backend.commit_speculative_state_after_verify(
+        backend.commit_state_after_verify(
             torch.tensor(accepted, dtype=torch.int32, device="cuda"), num_extends=0
         )
         assert state._verify_workspace is workspace
@@ -479,7 +479,7 @@ def test_qsa_only_target_verification_creates_state(
     assert backend.preallocate_verify_workspace(8, width) == 0
     with pytest.raises(RuntimeError, match="speculative target"):
         backend.verify_staging_buffers(1, 2)
-    root.commit_speculative_state_after_verify(
+    root.commit_state_after_verify(
         torch.tensor([3, 1], dtype=torch.int32), num_extends=0
     )
     assert commit_calls == []

@@ -31,7 +31,7 @@ against the frozen baseline before the work meets its completion gate.
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | M2–M4 cache contracts verified; M5 fields, pool views and isolated GPU positions verified | Runtime position refresh, endpoint materialization and handoff still pending |
-| C. Unified GPU forward and commit | M6 uses paged LCM fields; M7 tiles accepted-history reconstruction; not registered | Runtime refresh, conv/gates, endpoint materialization and serving dispatch remain pending |
+| C. Unified GPU forward and commit | M7 tiles paged history; M8 adds the shared runner commit hook and native-input transforms; recurrence not registered | Shared refresh, conv production/commit, endpoint materialization and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
@@ -677,3 +677,86 @@ Runtime integration remains the next gate: shared position refresh, conv/gate
 preparation and commit, ordinary/speculative commit dispatch, and exact endpoint
 materialization before publication or handoff. Serving guards remain enabled.
 Real NVFP4 TP8 Eagle3 performance, AIME 2026 and full-model traces are pending.
+
+### M8: shared commit hook and native recurrence inputs
+
+Based on `96921c09c9cb0efb9cee7d3ded6e8b4c85df7339` (M7 validation record).
+The runner now calls `commit_state_after_verify` after successful decode/mixed
+execution with or without a drafter. Graph outputs are sliced to live requests
+before this call. Ordinary decode supplies acceptance one through the same
+interface; no token is added. Failed forwards, pure prefill and idle execution
+do not commit. Hybrid/Qwen consumer routing is unchanged, and existing
+consumers without staged state return without issuing GPU work. The old
+speculative-only hook name is removed, including misleading accepted-count
+comments. This changes the shared runner, not the control-plane event loop.
+
+The private recurrence can now read positive-stride BF16 Q/K/V views from a
+packed conv(+SiLU) output, BF16/FP32 raw gate and beta logits, and FP32
+`A_log`/`dt_bias`. Q/K normalization, gate-to-decay conversion and sigmoid beta
+are computed inside the recurrence, without separate prepared-input tensors or
+launches. Both softplus and bounded gates follow the existing KDA equations.
+History and reconstructed state stay FP32. Prepared FP32 inputs remain a
+reference/benchmark input contract, not a separate ordinary-decode path.
+
+The runner hook is integrated; **buffered KDA serving remains disabled**.
+Native inputs still need the runtime's shared metadata and conv producer/commit
+wiring. The primitive does not grant checkpoint publication provenance or solve
+endpoint handoff ordering. No real-model Eagle3 performance claim follows from
+these changes.
+
+The existing tests now cover width-one and speculative commit fan-out, live-row
+slicing after graph replay, failure ordering, and real unstaged GDN/KDA/PLE/QSA
+no-ops. Native inputs join the existing multi-round recurrence matrix rather
+than adding separate tests for each transform: T=1/4, minimum/unaligned/larger
+capacities, eager/graph, strided packed views, weak decay, rejection, reuse and
+flush. The first native round also compares outputs and full state to the
+existing GPU recurrence. FP32 state/history tolerances remain atol=2e-5,
+rtol=2e-4. Native BF16 outputs add their predeclared half-ULP rounding allowance
+(`torch.finfo(torch.bfloat16).eps / 2`) to relative error; FP32 tolerances are
+not widened.
+
+Initial results on the same persistent GB300 allocation, one GPU and no weights:
+**104 commit/consumer/unified-path tests plus 62 subtests passed** (23 warnings,
+24.53s), and **64 reference/GPU tests passed** (15 warnings, 119.08s), including
+FP32 raw gates and old-kernel state parity. Environment remains Python 3.12.3,
+PyTorch 2.13.0+cu130, CUDA 13.0, driver 580.167.08,
+tokenspeed-triton 3.8.10.post20260906, pytest 9.1.1, aarch64. Scheduler sources
+and the M4 binary/extension are unchanged. Final validation and timing follow
+below once complete.
+
+The microbenchmark now requires `--input-kind prepared` or `--input-kind native`.
+Native timing includes in-kernel input transforms on both sides but excludes
+conv/gate producers, model execution and the original batched replay commit.
+Only prepared timings are directly comparable to M7's prepared-input sweep.
+This remains an isolated four-launch prototype test, not the Eagle3 gate.
+
+Final-source checks repeat **64 reference/GPU cases** (15 warnings, 125.92s),
+**104 commit/consumer cases plus 62 subtests** (23 warnings, 11.68s), and
+**501 runtime cases plus 317 subtests** (28 warnings, 19.44s). Input token
+offsets are widened before stride multiplication, like cache addressing; the
+invalid-backing cases also check offsets beyond signed int32 without allocating
+a multi-gigabyte tensor; both focused eager/graph cases passed separately
+(15 warnings, 0.45s). The unchanged runtime/consumer results precede this
+kernel-only address refinement; the 64-case numerical rerun follows it.
+
+A geometry sweep selected 8 value rows, up to 4 history rows and one warp for
+native K=V=128, T=1/4 at minimum capacity L=2*T. Other cases retain M7's wider
+tile. This is a compile-time geometry choice, not a separate decode/commit path.
+Prepared/native timing sweeps ran sequentially after numerical checks, using
+the same five-sample graph timer as M7, without a profiler.
+
+Final native T=4 results, microseconds per fixed round:
+
+| Batch | Capacity | Empty history | No flush, h=L-2*T | Flush, h=L-T |
+| --- | --- | --- | --- | --- |
+| 1 | 8 | 10.44 | 10.27 | 11.14 |
+| 8 | 8 | 12.55 | 12.55 | 14.35 |
+| 1 | 64 | 10.83 | 18.79 | 20.41 |
+| 8 | 64 | 13.63 | 26.11 | 28.64 |
+
+The native eager-recurrence reference takes 7.49 us at batch 1 and 9.29 us at
+batch 8; it is **not** the original Eagle3 verifier plus batched commit.
+Prepared-input timings range from roughly unchanged to 7.8% slower than M7
+over the 48 cases. These results do not establish a no-regression result or a
+default capacity. Shared per-group metadata must remove repeated per-layer
+work, and the actual native pipeline must be measured after integration.

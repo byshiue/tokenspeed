@@ -235,7 +235,8 @@ def commit_state_pages(
     ``out_row`` of a preallocated ``[groups, batch]`` buffer skips the stack too.
 
     Args:
-        accepted_length: Draft matches per request ``[>=batch_size]``.
+        accepted_length: Accepted input tokens per request ``[>=batch_size]``,
+            including the target input; no extra token is added here.
         committed: Committed lengths from the verify resolve ``[>=batch_size]``.
         table: Group page table ``[>=batch_size, num_slots]``, dense inner.
         batch_size: Live requests.
