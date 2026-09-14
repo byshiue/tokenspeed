@@ -51,7 +51,7 @@ against the frozen baseline before the work meets its completion gate.
 | B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
 | C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
 | D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
-| E. Real-model correctness and performance | First baseline/L8/L16 runs complete; both capacities miss the no-regression gate and exact output parity | Publication fix rerun, AIME 2026, remaining capacities, restart repeats and traces are pending |
+| E. Real-model correctness and performance | First baseline/L8/L16 runs complete; M16 generated-prefix publication rerun passes, but output parity and no-regression gates do not | AIME 2026, remaining capacities, restart repeats and matched trace analysis are pending |
 
 ## Recording a result
 
@@ -1398,3 +1398,29 @@ The matching scheduler was rebuilt and staged separately; the source patch,
 binary hashes, environment, exact commands and raw results are retained with
 the local M16 artifacts. Full-model reruns use a separate source archive so
 the earlier M15 measurements keep their original provenance.
+
+### M16 real-model follow-up
+
+The separate `38a396c8` archive completed the real-weight TP8 L8 smoke,
+generated-prefix diagnostic and short NSYS capture with the same full model,
+EAGLE3, graph/overlap and dependency settings recorded above. The scheduler
+fix restores reuse of a decode-produced checkpoint: the resumed request hits
+**52,864 tokens**, versus the old buffered source's prefill-only **51,840**.
+All **1,024 parent output IDs** match the old buffered run. The smoke also
+matches M15, including its difference from the original baseline.
+
+After flushing, the cold replay of that same resumed prompt completes with
+64 outputs. Warm and cold outputs first differ at zero-based index **20**.
+Checkpoint reuse is therefore established, but exact warm/cold parity is not.
+This raw-token lifecycle diagnostic is not an AIME or agent task-resolution
+score; full-model accuracy remains open.
+
+The short trace captures one frozen continuation with **608 new prefill tokens**
+and **96 generated tokens**, after priming and warmup. Each of the eight GPUs
+contains **one prefill forward and 39 decode graph replays**, with 2,598 kernel
+nodes per decode graph. The profiled output matches both its 96-token warmup
+and the first 96 tokens of the earlier unprofiled L8 timing sample. The two
+node reports, source/binary provenance, complete graph samples and analysis
+scripts are retained locally and packaged with clear filenames. Captured
+durations are not unprofiled performance measurements. The matching new
+baseline trace is still in progress.
