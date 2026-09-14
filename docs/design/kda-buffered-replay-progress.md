@@ -12,6 +12,8 @@ M1 source commit: `2619669e51d7eeb438069964d042fd21a5bc0736`
 (`test(kda): establish buffered replay reference and GPU prototype`).
 M2 source commit: `3f3615e11bef462b2c1390ef29b289b612dc2f38`
 (`feat(cache): add bounded live-state retention`).
+M3 source commit: `24c69bf25ca09ab4417b7134593c6f8bebbaf60b`
+(`feat(cache): keep replay history request-local`).
 No default capacity or performance benefit has been established. M1 adds
 an unregistered prototype, not the complete serving feature.
 
@@ -284,9 +286,8 @@ formatter changes are included in this milestone.
 
 ### M3: request-local history ownership and reuse
 
-Source: M3 work on `fcca5cabca832b42267db5e01a84e8b03264924d`, the M2
-validation record; tested before committing. The follow-up record identifies
-the source commit.
+Source: M3 commit above (tested before committing), based on the M2 validation
+record at `fcca5cabca832b42267db5e01a84e8b03264924d`.
 
 Added `replay_checkpoint_group`: a sliding, per-token history group names the
 state group that seeds it on resume. The Python declaration and scheduler
@@ -330,6 +331,7 @@ submit/srun reused the cached image and read-only serving venv. Tests ran on
 one GPU, with no target/draft model or TP8 model execution. The initial runtime
 run also passed; its extra warnings came from first-use compilation. The first
 repository-hook run formatted the new edits; those changes are included.
+The final `pre-commit run --all-files` passed before the signed-off source commit.
 Exact commands, versions, source patch and raw logs are retained in ignored
 local artifacts. No weights, packages or image were downloaded. No M3
 performance, AIME or full-model NSYS result is claimed.
