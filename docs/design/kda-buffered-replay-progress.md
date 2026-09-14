@@ -24,6 +24,8 @@ M7 source commit: `5a7bb231617d4c5e3feab467d444ad7cf5009523`
 (`perf(kda): tile accepted history reconstruction`).
 M8 source commit: `f7e780f15c595eec34501644e612ef55b6eddf7e`
 (`feat(kda): unify commit entry and fuse native recurrence inputs`).
+M9 source commit: `eb55b1dac8195dd6aca06238c018dd959c0bd0ca`
+(`perf(kda): share replay metadata and stamp commits across layers`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -768,7 +770,8 @@ work, and the actual native pipeline must be measured after integration.
 
 ### M9: shared group metadata and multi-layer stamp commit
 
-Based on `b47041e823e25252e8d94f60b658db318d413fad` (M8 validation record).
+Source commit: `eb55b1dac8195dd6aca06238c018dd959c0bd0ca` (signed off), based
+on `b47041e823e25252e8d94f60b658db318d413fad` (M8 validation record).
 No serving or full-model result yet.
 
 `KDAReplayMetadata` binds local replay groups from the cache pool and allocates
@@ -799,7 +802,7 @@ metadata, not recurrent/conv payload execution or checkpoint publication.
 Buffered serving remains disabled. Conv producer/commit wiring, exact endpoint
 materialization, failure feedback and publication ordering still gate dispatch.
 The original Eagle3 full-model performance, AIME and trace requirements remain
-unchanged. Validation results follow when complete.
+unchanged. Validation results follow below.
 
 Initial checks on a new persistent GB300 allocation, one GPU, no weights:
 **13 cache/metadata tests passed** (22 warnings, 13.76s), **64 reference/GPU
@@ -826,3 +829,12 @@ recurrence regression observed. Both use five samples of 50 graph replays,
 no-regression gate or justify a default capacity. The native T=4/L=8 flush
 case is 11.197 us at batch 1 and 13.905 us at batch 8, including all four
 prototype launches, not just the recurrence kernel.
+
+Final-source reruns passed **13 cache/metadata cases** (22 warnings, 15.97s),
+**64 reference/GPU cases** (15 warnings, 125.44s), and **505 runtime cases plus
+317 subtests** (28 warnings, 21.86s). These include the final PP binding and
+shorter-live-acceptance checks. The exact `pre-commit run --all-files` command
+passed after formatting. Validation preceded the signed-off source commit with
+the same code; source patches, environment, raw samples and hashes are retained
+in the local milestone runbook. There is still no real-model accuracy or
+Eagle3 throughput result for buffered serving.
