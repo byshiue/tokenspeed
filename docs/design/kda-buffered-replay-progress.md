@@ -51,7 +51,7 @@ against the frozen baseline before the work meets its completion gate.
 | B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
 | C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
 | D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
-| E. Real-model correctness and performance | First baseline/L8/L16 runs complete; M16 generated-prefix publication rerun passes, but output parity and no-regression gates do not | AIME 2026, remaining capacities, restart repeats and matched trace analysis are pending |
+| E. Real-model correctness and performance | First baseline/L8/L16 runs and matched traces complete; M16 generated-prefix reuse passes; corrected baseline AIME is 26/30 | Buffered AIME, remaining capacities and restart repeats are pending; no-regression has not passed |
 
 ## Recording a result
 
@@ -1423,4 +1423,92 @@ and the first 96 tokens of the earlier unprofiled L8 timing sample. The two
 node reports, source/binary provenance, complete graph samples and analysis
 scripts are retained locally and packaged with clear filenames. Captured
 durations are not unprofiled performance measurements. The matching new
-baseline trace is still in progress.
+baseline trace is reported below.
+
+### M17: matched traces and bounded launch tuning
+
+Source under validation: based on `a6d3e3fa`; not yet a committed or validated
+full-model optimization. Only native four-token, capacity-16 recurrence with
+12 local heads and batch sizes one through four changes its value tile from
+32 to 16. Other shapes retain their previous configuration. Four warps, the
+history tile, arithmetic, flush policy and L8 behavior stay unchanged. The existing parameterized recurrence
+test adds capacity 16 alongside minimum, odd and long capacities; its width-one
+cases also cover the corresponding intermediate capacity.
+
+The matched original `2e4b5407` trace now covers all eight GPUs, using the same
+environment and frozen request as M16. Each GPU has one prefill and **31 decode
+graph replays**, compared with buffered L8's **39**, for the same 96-token output
+budget. Per-GPU graph medians range from **12.141–12.152 ms** originally and
+**12.197–12.210 ms** buffered. Generated tokens and acceptance differ, so the
+additional rounds are not a kernel-only performance comparison. Rank 0's
+recurrent/verify kernel medians are 5.376 us and 8.480 us. Original accepted
+replay is already one batched recurrent call per round across KDA layers,
+outside the graph (31 calls, median 42.368 us), not one replay launch per layer.
+Both two-node captures and complete analysis are packaged together locally.
+
+On an idle GPU in the same allocation, **144 isolated launch measurements**
+compared dynamic versus unrolled loops, value tiles 4/8/16/32, one/two/four/eight
+warps and selected pipeline depths at B1/B4, L8/L16, empty and flush histories.
+All configurations passed the existing numerical tolerance; 88 were not
+bitwise identical. No tolerance changed. Unrolling did not consistently help
+L8 flush, so it was not adopted. The selected dynamic L16 tile-16 candidate
+was bitwise identical to the current output, state and history in all four
+measured cases. Its median kernel times changed as follows:
+
+| L16 case | Original tile 32, bracketed medians | Candidate tile 16 |
+| --- | ---: | ---: |
+| B1, empty | 6.404–6.412 us | 5.638 us |
+| B1, flush | 9.222–9.227 us | 8.202 us |
+| B4, empty | 7.423–7.428 us | 6.656 us |
+| B4, flush | 11.139–11.144 us | 10.331 us |
+
+This is a kernel-only candidate, not an EAGLE3 no-regression pass. Each sample
+replays a 16-call CUDA graph 25 times, with five event-timed repetitions;
+configurations are shuffled and bracketed by the current configuration.
+The source variants, all timings, numerical differences and script are retained.
+The first expanded kernel suite passed **89 tests** (15 warnings, 132.85s),
+integration passed **201 tests plus 77 subtests** (three optional/vendor skips,
+23 warnings, 49.48s), and shared runtime passed **527 tests plus 317 subtests**
+(28 warnings, 37.51s). The CPU reference passed **19 tests** in 7.73s. These
+runs preceded the final small-batch guard. On the final guarded source, the
+same suites passed **89 kernel/reference tests** (134.20s), **201 integration
+tests plus 77 subtests** (three skips, 48.11s), and **527 shared runtime tests
+plus 317 subtests** (36.61s). Warning counts were unchanged. A separate actual
+dispatch check passed **14 cases**, confirming the selected tile and bitwise
+results at B1/2/3/4/8/16/32 with six or twelve heads. Large batches and other
+head counts keep tile 32. Full-model validation of the candidate remains open.
+The earlier isolated scaling/FMA experiments did not establish exact
+agreement with the original native verify kernel; no such math change was
+adopted.
+
+The first baseline AIME attempt was stopped at **27/30**, with every completed
+answer retained. Its short-profile graph ladder captured 1/2/4 with padding
+disabled, leaving the final three requests on slow eager execution. This is
+an incomplete run, not a reported score. Fresh complete evaluations use graph
+sizes **1/2/3/4 for both sources**, with all dataset, sampling and output-budget
+settings unchanged. Short timing and trace protocols retain their original
+ladder; timing on the new AIME servers is a separately matched comparison.
+
+A second isolated sweep checked **56 cases**: B1/2/3/4/8/16/32, history lengths
+0/3/8/12 and two seeds. All outputs, state and history were bitwise identical
+between value tiles 16 and 32. Paired 32/16/16/32 timings show improvements for
+B1/B4 and most B2/B3 cases; B2/B3 long-history flush is effectively tied.
+Larger batches regress: roughly 31–39% at B8, 13–18% at B16 and 8–13% at B32.
+That evidence narrows the production change to the measured small-batch,
+12-head geometry. It is not a universal L16 configuration change.
+
+The corrected frozen-baseline AIME run completed all **30 questions** with
+**26 correct (86.67%)**, zero request errors and one 63,488-token budget stop.
+All prompts were cold, with 203,117 output tokens in total. Official scoring
+and independent full-text grading agree on every question. A separate audit
+grades the 29 explicit response channels and treats the budget-truncated text
+without a response channel as incomplete; it also yields 26/30. Both audit
+versions and every prediction remain in the artifacts. This is the original
+source's result, not accuracy evidence for the buffered candidate.
+
+The same unprofiled baseline server completed the 75-request timing protocol
+with the new 1/2/3/4 graph ladder. Median client latency is **1,058.916 ms at C1**
+and **1,597.885 ms at C4**; median decode throughput is 288.4 and 214.5 tokens/s,
+and acceptance length is 3.59 and 3.67. No request failed or was preempted.
+The candidate must use this same ladder for its paired timing; these results
+are not mixed into the earlier 1/2/4 comparison.

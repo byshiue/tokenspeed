@@ -5,9 +5,10 @@
 accepted/quiescent endpoint 物化。M14 接通 mixed batch 中的 buffered decode
 部分，复用同一个 forward/commit；prefill 仍要求 cache owner 提供精确输入状态。
 M15 接入实验性容量参数与 kernel 注册；真实 TP8 的首轮 L8/L16 测试都未通过
-性能不退步的目标，输出也未与基线逐 token 一致。M16 正在验证 decode checkpoint
-延迟发布的修复。PD/任意 live endpoint 交接仍受限，AIME/NSYS、重启复测及
-其余容量验证尚未完成，尚未选择默认容量。各阶段 commit、环境和验证证据见
+性能不退步的目标，输出也未与基线逐 token 一致。M16 已验证 decode checkpoint
+延迟发布修复，并完成新旧实现的短 NSYS 对照。M17 验证 L16 的静态 kernel
+tile 调整；完整 AIME 对照、重启复测及其余容量验证仍未完成。
+PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 
 ## 1. 目标与范围
