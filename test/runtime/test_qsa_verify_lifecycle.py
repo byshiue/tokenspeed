@@ -261,6 +261,7 @@ def test_unstaged_consumers_ignore_width_one_commit():
         backend = object.__new__(cls)
         backend._verify_commit_ctx = None
         if cls is KdaAttnBackend:
+            backend._buffered_replay = None
             # Both the ordinary GDN delegate and the existing KDA replay route
             # must be no-ops when forward already wrote the final state.
             backend._replay_active = False

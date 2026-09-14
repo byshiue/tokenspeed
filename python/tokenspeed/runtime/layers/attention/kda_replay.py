@@ -79,7 +79,7 @@ def kda_buffered_workspace_bytes(
     # GroupTableStacks also owns decode_locs and the page_sizes vector, even
     # though this consumer uses only its ratio-one raw-table fill.
     tables = raw_groups * (max_bs * columns + max_bs * max_window + 1) * 4
-    positions = max_bs * (8 + groups * (19 + 4 * max_window))
+    positions = max_bs * (9 + groups * (19 + 4 * max_window))
     return activations + descriptors + tables + positions
 
 

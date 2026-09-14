@@ -39,7 +39,7 @@ against the frozen baseline before the work meets its completion gate.
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Live endpoint materialization and handoff still pending |
-| C. Unified GPU forward and commit | M11 adds accepted-endpoint materialization to the M10 workspace | Scheduler handoff, failure feedback and serving dispatch remain pending; recurrence not registered |
+| C. Unified GPU forward and commit | M12 connects the workspace to KDA decode and accepted commit, with rank-agreed failure feedback | Lifecycle handoff and mixed batches remain pending; recurrence not registered and factory still gated |
 | D. Graphs, overlap and lifecycle integration | M10 isolated producer-stream pipeline tests pass in eager/graph; serving integration pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
@@ -1020,3 +1020,70 @@ adds 3,324 bytes per TP8 rank to M10's tensor workspace: **11,211,752 bytes**
 total, excluding LCM fields, the caller-owned handoff mask and CUDA stream/event
 overhead. Exact source, environment, commands and hashes are retained with the
 milestone artifacts.
+
+### M12: backend dispatch and rank-agreed commit validity
+
+Source: based on `648c41bd` (M11 record); source commit follows final hooks.
+No new serving performance or real-model correctness result.
+
+An explicitly planned buffered pool now binds `KDAReplayWorkspace` in the KDA
+backend. Ordinary decode and verify share its refresh, forward and accepted
+commit; neither uses a per-position state tape or eager recurrent replay.
+The hybrid wrapper's existing commit hook supplies live accepted input counts
+after execution, including after CUDA graph replay. Graph metadata exposes
+the cached group views to the pointer guard. Pool replacement rebuilds the
+workspace and descriptors; a changed replay layout is rejected before binding.
+Refresh arms one commit; repeated commits fail before issuing stores. Validity
+is unavailable until the commit is issued, so preparation alone cannot produce
+a successful result. Rebind also resets the legacy replay capability latches.
+The recipe accounts for the immutable no-handoff mask (one byte per runtime
+request) alongside the workspace's existing tensors.
+
+Metadata preparation reads only request-local, non-transferred stamps. Each
+layer fences cache access before consuming the workspace's cached state views;
+the batched commit follows every layer. The executor then snapshots live group
+validity in its normal output D2H sequence. After the copy event completes,
+`StateCommitValidator` agrees on failures over CPU TP and PP groups before
+output post-processing or scheduler feedback. A rank with valid local data
+must still reject if another rank failed. Missing/malformed decode flags also
+fail through this agreement, so no rank exits the collective early. These
+cache-invariant failures stop execution; they are not treated as recoverable
+NaN output. Other cache contracts perform no extra collective.
+
+The factory still enables no replay layout. Mixed buffered batches fail
+explicitly until their handoff is integrated; they cannot read a lagging
+checkpoint through the old prefill scan. Exact lifecycle handoff, public kernel
+registration/configuration, real full-model NVFP4 TP8 Eagle3 no-regression,
+AIME 2026 and NSYS remain required. In particular, this milestone's additional
+CPU agreement and D2H must be included in the eventual end-to-end timing.
+
+The first integration pass passed 102 cases plus 62 subtests and failed ten
+legacy KDA fixtures that omitted the now-explicit refresh arguments. Fixing
+those callers, including the production runner, passed **112 cases plus 62
+subtests** (23 warnings, 43.28s). No kernel math or tolerance changed. A further
+pass exercises the real hybrid forward/commit, pointer guard and pool rebind.
+The suite includes a real two-process Gloo check: a failure present only on
+rank one, missing flags and malformed flags are rejected by both ranks; a
+stage without local buffered groups still participates successfully.
+
+Environment: a fresh persistent four-GB300 allocation, driver 580.167.08,
+Python 3.12.3, PyTorch 2.13.0+cu130 and tokenspeed-triton 3.8.10.post20260906.
+Tests use TP8 per-layer dimensions and packed local-layer cache views, not an
+eight-GPU model run. The cached image, serving venv and M4 scheduler extension
+are unchanged; exact allocation, paths, commands and logs are retained in the
+local milestone runbook. No weights or packages were downloaded.
+
+The final integration suite passed **156 cases plus 62 subtests** (23
+warnings, 36.70s), including the actual hybrid entry, duplicate/missing commit
+guards, pointer guard, pool rebind, device/control-plane tests and NaN-guard
+regressions. Three old cases were skipped: two require optional FLA and one
+tests an AMD-only indexed-decode contract. Native CuteDSL prefill staging
+checks did run. The final scheduler/cache/GDN suite passed **517 cases plus
+317 subtests** (28 warnings, 34.13s). Counts overlap and must not be summed.
+The expanded legacy suite initially exposed a mock pool missing its published
+group specs and a capture call missing placeholder tables; both fixtures now
+honor the real interface. No test was removed and no tolerance was widened.
+The invalid-acceptance check refreshes the actual next endpoint and first
+asserts valid backing, so an unrelated metadata failure cannot hide a missed
+acceptance check. The full TP8 tensor workspace is **11,211,756 bytes per rank**
+at context 65,536, batch four and width four, four bytes above M11.

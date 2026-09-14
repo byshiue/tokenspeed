@@ -1544,6 +1544,14 @@ class ModelExecutor:
 
                 output_nan_flags = self.nan_guard.flags_cpu
 
+                state_commit_validity = self.attn_backend.state_commit_validity(
+                    bs, num_extends=num_extends
+                )
+                if state_commit_validity is not None:
+                    state_commit_validity = state_commit_validity.to(
+                        "cpu", non_blocking=True
+                    )
+
                 copy_event = self.device_module.Event()
                 copy_event.record()
                 if timing_enabled:
@@ -1584,6 +1592,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            state_commit_validity=state_commit_validity,
             spec_candidate_tokens=spec_candidate_tokens,
         )
 

@@ -356,8 +356,10 @@ table width remains absolute and is not reduced to the resident window.
 
 This is an integration foundation, not a serving option. The production recipe
 factory names no replay dependency. An explicit, internal Kimi-K3 planning input
-can bind the fields below; its attention backend rejects that layout until
-endpoint materialization and unified commit are integrated.
+can bind the fields below. Its KDA backend now consumes them through unified
+buffered decode and accepted-endpoint commit, with rank-agreed failure feedback.
+Mixed batches and lifecycle handoffs remain gated; the recipe factory still
+enables no replay layout.
 PD rejects replay-history declarations and wire contracts until materialized
 handoff is implemented. This explicit gate must not be removed by giving the
 history a `full_suffix` transfer policy: there may be no initialized prefill

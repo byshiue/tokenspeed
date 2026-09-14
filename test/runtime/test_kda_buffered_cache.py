@@ -237,7 +237,7 @@ def test_replay_views_share_arena_respect_layer_windows_and_fences():
     assert replacement.get_replay_buffers(layer).key.data_ptr() != replay.key.data_ptr()
 
 
-def test_incomplete_replay_layout_and_serving_dispatch_are_rejected():
+def test_incomplete_replay_layout_and_unsupported_dispatch_are_rejected():
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 
     recipe = _recipe(64)
@@ -248,7 +248,9 @@ def test_incomplete_replay_layout_and_serving_dispatch_are_rejected():
     backend._state_group_ids = ()
     backend._checkpoint_granularity = None
     backend._state_layer_geometry = ()
-    with pytest.raises(RuntimeError, match="planning-only"):
+    backend._buffered_replay = None
+    backend.dtype = torch.bfloat16
+    with pytest.raises(RuntimeError, match="BF16 CUDA"):
         backend.validate_cache_pool(pool)
     layer = min(pool.state_group_by_layer)
     for suffix in ("key", "checkpoint"):
@@ -645,8 +647,11 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("width,capacity", [(1, 8), (4, 8), (4, 37)])
 @pytest.mark.parametrize("captured", [False, True])
-def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured):
-    """Packed fields and producer streams, not scheduler/model integration.
+@pytest.mark.parametrize("backend_dispatch", [False, True])
+def test_buffered_workspace_forward_commit_and_budget(
+    width, capacity, captured, backend_dispatch
+):
+    """Packed fields through the workspace and actual backend decode dispatch.
 
     Existing GPU producers fix BF16 conv/gate rounding. Independent CPU
     recurrence keeps M8's FP32 tolerance and BF16 output half-ULP allowance.
@@ -656,9 +661,20 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
         fused_kda_verify_conv_update,
     )
 
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.graph_ptr_guard import (
+        snapshot_graph_metadata,
+        verify_graph_metadata,
+    )
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
     from tokenspeed.runtime.layers.attention.backends.state.kda_buffered import (
         KDAReplayWorkspace,
     )
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 
     torch.manual_seed(711)
     batch, requests, heads, dim, rank, context = 3, 2, 12, 128, 128, 256
@@ -673,7 +689,21 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
     del full_workspace, full, arena
     # A nonzero PP window crossing a state-group boundary; pool IDs are local.
     arena, pool = _pool(recipe, plan.narrow_to_layers(28, 36), "cuda", 28, 36)
-    workspace = KDAReplayWorkspace(pool, max_bs=batch, max_context_len=context)
+    backend = None
+    if backend_dispatch:
+        config = replace(
+            recipe.attn_config, device="cuda", speculative_num_draft_tokens=width
+        )
+        backend = KdaAttnBackend(config, config.component(MLAConfig))
+        backend.set_cache_pool(pool)
+        backend.init_cuda_graph_state(batch)
+        root_backend = HybridLinearAttnBackend(
+            AttentionBackend(config, config.component(MLAConfig)), backend, []
+        )
+        workspace = backend._buffered_replay
+        assert backend.preallocate_verify_workspace(batch, width) == workspace.nbytes
+    else:
+        workspace = KDAReplayWorkspace(pool, max_bs=batch, max_context_len=context)
     meta, layers = workspace.metadata, workspace.layer_ids
     assert len(layers) == 6 and len(meta._groups) == 2
     assert workspace.nbytes == kda_buffered_workspace_bytes(
@@ -746,30 +776,77 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
     accepted = torch.zeros_like(seq_lens)
     force = torch.zeros_like(seq_lens, dtype=torch.bool)
     rejected = torch.zeros((1, batch, width, 1), dtype=torch.bool, device="cuda")
-    meta.refresh(batch, 0, seq_lens, tables)
+
+    def refresh(live, delivered):
+        if backend is None:
+            meta.refresh(batch, live, seq_lens, delivered)
+        else:
+            backend.refresh_decode_metadata(
+                batch,
+                live,
+                seq_lens,
+                seq_lens,
+                forward_mode=ForwardMode.DECODE,
+                block_tables=delivered,
+                num_extends=0,
+                for_graph_replay=captured,
+            )
+
+    if captured and backend is not None:
+        backend.init_forward_metadata_capture_cuda_graph(
+            batch, seq_lens, seq_lens, ForwardMode.DECODE, block_tables=tables
+        )
+    else:
+        refresh(0, tables)
 
     def run():
-        meta.prepare(batch)
+        if backend is None:
+            meta.prepare(batch)
         for index, layer in enumerate(layers):
-            output = workspace.forward(
-                layer,
-                batch,
-                raw[index],
-                weights[index],
-                f_a[index],
-                f_b[index],
-                beta[index],
-                a_log,
-                bias[index],
-                -0.3,
-            )
+            if backend is None:
+                output = workspace.forward(
+                    layer,
+                    batch,
+                    raw[index],
+                    weights[index],
+                    f_a[index],
+                    f_b[index],
+                    beta[index],
+                    a_log,
+                    bias[index],
+                    -0.3,
+                )
+            else:
+                output = root_backend.forward(
+                    None,
+                    None,
+                    None,
+                    None,
+                    pool,
+                    ForwardMode.DECODE,
+                    batch,
+                    save_kv_cache=True,
+                    record_kv_cache=None,
+                    layer_id=layer,
+                    mixed_qkv=raw[index].view(batch * width, channels),
+                    conv_weights=weights[index],
+                    bias=None,
+                    activation="silu",
+                    f_a_out=f_a[index],
+                    f_b_weight=f_b[index],
+                    beta_raw=beta[index].view(batch * width, heads),
+                    A_log=a_log,
+                    dt_bias=bias[index],
+                    lower_bound=-0.3,
+                ).view(batch, width, heads, dim)
             outputs[index].copy_(output)  # Consume shared scratch before next layer.
         workspace.payload.masked_fill_(rejected, float("nan"))
-        workspace.commit(
-            batch,
-            accepted if captured else accepted[:requests],
-            force if captured else force[:requests],
-        )
+        if backend is None:
+            workspace.commit(
+                batch,
+                accepted if captured else accepted[:requests],
+                force if captured else force[:requests],
+            )
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -780,6 +857,7 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
     if captured:
         with torch.cuda.graph(graph):
             run()
+    snapshot = snapshot_graph_metadata(backend) if backend is not None else None
     buffers = (
         workspace.payload,
         workspace.conv_output,
@@ -805,6 +883,8 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
                 if ends[req] > checkpoints[req] and not flags[row]:
                     counts[row], forced[row] = 0, True
                     break
+        if backend is not None:
+            forced = [False] * requests  # Serving commit has no external handoff.
         endpoint_flags = [
             (forced[row] or (ends[req] + counts[row]) % 128 == 0)
             and ends[req] + counts[row]
@@ -819,7 +899,9 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             >= torch.tensor(counts + [0])[None, :, None, None]
         )
         current = {gid: table[order + [requests]] for gid, table in tables.items()}
-        meta.refresh(batch, requests, seq_lens, current)
+        refresh(requests, current)
+        if backend is not None:
+            verify_graph_metadata(backend, snapshot, context="buffered decode refresh")
         raw_cpu = torch.randn(raw.shape, dtype=torch.bfloat16) * 0.3
         raw.copy_(raw_cpu)
         f_a.normal_(std=0.1)
@@ -882,6 +964,13 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             graph.replay()
         else:
             run()
+        if backend is not None:
+            # Like ForwardStepRunner, acceptance commit follows the graph and
+            # receives only live rows, not the capture ladder's padded output.
+            assert root_backend.state_commit_validity(requests, num_extends=0) is None
+            root_backend.commit_state_after_verify(accepted[:requests], num_extends=0)
+            validity = root_backend.state_commit_validity(requests, num_extends=0)
+            assert validity.shape == (2, requests) and validity.all()
         torch.testing.assert_close(
             outputs[:, :requests].cpu().float(),
             torch.stack(expected_outputs, dim=2),
@@ -976,7 +1065,7 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
         ] == pointers
     assert saw_flush and saw_no_flush and saw_zero_accept_flush
     assert saw_endpoint and saw_aligned_endpoint
-    if capacity > 2 * width:
+    if capacity > 2 * width and backend is None:
         assert saw_zero_accept_endpoint
     if capacity == 37:
         assert saw_split_state_slots
@@ -994,8 +1083,19 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
     ]
     accepted.fill_(width + 1)
     force.fill_(True)
-    workspace.commit(batch, accepted, force)
-    assert not meta.ok.any()
+    if backend is None:
+        workspace.commit(batch, accepted, force)
+        assert not meta.ok.any()
+    else:
+        # Re-enter through refresh: duplicate commit must never reconstruct an
+        # endpoint on top of the state the previous commit just materialized.
+        with pytest.raises(RuntimeError, match="already committed"):
+            root_backend.commit_state_after_verify(accepted[:requests], num_extends=0)
+        seq_lens.copy_(torch.tensor([ends[req] + width for req in order] + [2**31 - 1]))
+        refresh(requests, current)
+        assert meta.ok[:, :requests].all()
+        root_backend.commit_state_after_verify(accepted[:requests], num_extends=0)
+        assert not root_backend.state_commit_validity(requests, num_extends=0).any()
     for layer, saved in zip(layers, before, strict=True):
         for current, old in zip(
             (*pool.get_state_buffers(layer), pool.get_replay_buffers(layer).checkpoint),
@@ -1003,3 +1103,21 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             strict=True,
         ):
             torch.testing.assert_close(current, old, atol=0, rtol=0, equal_nan=True)
+    if backend is not None:
+        _, replacement = _pool(recipe, plan.narrow_to_layers(28, 36), "cuda", 28, 36)
+        backend.set_cache_pool(replacement)
+        rebound = backend._buffered_replay
+        assert rebound is not workspace and backend.forward_metadata is None
+        assert backend._buffered_actual_bs == 0
+        assert rebound.payload.data_ptr() != workspace.payload.data_ptr()
+        assert backend._verify_scratch is None and backend._replay_payloads is None
+        backend.init_cuda_graph_state(batch)
+        assert backend.preallocate_verify_workspace(batch, width) == rebound.nbytes
+        changed = _recipe(
+            capacity + 8, decode_input_tokens=width, max_bs=batch, context_len=context
+        )
+        changed_plan = _layout(changed).bind(24).narrow_to_layers(28, 36)
+        _, wrong = _pool(changed, changed_plan, "cuda", 28, 36)
+        with pytest.raises(RuntimeError, match="different buffered replay layout"):
+            backend.set_cache_pool(wrong)
+        assert backend.cache_pool is replacement and backend._buffered_replay is rebound

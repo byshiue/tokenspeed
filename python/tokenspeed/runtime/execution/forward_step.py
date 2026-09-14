@@ -710,6 +710,7 @@ class ForwardStepRunner:
             seq_lens,
             forward_mode=forward_mode,
             block_tables=block_tables,
+            num_extends=0,
             for_graph_replay=use_graph,
             **cache_kwargs,
         )

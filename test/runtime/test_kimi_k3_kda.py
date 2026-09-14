@@ -216,7 +216,9 @@ class _StubContractPool:
 
     def __init__(self, contract, device, conv_dim, width, num_heads, head_dim):
         # The arena publishes the contract; a view only names its arena.
-        self.arena = SimpleNamespace(runtime_contract=contract)
+        self.arena = SimpleNamespace(
+            runtime_contract=contract, cache_group_specs=contract.group_specs
+        )
         num_pages = contract.group_page_counts[_STATE_GROUPS[0]]
         self._groups = {i: _STATE_GROUPS[i] for i in range(3)}
         self._components = {
@@ -389,6 +391,8 @@ def test_dual_index_reuses_one_slot_plan_and_groups_are_independent(
         seq_lens,
         forward_mode=ForwardMode.DECODE,
         block_tables=delivered,
+        num_extends=0,
+        for_graph_replay=False,
     )
 
     # Conversion and slot arithmetic run once for the whole batch. Each state
@@ -429,6 +433,10 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         req_pool_indices=torch.tensor([0, 1], dtype=torch.int32),
         seq_lens=torch.tensor([1, 1], dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        block_tables={
+            spec.group_id: torch.zeros((2, 1), dtype=torch.int32)
+            for spec in pool.arena.cache_group_specs
+        },
     )
     captured_ptrs = {
         gid: backend.state_in_by_group[gid][1].data_ptr() for gid in _STATE_GROUPS
@@ -445,6 +453,7 @@ def test_cuda_graph_replay_refreshes_buffers_in_place() -> None:
         forward_mode=ForwardMode.DECODE,
         for_graph_replay=True,
         block_tables=delivered,
+        num_extends=0,
     )
     md = backend.forward_metadata
     for gid in _STATE_GROUPS:
@@ -575,6 +584,8 @@ class _KDAHarness:
             torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
             forward_mode=ForwardMode.DECODE,
             block_tables=self._delivered(tables),
+            num_extends=0,
+            for_graph_replay=False,
         )
 
     def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1):
@@ -608,6 +619,7 @@ class _KDAHarness:
             out_cache_loc=None,
             token_to_kv_pool=self.pool,
             bs=bs,
+            save_kv_cache=True,
             mixed_qkv=mixed.clone(),
             g_raw=g_raw,
             beta_raw=beta_raw,

@@ -125,6 +125,10 @@ class ModelExecutionResult:
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
+    # CPU bool [local cache groups, live requests], copied after state commit.
+    # Unlike numerical-output flags, these may differ across TP ranks and must
+    # be rank-agreed before the scheduler accepts any output from this round.
+    state_commit_validity: torch.Tensor | None = None
     # Optional verify-input snapshot used by speculative diagnostics. Layout is
     # [batch, verify_width]: anchor followed by draft candidate token ids.
     spec_candidate_tokens: torch.Tensor | None = None

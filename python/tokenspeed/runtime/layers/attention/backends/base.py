@@ -409,6 +409,20 @@ class AttentionBackend(CachePoolBinding, ABC):
         inherit this no-op.
         """
 
+    def state_commit_validity(
+        self, bs: int, *, num_extends: int
+    ) -> torch.Tensor | None:
+        """Return device bool ``[local groups, live requests]`` commit validity.
+
+        Called after forward and accepted-state commit, before output D2H.
+        These are borrowed per-round flags: the executor snapshots them on the
+        execution stream before another refresh may overwrite them. None means
+        this consumer has no deferred-state validation for this round. Padding
+        is excluded; the control plane must agree across ranks before publishing
+        any successful result. This is not checkpoint provenance.
+        """
+        return None
+
     @contextmanager
     def record_pd_cache_step(
         self,

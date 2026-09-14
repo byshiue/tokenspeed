@@ -17,6 +17,9 @@ commit 接入同一个实验工作区，并核对实际分配与 recipe 预算�
 交付及完整模型验收仍未完成，不能据此启用 serving。
 M11 增加 acceptance 之后的跨层 endpoint 物化，复用 forward 的 FP32 历史重建；
 精确 endpoint 的 GPU 写回已有实验实现，scheduler 触发、交付完成与失败反馈仍待接入。
+M12 已将工作区接入 KDA backend 的统一 decode/commit，并将有效性随输出拷回
+CPU，在 scheduler 接受结果前作跨 rank 检查。生命周期交接、mixed batch、配置
+启用与完整模型验收仍待完成；本阶段不据此选择默认容量。
 
 ## 1. 目标与范围
 

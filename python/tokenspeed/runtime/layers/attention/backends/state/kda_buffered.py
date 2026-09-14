@@ -21,8 +21,9 @@
 """Fixed-address, per-group metadata for cache-owned KDA buffered replay.
 
 This is execution scratch, not a request-state pool: stamps and history remain
-in LCM fields. The serving backend stays gated until exact endpoint handoff
-and failure feedback are integrated. No ordinary/speculative or eager/graph fork.
+in LCM fields. The KDA backend consumes this workspace for explicitly planned
+replay pools; the serving factory remains gated on lifecycle integration and
+validation. No ordinary/speculative or eager/graph fork.
 """
 
 from __future__ import annotations
@@ -88,8 +89,9 @@ class KDAReplayMetadata:
 
     ``max_bs`` is full decode capacity, not the graph capture ladder. Rebinding
     requires a new owner and recapturing graphs; no old cache views survive.
-    Before any prepare, the caller must fence access to every local layer's
-    transferred fields. A shared group commit follows *all* layer stores, so
+    Preparation reads only non-transferred, request-local stamps; each layer
+    must fence its state payload before consuming cached pool views. A shared
+    group commit follows *all* layer stores, so
     every layer's checkpoint stamp is equal at the next prepare. It is then
     sufficient to load one local layer's stamp per group (also for PP views).
     """
@@ -434,6 +436,9 @@ class KDAReplayWorkspace:
             device=device,
         )
         self.materialized = torch.zeros_like(self.metadata.ok)
+        # Ordinary accepted commit has no external handoff request. Keep this
+        # immutable input outside captures; explicit handoffs supply their mask.
+        self.no_handoff = torch.zeros(max_bs, dtype=torch.bool, device=device)
         self.endpoint_descriptors = torch.tensor(
             [
                 [
@@ -469,6 +474,7 @@ class KDAReplayWorkspace:
                 self.conv_ptrs,
                 self.group_indices,
                 self.materialized,
+                self.no_handoff,
                 self.endpoint_descriptors,
                 meta.tables.tables,
                 meta.tables.decode_locs,

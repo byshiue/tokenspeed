@@ -160,6 +160,17 @@ op kind) either returns events into one of these two points or adds a new
 explicit call site in the loop body with a comment stating why the existing
 points don't fit. It must not call `advance_scheduler` itself.
 
+Deferred recurrent-state validity crosses with the forward's output D2H and is
+read only after `PendingExecution.result()` joins the copy event. For a cache
+contract declaring buffered replay, `StateCommitValidator` agrees on failures
+over the CPU TP and PP groups before output post-processing. It runs on every
+participating rank, including stages with no local recurrent group. Invalid,
+missing or malformed decode flags reject the round everywhere; they never
+become successful token feedback or checkpoint provenance. This is a fatal
+cache-invariant failure, not the recoverable NaN-output guard. Contracts without
+buffered state perform no additional collective. The validator holds CPU values
+only and neither advances the scheduler nor performs GPU work.
+
 ## Principle 4: correctness never depends on the in-flight depth
 
 The loop is parameterized by `in_flight_depth`: 0 (classic synchronous

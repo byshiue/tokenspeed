@@ -199,7 +199,9 @@ something the idle refresh cannot express:
 * **DeepseekV4**: the packed `tokens_per_req` row machinery and its bespoke
   multi-group metadata build;
 * **Mamba** (`MambaAttnBackend`): the warmup kernels need the arange
-  query-start-loc, which the idle refresh deliberately zeroes;
+  query-start-loc, which the idle refresh deliberately zeroes. KDA delegates
+  legacy pools here; buffered pools use the ordinary idle refresh because
+  their recurrence consumes endpoint/width buffers, not query boundaries;
 * **Inkling**: conv-state seeding (paged conv reads `pos = seq_len - 1`, so
   capture must seed real lengths);
 * **HybridLinearAttnBackend / Qwen4ExpBackend / MSAHybrid**: pure fan-out to
@@ -499,11 +501,14 @@ All local layers in a group commit the same checkpoint stamp in one launch,
 after every layer's data stores. Only under this ordering invariant may the
 next prepare read one representative local layer's stamp. A PP view enumerates
 its own local layers; a pool replacement creates a new metadata owner and
-requires recapture. Access to transferred layer fields must be fenced before
-preparation. A false validity flag suppresses GPU stores but does not itself
+requires recapture. Preparation reads only request-local stamps, which are
+zeroed on fresh allocation and excluded from transfer. State payload access is
+fenced at each layer's first consumption, before the workspace's cached views
+are used. A false validity flag suppresses GPU stores but does not itself
 reject a scheduler result or grant checkpoint provenance. Buffered KDA serving
-is still gated on exact-endpoint handoff and failure feedback; this owner is
-not an alternate serving path.
+is still gated on lifecycle handoff and full-model validation. The executor's
+rank-agreed result check supplies failure feedback; this metadata owner is not
+an alternate serving path.
 
 The experimental `KDAReplayWorkspace` composes that metadata with one
 width-parameterized conv/gate/recurrent forward. Conv preparation validates
@@ -535,8 +540,21 @@ No additional state store is needed when the source is already exact. The
 per-group `materialized` flag records a required write, not its completion;
 stamp commit may consume it only after all layer stores finish. The caller's
 handoff mask grants neither writable ownership nor publication provenance.
-The runtime still needs to connect this operation to scheduler handoff and
-failure feedback before buffered serving is enabled.
+The KDA backend now dispatches buffered decode for an explicitly planned replay
+pool. Width one and verify use the same refresh, forward and accepted commit;
+the persistent workspace exists before capture, with no legacy verify tape.
+Its decode metadata slot exposes cached group views to the graph pointer guard.
+Normal commit uses a preallocated false handoff mask and materializes aligned
+accepted endpoints automatically. Refresh arms one commit; a repeated commit
+is rejected, and validity is not exposed while that commit is still pending.
+The executor copies live group-validity flags
+with its outputs; CPU rank agreement rejects a failed round before scheduler
+feedback (see `event-loop.md`). Pure prefill retains its existing exact-state
+path and reports no deferred commit flags. Mixed buffered batches are rejected
+until their handoff is integrated; they cannot consume lagging state through
+the legacy scan. The recipe factory still enables no replay layout. Explicit
+lifecycle handoff, registration, configuration and full-model validation remain
+required before serving is enabled.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
