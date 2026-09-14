@@ -38,6 +38,8 @@ M14 source commit: `fd31239aa518c75a3dc7dcd0172d49313d6bc03a`
 (`feat(kda): compose mixed prefill and buffered decode`).
 M15 source commit: `fea0e94fbd816116d9eebd0ac6b833e05bc8054b`
 (`feat(kda): expose experimental buffered decode`).
+M16 source commit: `38a396c8f5b0dc474ecda4ab624ec7789e0a3ad2`
+(`fix(cache): retain exact decode checkpoint publication evidence`).
 No default capacity or serving performance benefit has been established.
 M15 registers the GPU recurrence and adds an explicit experimental capacity;
 it is not a production-validated default. Eagle3 must run the new path without a performance regression
@@ -1370,6 +1372,8 @@ experiments above used frozen M15, not the fix.
 
 ### M16: preserve exact decode checkpoints until publication
 
+Source: `38a396c8f5b0dc474ecda4ab624ec7789e0a3ad2`, based on `de69d598`.
+
 The scheduler now retains the last known exact materialization boundary in
 `CacheProgress` when scheduling decode. It still rejects a boundary merely
 crossed by a verify window. There is no new state allocation, GPU work or
@@ -1388,3 +1392,9 @@ The shared scheduler/cache/runtime suite passed **527 tests plus 317 subtests**
 waited for Slurm step creation after communication timeouts, then proceeded
 without resubmission. No numerical tolerance was changed. No fixed-source
 full-model result or performance improvement is claimed yet.
+
+All applicable all-files hooks passed before the signed-off source commit.
+The matching scheduler was rebuilt and staged separately; the source patch,
+binary hashes, environment, exact commands and raw results are retained with
+the local M16 artifacts. Full-model reruns use a separate source archive so
+the earlier M15 measurements keep their original provenance.
