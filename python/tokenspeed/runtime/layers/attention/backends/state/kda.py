@@ -174,6 +174,14 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
+        state_groups = set(cache_pool.state_group_by_layer.values())
+        if any(
+            spec.replay_checkpoint_group in state_groups
+            for spec in cache_pool.arena.cache_group_specs
+        ):
+            raise RuntimeError(
+                "buffered KDA cache is planning-only until endpoint materialization and commit are integrated"
+            )
         replay_active = kda_replay_commit_supported(
             self.dtype,
             recurrent_layout=self.kda_recurrent_layout,

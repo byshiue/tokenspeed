@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from dataclasses import replace
 from functools import cached_property
 
 import torch
@@ -39,6 +40,10 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import (
     LinearAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.kda_replay import (
+    KDA_REPLAY_BLOCK_TOKENS,
+    KDAReplayLayout,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
 )
@@ -49,12 +54,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
     CacheLayout,
     cache_dtype_name,
+    cache_field_layer_id,
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    NULL_PAGES,
     CacheGroupDeclaration,
+    CacheGroupSpec,
+    compute_cache_group_page_counts,
 )
 
 _KIMI_K3_LAYERS = 93
@@ -85,6 +94,95 @@ class KimiK3Recipe(CacheRecipe):
     """
 
     family = "kimi_k3"
+
+    def __init__(self, *, replay_buffer_capacity: int | None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # An explicit planning input, not a serving switch. The production
+        # factory passes None until materialization/commit integration is ready.
+        self.buffered_replay = (
+            None
+            if replay_buffer_capacity is None
+            else KDAReplayLayout(
+                capacity=replay_buffer_capacity,
+                max_window=self.decode_input_tokens,
+                block_tokens=KDA_REPLAY_BLOCK_TOKENS,
+            )
+        )
+        if self.buffered_replay is not None and self.pd_disaggregation_enabled:
+            raise ValueError(
+                "buffered KDA requires materialized handoff before PD integration"
+            )
+
+    @override
+    def groups(self) -> tuple[CacheGroupDeclaration, ...]:
+        groups = super().groups()
+        replay = self.buffered_replay
+        if replay is None:
+            return groups
+        heads, value_dim, key_dim = self._kda_shapes[1]
+        declarations = []
+        for spec, fields in groups:
+            if spec.family != "state":
+                declarations.append((spec, fields))
+                continue
+            declarations.append(
+                (
+                    replace(spec, max_state_lag_tokens=replay.max_state_lag_tokens),
+                    fields,
+                )
+            )
+            recurrent_fields = [
+                field for field in fields if field.field_id.endswith(".recurrent_state")
+            ]
+            # K3 has one more MLA plane than the 23 layers in each state group.
+            # Put the tiny position stamps in that spare plane: adding them to
+            # a full history plane would reduce TP8 packing from six to five.
+            stamp_plane = f"slot.{len(recurrent_fields)}"
+            history_fields = []
+            for field in recurrent_fields:
+                layer_id = cache_field_layer_id(field.field_id)
+                for suffix, dim in (
+                    ("replay_key", key_dim),
+                    ("replay_correction", value_dim),
+                    ("replay_decay", key_dim),
+                ):
+                    history_fields.append(
+                        CacheFieldSpec(
+                            f"layer.{layer_id}.{suffix}",
+                            field.plane_id,
+                            (replay.block_tokens, heads, dim),
+                            "float32",
+                            exact_page_stride=False,
+                        )
+                    )
+                # Per-layer ownership preserves PP narrowing and layer fences.
+                # Batch positions can be shared across layers at runtime.
+                history_fields.append(
+                    CacheFieldSpec(
+                        f"layer.{layer_id}.replay_checkpoint",
+                        stamp_plane,
+                        (replay.block_tokens,),
+                        "int64",
+                        exact_page_stride=False,
+                    )
+                )
+            declarations.append(
+                (
+                    CacheGroupSpec(
+                        group_id=f"{spec.group_id}_replay",
+                        family="history",
+                        retention="sliding_window",
+                        rows_per_page=replay.block_tokens,
+                        entry_stride_tokens=1,
+                        sliding_window_tokens=replay.capacity,
+                        max_state_lag_tokens=0,
+                        replay_checkpoint_group=spec.group_id,
+                        transfer_policy=None,
+                    ),
+                    tuple(history_fields),
+                )
+            )
+        return tuple(declarations)
 
     # ---- layer vocabulary ----
 
@@ -266,14 +364,31 @@ class KimiK3Recipe(CacheRecipe):
         # parent granularity. Attn tp=8 gives the historical 12; attention-DP
         # (tp < 8) grows the state 8/tp-fold and the packing follows it up,
         # while larger tp shrinks the state and the parent with it.
-        mla_packing = max(1, -(-linear_plane_bytes // mla_page_bytes))
-        linear_packing = max(1, mla_packing * mla_page_bytes // linear_plane_bytes)
-        return {
-            spec.group_id: (
-                mla_packing if spec.group_id == FULL_ATTENTION else linear_packing
-            )
-            for spec, _ in groups
-        }
+        plane_quantum = mla_page_bytes
+        group_plane_bytes = {}
+        for spec, fields in groups:
+            bytes_by_plane: dict[str, int] = {}
+            for field in fields:
+                bytes_by_plane[field.plane_id] = (
+                    bytes_by_plane.get(field.plane_id, 0) + field.payload_bytes
+                )
+            group_plane_bytes[spec.group_id] = max(bytes_by_plane.values())
+            if spec.replay_checkpoint_group is not None:
+                # A history block must divide the plane without rounding its
+                # byte width: MLA indexes pages with an implicit exact stride.
+                # TP8/16 already divide; smaller TP needs a slightly wider
+                # parent, still made of whole, unchanged MLA pages.
+                plane_quantum = math.lcm(
+                    plane_quantum, group_plane_bytes[spec.group_id]
+                )
+        plane_bytes = -(-linear_plane_bytes // plane_quantum) * plane_quantum
+        packing = {FULL_ATTENTION: plane_bytes // mla_page_bytes}
+        for spec, _ in groups:
+            if spec.group_id != FULL_ATTENTION:
+                packing[spec.group_id] = max(
+                    1, plane_bytes // group_plane_bytes[spec.group_id]
+                )
+        return packing
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
@@ -344,7 +459,7 @@ class KimiK3Recipe(CacheRecipe):
                 * sum(
                     field.payload_bytes
                     for spec, fields in self.groups()
-                    if spec.group_id != FULL_ATTENTION
+                    if spec.family == "state"
                     for field in fields
                     if field.field_id.endswith(".conv_state")
                 )
@@ -355,7 +470,7 @@ class KimiK3Recipe(CacheRecipe):
             layer_count = sum(
                 field.field_id.endswith(".conv_state")
                 for spec, fields in self.groups()
-                if spec.group_id != FULL_ATTENTION
+                if spec.family == "state"
                 for field in fields
             )
             payload_bytes_per_row = (
@@ -375,7 +490,7 @@ class KimiK3Recipe(CacheRecipe):
         return verify_rows * sum(
             field.payload_bytes
             for spec, fields in self.groups()
-            if spec.group_id != FULL_ATTENTION
+            if spec.family == "state"
             for field in fields
         )
 
@@ -418,7 +533,7 @@ class KimiK3Recipe(CacheRecipe):
                     - 1
                     + protected_pages
                 )
-            else:
+            elif specs[group_id].family == "state":
                 # A finishing off-page prefill holds its input snapshot and
                 # aligned checkpoint, plus the final tail AND banked decode
                 # growth. Overlap protects one more decode reservation. With
@@ -430,6 +545,17 @@ class KimiK3Recipe(CacheRecipe):
                     2
                     + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
                     + math.ceil(specs[group_id].max_state_lag_tokens / page_tokens)
+                )
+            else:
+                # Replay rows use the generic empty-prefill/live-window budget,
+                # not the snapshot working set or the dense MLA token capacity.
+                child_pages = (
+                    compute_cache_group_page_counts(
+                        (specs[group_id],),
+                        max_total_tokens=token_capacity,
+                        **limits,
+                    )[group_id]
+                    - NULL_PAGES
                 )
             parents += math.ceil(child_pages / packing)
         return parents

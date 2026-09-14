@@ -169,7 +169,7 @@ _RECIPES: dict[CacheModelFamily, Callable[..., CacheRecipe]] = {
     "qwen_gdn": QwenGDNRecipe,
     "qwen4_exp": Qwen4ExpRecipe,
     "inkling": InklingRecipe,
-    "kimi_k3": KimiK3Recipe,
+    "kimi_k3": partial(KimiK3Recipe, replay_buffer_capacity=None),
     "glm53_flash": Glm53FlashRecipe,
     "deepseek_v4": DeepseekV4Recipe,
     "deepseek_v41": DeepseekV41Recipe,

@@ -354,13 +354,52 @@ endpoint; this guard costs storage even without overlap. Both the Python group
 budget and C++ startup bound include it, plus partial-block rounding. Logical
 table width remains absolute and is not reduced to the resident window.
 
-This is an integration foundation, not a serving option. Current recipes name
-no replay dependency. GPU position metadata, KDA field binding and endpoint
-materialization are still pending.
+This is an integration foundation, not a serving option. The production recipe
+factory names no replay dependency. An explicit, internal Kimi-K3 planning input
+can bind the fields below; its attention backend rejects that layout until
+endpoint materialization and unified commit are integrated.
 PD rejects replay-history declarations and wire contracts until materialized
 handoff is implemented. This explicit gate must not be removed by giving the
 history a `full_suffix` transfer policy: there may be no initialized prefill
 rows to transfer, and a lagging checkpoint is not the accepted endpoint.
+
+#### Experimental KDA replay fields
+
+Each KDA state group has a request-local history group containing FP32 normalized
+K, correction U and multiplicative per-channel decay. Blocks currently hold
+eight tokens. This is a physical packing choice, not the logical capacity `L`,
+maximum execution width `T`, prefix grain, or scan-kernel tile size. The group
+declares window `L` and its state group declares lag `L-T`, with `L >= 2*T`.
+The ordinary group budget includes candidate and overlap protection; these are
+additional physical rows, not permission to exceed the logical capacity.
+
+One int64 checkpoint stamp accompanies each history row. Only the last accepted
+input row is stamped, with materialized position `c+1`; zero means empty history
+seeded at an exact endpoint. The stamps are per-layer cache fields so pipeline
+narrowing, layer fences and page zeroing have the same owner as K/U/decay.
+For the full Kimi-K3 layout they occupy the spare 24th plane. Putting them beside
+K/U/decay would reduce TP8 history packing from six blocks per parent to five.
+The planner preserves exact MLA page strides; TP8/16 parent size is unchanged,
+while smaller TP widths round the parent to whole MLA and history blocks.
+Pool accessors expose zero-copy typed views and allocate no private history.
+Replay-dependent groups are not attention KV and do not get paged-attention
+router leaves.
+
+The unregistered GPU position primitives resolve the row at `e-1` through the
+current raw block table, derive `h=e-c`, and request a capacity flush when
+`h+2*T > L`. They fill caller-owned output buffers without host readback.
+Commit stamps `e+a-1` after state/history stores, where `a` includes the target
+input. A flush with zero acceptance must restamp `e-1` with `e+1`; otherwise the
+next round would still see the old checkpoint. Idle rows and rejected candidates
+do not mutate stamps. Invalid positions/acceptance clear the per-row validity
+output and suppress stores; consumers must enforce that result before publishing.
+
+Zero or missing stamps are **not** a recovery mechanism for lost live history.
+They are valid seeds only after exact-endpoint materialization and fresh-page
+zeroing. The runtime still needs to enforce this transition, integrate stable
+batch outputs and paged recurrence, and order materialization before publication,
+incremental prefill, transfer and retraction. A capacity-flush decision alone
+does not establish prefix-publication provenance.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 

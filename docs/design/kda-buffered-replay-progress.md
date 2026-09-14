@@ -16,13 +16,15 @@ M3 source commit: `24c69bf25ca09ab4417b7134593c6f8bebbaf60b`
 (`feat(cache): keep replay history request-local`).
 M4 source commit: `ac74d6785ee921efcd2b4c061e74a562b82ac47f`
 (`feat(cache): reserve only replay history decode tails`).
+M5 source: uncommitted during validation; exact commit will be recorded after
+the repository hooks pass.
 No default capacity or performance benefit has been established. M1 adds
 an unregistered prototype, not the complete serving feature.
 
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
-| B. LCM ownership, retention and lifecycle contract | M2 retention/capacity, M3 request-local ownership and M4 empty-prefill allocation verified | GPU field/metadata binding, endpoint materialization and handoff still pending |
+| B. LCM ownership, retention and lifecycle contract | M2–M4 cache contracts verified; M5 fields, pool views and isolated GPU positions verified | Runtime position refresh, endpoint materialization and handoff still pending |
 | C. Unified GPU forward and commit | Isolated recurrence prototype; not registered or integrated | LCM, conv/gate integration and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
@@ -422,3 +424,80 @@ environment and checksums are retained in the local runbook.
 The remaining field/metadata work is unchanged. In particular, none of these
 tests proves that a lagging checkpoint may be published at the accepted
 endpoint: materialization and lifecycle ordering must be integrated first.
+
+### M5: KDA history fields and cache-owned positions
+
+Based on `2a62f8b8c585689526a8ee61a5490ada35da7b1f` (M4 validation record).
+This milestone binds real KDA history fields through the existing recipe,
+packing and arena pipeline. It does not enable buffered serving: the factory
+still passes no replay capacity, and the KDA backend explicitly rejects a
+buffered layout until materialization and commit are integrated.
+
+Each of the three state groups gains a request-local history group. Its
+per-layer fields are FP32 normalized K, correction U, multiplicative decay,
+and an int64 checkpoint-position stamp. The fixed physical block span is eight
+tokens, independent of capacity and prefix identity. A typed pool accessor
+returns zero-copy arena views, honors layer-load fences and validates complete
+field ownership. Pipeline/draft views retain their existing layer windows;
+replay groups do not become paged-attention router leaves.
+
+The position stamp records `c+1` at the last committed input row. Resolving it
+through the current block table gives `h=e-c`, without a persistent table keyed
+by batch slot. Stamps are owned per layer, preserving cache lifecycle and PP
+ownership; the future runtime refresh should compute batch positions once and
+share those outputs across layers. Unregistered GPU prepare/commit primitives
+now cover this contract with caller-owned buffers, explicit strides and no
+host readback. They handle idle rows, partial acceptance, and restamping after
+a flush with zero acceptance. Invalid rows report failure and suppress stores.
+Zero stamps only seed empty history after exact-endpoint materialization and
+fresh-page zeroing; they must not silently recover lost live history.
+
+At TP8 the existing 24 planes and 20.25 MiB parent remain unchanged. Six
+eight-token history blocks fit per parent. Stamps use the spare 24th plane;
+placing them inline would reduce packing to five. TP16 also keeps its original
+parent size. TP1/2/4 round to 96/48/24 MLA pages per parent plane instead of
+89/45/23; each MLA page retains its exact byte stride. Existing non-buffered
+layouts are unchanged. Initial 16-token packing exceeded TP4's padding budget;
+an eight-token attempt then exposed a whole-plane divisibility constraint.
+The final planner accounts for both, without relaxing the padding limit.
+
+The logical K/U/decay payload at TP8, 69 KDA layers and L=64 is still 77.625 MiB
+per live request per rank. Stamps add 34.5 KiB before packing. These are payload
+sizes, not peak serving memory: the planner also reserves state lag, candidates,
+overlap and rounded blocks. Existing verify-workspace budgeting remains in
+place; the final buffered-forward workspace and commit descriptors are pending.
+
+One planner example: TP8, B=1, T=4, L=64, 4096-token capacity and overlap depth
+zero needs 24 usable parents, or 506.25 MiB including the null parent. The
+non-buffered plan needs 15 usable parents, or 324 MiB. This bound includes the
+additional state-lag reservation and rounded history storage, not just payload.
+It is a reproducible planning result, not a measured serving-memory comparison.
+
+Validation used one GB300 in the existing persistent allocation, the cached
+container and read-only serving venv. Python 3.12.3, PyTorch 2.13.0+cu130,
+CUDA 13.0, driver 580.167.08, tokenspeed-triton 3.8.10.post20260906 and pytest
+9.1.1. No target/draft weights were loaded. The scheduler extension is the
+unchanged M4 build, staged separately; there are no C++ edits in M5.
+
+- Cache/runtime/scheduler regression selection: **501 passed, 317 subtests**,
+  28 dependency warnings, 19.57 seconds. The nine new cases cover TP1/2/4/8/16,
+  L=8/37/64, T=1/4, budget inversion, unchanged prefill independence, actual
+  arena aliasing/zeroing, PP/draft windows, fences, invalid layouts and the
+  serving guard. Existing Kimi, GDN/Qwen, GLM, PD, pool and router checks pass.
+- Buffered reference/GPU selection: **34 passed**, 15 dependency warnings,
+  7.18 seconds. Seven new cases check strided paged metadata, 64 reordered
+  rounds, eager/CUDA graphs, idle/padding, acceptance, flush and invalid stores.
+  An initial test pattern did not produce zero acceptance at a flush; the test
+  now forces that case. Recurrence tolerances and kernels are unchanged.
+- Complete unchanged C++ scheduler binary: **487 passed, 134 suites**.
+
+These durations describe test execution, not a performance comparison. M1's
+serial recurrence regression is unresolved. No M5 serving throughput, TP8
+real-weight accuracy, AIME score or NSYS result is claimed. Full commands,
+planner estimates, environment, source patch and logs are retained in ignored
+`outputs/kda-buffered-replay/m5/`; repository-hook and final-source results will
+be recorded with the source commit.
+
+Next: integrate paged recurrence and shared runtime position refresh, then
+materialization/publication ordering and ordinary/speculative commit. Capacity
+CLI/defaults and real-model validation remain gated on that work.
