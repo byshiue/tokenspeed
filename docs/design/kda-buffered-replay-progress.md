@@ -37,7 +37,7 @@ against the frozen baseline before the work meets its completion gate.
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Live endpoint materialization and handoff still pending |
-| C. Unified GPU forward and commit | M10 composes conv/candidate capture, gate GEMM, recurrence and conv/stamp commit in one experimental workspace | Endpoint materialization and serving dispatch remain pending; recurrence not registered |
+| C. Unified GPU forward and commit | M11 adds accepted-endpoint materialization to the M10 workspace | Scheduler handoff, failure feedback and serving dispatch remain pending; recurrence not registered |
 | D. Graphs, overlap and lifecycle integration | M10 isolated producer-stream pipeline tests pass in eager/graph; serving integration pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
@@ -925,3 +925,95 @@ cases plus 317 subtests** (28 warnings, 34.43s). The last suite includes the
 pipeline cases. The exact `pre-commit run --all-files` command passed after
 formatting. Final tests also verify stable pointers by rereading the workspace
 attributes, so retaining old tensor references cannot hide a rebound buffer.
+
+### M11: accepted-endpoint materialization
+
+Source: based on `d8014a642ad829c4648d2df8550ab67e3bb85f0f` (M10 record);
+source commit will be recorded after final checks. No serving or real-model
+result yet.
+
+The workspace now makes its endpoint decision after acceptance. It selects
+an aligned accepted endpoint, or a caller-supplied GPU handoff mask, only when
+the existing checkpoint still lags. Capacity flush and endpoint materialization
+remain distinct: the former writes only old accepted history before this
+round's candidates; the latter can include this round's accepted prefix.
+One cross-layer kernel performs the selected endpoint writes. It reuses the
+same FP32 tiled reconstruction as forward, extracted without changing its
+arithmetic or tuning. Conv windows and endpoint state complete before the
+group stamp commits record the resulting checkpoint. Invalid acceptance
+suppresses all commit stores; a zero-acceptance handoff can still advance the
+checkpoint over old committed history.
+
+Stable descriptors name the pool's state/K/U/D fields and raw tables. Their
+bytes and per-group endpoint flags are included in workspace budgeting. The
+handoff mask is an explicit caller-owned input, like acceptance, not a hidden
+per-request state map. Prefix alignment comes from the arena's identity grain;
+the state group's span is used only for addressing. Published snapshots remain
+read-only, and destinations must be request-writable.
+
+Initial GPU validation passed **19 cache/runtime cases** (22 warnings, 39.92s)
+on the same persistent GB300 allocation and software environment as M10, no
+weights. The existing six pipeline combinations now cover aligned endpoint
+writes, forced unaligned handoff, zero acceptance, mixed capacity-flush and
+endpoint decisions, eager/graph, and exact conv/recurrent endpoint state against
+the CPU reference. They keep copies of aligned snapshots and require later
+decode not to modify them. Tolerances are unchanged. A final assertion also
+checks that invalid acceptance cannot partially commit state or stamps.
+
+This completes the experimental GPU operation, not its serving lifecycle.
+Scheduler-triggered handoff, failure feedback, prefill seeding and external
+completion/provenance still gate dispatch. Original Eagle3 no-regression,
+real NVFP4 TP8, AIME 2026 and short NSYS requirements remain unchanged.
+
+Four additional GPU cases cover width one/four and eager/graph with an implicit
+zero initial state, state span 8 versus prefix identity 16, forced zero-count
+handoff, completed capacity flush and padding. Rejected K/U/decay entries are
+poisoned with NaNs before materialization. A direct CPU affine reconstruction
+checks every state element, including untouched blocks. This catches using
+state alignment as prefix identity or reading beyond the accepted endpoint.
+
+The first endpoint launch grid scheduled every layer/head/value tile even on
+empty rounds. It now uses a startup-fixed persistent grid, bounded to twice
+the device's SM count, with a live-flag check before striding over tiles. This
+keeps the eager/graph operation sequence unchanged and needs no host decision.
+The edge-case fixture caps the grid at eight programs to exercise multiple
+tiles per program. Only launch scheduling changed, not arithmetic or tolerances.
+
+Final GPU checks passed **76 reference/kernel cases** (15 warnings, 130.91s)
+and **511 runtime cases plus 317 subtests** (28 warnings, 27.99s). The latter
+includes the 19 cache/pipeline cases; their separate persistent-grid rerun
+passed in 21.65s. An earlier recurrence-suite run failed because its new flag
+variable reused the CPU oracle's `materialized` name. Renaming the flag fixed
+the fixture without changing the kernel or tolerance.
+
+Same-GPU isolated commit medians, in microseconds across 69 layers, T=4/L=37,
+18 old history entries and four accepted inputs:
+
+| Commit operation | Batch 1 | Batch 8 |
+| --- | ---: | ---: |
+| M10 conv/stamp commit control | 7.15 | 16.95 |
+| M11, no endpoint required | 11.68 | 22.16 |
+| M11, every endpoint forced | 113.91 | 803.91 |
+
+Before the persistent-grid change, empty-round M11 timings were 14.98/44.31 us.
+The new protocol still adds about 4.5/5.2 us to the M10 commit control, and
+full-batch materialization is expensive. These synthetic, fixed-address
+measurements exclude forward, gates, table refresh and model work; M10 is a
+prototype control, **not original Eagle3**. Raw samples and the earlier grid's
+results are retained in the local runbook. The complete real-model path must
+include this cost in its no-regression comparison; no serving speedup or
+default capacity is established here.
+
+The four-launch native recurrence timer also compares exact archived M10 code
+against the shared-helper version: 48 matching cases have current/M10 ratios
+of 0.9701–1.0449. The T=4/L=8 flush case is 11.197/11.208 us at batch one and
+13.907/13.634 us at batch eight (M10/current). This includes position prepare,
+backing validation, recurrence and stamp commit, not the new endpoint protocol.
+The range does not justify a blanket no-regression claim.
+
+All timings use five samples of 50 graph replays, 32 calls per graph after
+warmup, without a profiler. At context 65,536, batch four and width four, M11
+adds 3,324 bytes per TP8 rank to M10's tensor workspace: **11,211,752 bytes**
+total, excluding LCM fields, the caller-owned handoff mask and CUDA stream/event
+overhead. Exact source, environment, commands and hashes are retained with the
+milestone artifacts.

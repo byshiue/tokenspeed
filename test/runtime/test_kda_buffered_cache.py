@@ -298,6 +298,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
     length = torch.empty_like(end)
     flush = torch.empty(1, dtype=torch.bool, device="cuda")
     ok = torch.empty_like(flush)
+    materialized = torch.zeros_like(flush)
     prepare_positions(
         replay.checkpoint,
         table,
@@ -378,7 +379,16 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         replay.correction[1, 3], correction, atol=2e-5, rtol=2e-4
     )
     commit_positions(
-        (replay.checkpoint,), table, end, width, width, checkpoint, length, flush, ok
+        (replay.checkpoint,),
+        table,
+        end,
+        width,
+        width,
+        checkpoint,
+        length,
+        flush,
+        ok,
+        materialized,
     )
     assert replay.checkpoint[1, 3] == 4 and ok.item()
     # Continue through a history-block boundary and a capacity flush using
@@ -467,6 +477,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             length,
             flush,
             ok,
+            materialized,
         )
         end.add_(1)
     assert saw_flush
@@ -508,13 +519,14 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
         pool.zero_new_blocks({gid: list(range(history_start, history_start + 6))})
     seq_lens = torch.zeros(5, dtype=torch.int32, device="cuda")
     accepted = torch.zeros_like(seq_lens)
+    materialized = torch.zeros_like(metadata.ok)
     metadata.refresh(2, 0, seq_lens, tables)
 
     def run(bs, live):
         metadata.prepare(bs)
         # There are no numerical payloads in this metadata-only fixture.
         # Serving must put all layer stores between these two operations.
-        metadata.commit(bs, accepted[:live])
+        metadata.commit(bs, accepted[:live], materialized)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -589,7 +601,7 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
     # is needed by the group commit. Invalid live counts suppress their stamps.
     accepted[:2].fill_(width + 1)
     before = {gid: stamps[0].clone() for gid, stamps in metadata._stamps.items()}
-    metadata.commit(2, accepted[:2])
+    metadata.commit(2, accepted[:2], materialized)
     for gid, stamps in metadata._stamps.items():
         assert not metadata._batch(2)[gid].ok.any()
         for stamp in stamps:
@@ -732,6 +744,7 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
     )
     seq_lens = torch.zeros(batch, dtype=torch.int32, device="cuda")
     accepted = torch.zeros_like(seq_lens)
+    force = torch.zeros_like(seq_lens, dtype=torch.bool)
     rejected = torch.zeros((1, batch, width, 1), dtype=torch.bool, device="cuda")
     meta.refresh(batch, 0, seq_lens, tables)
 
@@ -752,7 +765,11 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             )
             outputs[index].copy_(output)  # Consume shared scratch before next layer.
         workspace.payload.masked_fill_(rejected, float("nan"))
-        workspace.commit(batch, accepted if captured else accepted[:requests])
+        workspace.commit(
+            batch,
+            accepted if captured else accepted[:requests],
+            force if captured else force[:requests],
+        )
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -772,6 +789,8 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
     )
     pointers = [t.data_ptr() for t in buffers]
     saw_flush = saw_no_flush = saw_zero_accept_flush = saw_split_state_slots = False
+    saw_endpoint = saw_zero_accept_endpoint = saw_aligned_endpoint = False
+    published = {}
     for step in range(32):
         order = [step % 2, (step + 1) % 2]
         counts = [(step + row) % (width + 1) for row in range(requests)]
@@ -780,6 +799,19 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             for row, flag in enumerate(flags):
                 if flag:
                     counts[row] = 0
+        forced = [step > 15 and step % 11 == 9, False]
+        if step > 15 and not saw_zero_accept_endpoint:
+            for row, req in enumerate(order):
+                if ends[req] > checkpoints[req] and not flags[row]:
+                    counts[row], forced[row] = 0, True
+                    break
+        endpoint_flags = [
+            (forced[row] or (ends[req] + counts[row]) % 128 == 0)
+            and ends[req] + counts[row]
+            > (ends[req] if flags[row] else checkpoints[req])
+            for row, req in enumerate(order)
+        ]
+        force.copy_(torch.tensor(forced + [True]))  # Padding cannot request a write.
         seq_lens.copy_(torch.tensor([ends[req] + width for req in order] + [2**31 - 1]))
         accepted.copy_(torch.tensor(counts + [0]))
         rejected.copy_(
@@ -857,6 +889,11 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             rtol=2e-4 + torch.finfo(torch.bfloat16).eps / 2,
         )
         assert meta.ok.all() and meta.flushed.tolist() == [flags + [False]] * 2
+        assert workspace.materialized[:, :requests].tolist() == [endpoint_flags] * 2
+        for (layer, block), (saved_conv, saved_state) in published.items():
+            conv, state = pool.get_state_buffers(layer)
+            torch.testing.assert_close(conv[block], saved_conv, atol=0, rtol=0)
+            torch.testing.assert_close(state[block], saved_state, atol=0, rtol=0)
         for index, layer in enumerate(layers):
             history = pool.get_replay_buffers(layer)
             conv, state = pool.get_state_buffers(layer)
@@ -869,7 +906,9 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
                 )
                 state_table = tables_cpu[history.checkpoint_group_id][req]
                 saw_split_state_slots |= (c - 1) // 128 != (e - 1) // 128
-                if flushed:
+                if flushed and (
+                    not endpoint_flags[row] or (e - 1) // 128 != (e + count - 1) // 128
+                ):
                     torch.testing.assert_close(
                         state[state_table[(e - 1) // 128]].cpu(),
                         previous[index, req],
@@ -881,6 +920,11 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
                         (windows[index, req], raw_cpu[index, row, :count].T), dim=-1
                     )[:, -3:]
                 new_end, new_c = e + count, e if flushed else c
+                if endpoint_flags[row]:
+                    new_c = new_end
+                    saw_endpoint = True
+                    saw_zero_accept_endpoint |= count == 0
+                    saw_aligned_endpoint |= new_end % 128 == 0
                 torch.testing.assert_close(
                     conv[state_table[(new_end - 1) // 128]].cpu(),
                     windows[index, req],
@@ -904,6 +948,12 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
                 torch.testing.assert_close(
                     reconstructed, states[index, req], atol=2e-5, rtol=2e-4
                 )
+                if new_end % 128 == 0:
+                    block = int(state_table[(new_end - 1) // 128])
+                    published[layer, block] = (
+                        conv[block].clone(),
+                        state[block].clone(),
+                    )
         for row, req in enumerate(order):
             if flags[row]:
                 checkpoints[req] = ends[req]
@@ -912,6 +962,8 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             else:
                 saw_no_flush = True
             ends[req] += counts[row]
+            if endpoint_flags[row]:
+                checkpoints[req] = ends[req]
         assert [
             t.data_ptr()
             for t in (
@@ -923,5 +975,31 @@ def test_buffered_workspace_forward_commit_and_budget(width, capacity, captured)
             )
         ] == pointers
     assert saw_flush and saw_no_flush and saw_zero_accept_flush
+    assert saw_endpoint and saw_aligned_endpoint
+    if capacity > 2 * width:
+        assert saw_zero_accept_endpoint
     if capacity == 37:
         assert saw_split_state_slots
+    # Acceptance is validated before conv, endpoint or stamp commits. Rejecting
+    # the count must not partially materialize any layer, even with handoff set.
+    before = [
+        tuple(
+            t.clone()
+            for t in (
+                *pool.get_state_buffers(layer),
+                pool.get_replay_buffers(layer).checkpoint,
+            )
+        )
+        for layer in layers
+    ]
+    accepted.fill_(width + 1)
+    force.fill_(True)
+    workspace.commit(batch, accepted, force)
+    assert not meta.ok.any()
+    for layer, saved in zip(layers, before, strict=True):
+        for current, old in zip(
+            (*pool.get_state_buffers(layer), pool.get_replay_buffers(layer).checkpoint),
+            saved,
+            strict=True,
+        ):
+            torch.testing.assert_close(current, old, atol=0, rtol=0, equal_nan=True)

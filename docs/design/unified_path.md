@@ -515,14 +515,28 @@ candidates per local layer but shares conv/gate/output scratch across layers.
 Each layer must consume its output before the following layer reuses it.
 These are per-round tensors, not private persistent request state.
 
-After all local layer forwards finish, one GPU launch commits accepted conv
-windows across layers, followed by the shared group stamp commits. It handles
+After all local layer forwards finish, acceptance preparation selects endpoint
+materialization at aligned accepted endpoints or an explicit GPU handoff mask.
+It validates counts before any commit stores. One GPU launch commits accepted
+conv windows across layers; another materializes the selected recurrent
+endpoints, followed by the shared group stamp commits. It handles
 width one and verify identically; rejected candidates do not enter the conv
 window. The recipe reserves candidates, shared scratch, descriptors and raw
 table/position buffers at full runtime batch capacity before sizing the arena.
 The workspace reports the same tensor-byte total, excluding LCM fields and
 CUDA stream/event implementation overhead. Binding a different pool requires
 a new workspace and recapture; old descriptors must not survive it.
+
+Endpoint materialization shares the forward's FP32 history reconstruction.
+After a capacity flush its source is `S_e`; otherwise it starts from `S_c`.
+It consumes only accepted rows through `e+a`, never rejected candidates. A
+zero-acceptance handoff may still need to materialize old committed history.
+No additional state store is needed when the source is already exact. The
+per-group `materialized` flag records a required write, not its completion;
+stamp commit may consume it only after all layer stores finish. The caller's
+handoff mask grants neither writable ownership nor publication provenance.
+The runtime still needs to connect this operation to scheduler handoff and
+failure feedback before buffered serving is enabled.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes

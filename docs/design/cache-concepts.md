@@ -439,6 +439,16 @@ or transfer until recurrent endpoint materialization completes. Committing a
 conv window or stamp alone does not change that rule. Published snapshots
 remain immutable, and all destinations must be request-writable.
 
+An experimental batched endpoint writer now reconstructs the accepted state
+using the same FP32 history operation as forward. A post-acceptance decision
+selects the actual aligned endpoint, not every boundary crossed by a verify
+window, or a caller's explicit handoff mask. Prefix identity uses the arena's
+`prefix_granularity`; state addressing still uses the state group's span.
+The writer starts from the capacity-flushed state when present and stops at
+`e+a`. A following group stamp commit records that exact endpoint. GPU flags
+describe this ordered work; they do not publish a scheduler result or authorize
+reuse, transfer or reclamation. Those owner-level transitions remain gated.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables

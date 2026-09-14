@@ -100,6 +100,7 @@ def _commit_positions(
     CHECKPOINT,
     FLUSH,
     OK,
+    MATERIALIZED,
     B: tl.constexpr,
     COLUMNS: tl.constexpr,
     PAGES: tl.constexpr,
@@ -116,9 +117,10 @@ def _commit_positions(
     accepted = tl.load(ACCEPTED + row, live, 0)
     checkpoint = tl.load(CHECKPOINT + row, live, 0)
     flush = tl.load(FLUSH + row, live, False)
+    materialized = tl.load(MATERIALIZED + row, live, False)
     ok = tl.load(OK + row, live, False) & (accepted >= 0) & (accepted <= width)
     # Zero acceptance still advances c after a flush of old accepted history.
-    write = live & ok & (width > 0) & ((accepted > 0) | flush)
+    write = live & ok & (width > 0) & ((accepted > 0) | flush | materialized)
     token = end + accepted - 1
     column = token // ROWS
     in_table = write & (token >= 0) & (column < COLUMNS)
@@ -131,7 +133,8 @@ def _commit_positions(
     for layer in tl.static_range(len(STAMPS)):
         tl.store(
             STAMPS[layer] + page * PAGE_STRIDE + (token % ROWS) * ROW_STRIDE,
-            tl.where(flush, end, checkpoint) + 1,
+            tl.where(materialized, end + accepted, tl.where(flush, end, checkpoint))
+            + 1,
             write & backed,
         )
     tl.store(OK + row, ok, live)
@@ -240,7 +243,16 @@ def prepare_positions(
 
 
 def commit_positions(
-    stamps, block_table, end, width, accepted, checkpoint, length, flush, ok
+    stamps,
+    block_table,
+    end,
+    width,
+    accepted,
+    checkpoint,
+    length,
+    flush,
+    ok,
+    materialized,
 ):
     """Stamp all layers' last accepted input rows after data stores complete.
 
@@ -253,6 +265,9 @@ def commit_positions(
     A capacity flush must already have materialized state at e. With zero
     acceptance it restamps the previous committed row; otherwise only the last
     accepted row is stamped. Rejected candidates and idle rows are untouched.
+    materialized is an explicit bool [batch] flag: when true, endpoint state
+    at e+a must also have completed its stores, and that exact position is
+    stamped even with zero acceptance. It does not itself fence those stores.
 
     Returns None. Invalid acceptance or an unbacked destination clears the
     corresponding ok output and suppresses its store. The caller must consume
@@ -262,6 +277,15 @@ def commit_positions(
         raise ValueError("commit requires a nonempty tuple of group stamp fields")
     first = stamps[0]
     _validate_positions(first, block_table, end, width, checkpoint, length, flush, ok)
+    if (
+        materialized.shape != width.shape
+        or materialized.dtype != torch.bool
+        or materialized.device != first.device
+        or not materialized.is_contiguous()
+    ):
+        raise ValueError(
+            "materialized must be a contiguous bool batch vector on the same GPU"
+        )
     if any(
         t.shape != first.shape
         or t.stride() != first.stride()
@@ -292,6 +316,7 @@ def commit_positions(
             checkpoint,
             flush,
             ok,
+            materialized,
             batch,
             block_table.shape[1],
             first.shape[0],

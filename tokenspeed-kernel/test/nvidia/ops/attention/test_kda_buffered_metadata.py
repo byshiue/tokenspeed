@@ -55,6 +55,7 @@ def test_paged_positions_reordering_acceptance_and_graph(
     length = torch.empty_like(end)
     flush = torch.empty(batch, dtype=torch.bool, device="cuda")
     ok = torch.empty_like(flush)
+    materialized = torch.zeros_like(flush)
 
     def run():
         prepare_positions(
@@ -70,7 +71,16 @@ def test_paged_positions_reordering_acceptance_and_graph(
             max_window=max_window,
         )
         commit_positions(
-            (stamps,), table, end, width, accepted, checkpoint, length, flush, ok
+            (stamps,),
+            table,
+            end,
+            width,
+            accepted,
+            checkpoint,
+            length,
+            flush,
+            ok,
+            materialized,
         )
 
     stream = torch.cuda.Stream()
@@ -153,6 +163,7 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
     length = torch.empty(4, dtype=torch.int32, device="cuda")
     flush = torch.empty(4, dtype=torch.bool, device="cuda")
     ok = torch.empty_like(flush)
+    materialized = torch.zeros_like(flush)
     stamps[1, 4] = 999  # Checkpoint beyond the accepted endpoint is corrupt.
     initial = stamps.clone()
     prepare_positions(
@@ -169,7 +180,16 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
     )
     assert ok.tolist() == [False, True, True, True]
     commit_positions(
-        (stamps,), table, end, width, accepted, checkpoint, length, flush, ok
+        (stamps,),
+        table,
+        end,
+        width,
+        accepted,
+        checkpoint,
+        length,
+        flush,
+        ok,
+        materialized,
     )
     assert ok.tolist() == [False, False, False, True]
     initial[7, 5] = 6
@@ -204,5 +224,14 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
         )
     with pytest.raises(ValueError, match="accepted"):
         commit_positions(
-            (stamps,), table, end, width, accepted.long(), checkpoint, length, flush, ok
+            (stamps,),
+            table,
+            end,
+            width,
+            accepted.long(),
+            checkpoint,
+            length,
+            flush,
+            ok,
+            materialized,
         )

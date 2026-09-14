@@ -40,6 +40,10 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_conv import (
     commit_conv_windows,
     prepare_conv_blocks,
 )
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_endpoint import (
+    materialize_endpoints,
+    prepare_endpoint_commit,
+)
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
     commit_positions,
     prepare_positions,
@@ -298,7 +302,9 @@ class KDAReplayMetadata:
                 grain=self._state_grains[gid],
             )
 
-    def commit(self, bs: int, accepted: torch.Tensor) -> None:
+    def commit(
+        self, bs: int, accepted: torch.Tensor, materialized: torch.Tensor
+    ) -> None:
         """Commit live acceptance after all recurrent/conv stores have completed.
 
         ``accepted`` contains only live requests, including the target input.
@@ -308,7 +314,16 @@ class KDAReplayMetadata:
         live = accepted.numel()
         if live > bs:
             raise ValueError("acceptance exceeds the prepared batch")
-        for gid, view in self._batch(bs).items():
+        if (
+            materialized.shape != self.ok.shape
+            or materialized.dtype != torch.bool
+            or materialized.device != self.ok.device
+            or not materialized.is_contiguous()
+        ):
+            raise ValueError(
+                "materialization flags must match the group/runtime batch geometry"
+            )
+        for index, (gid, view) in enumerate(self._batch(bs).items()):
             commit_positions(
                 self._stamps[gid],
                 view.history_table[:live],
@@ -319,6 +334,7 @@ class KDAReplayMetadata:
                 view.length[:live],
                 view.flushed[:live],
                 view.ok[:live],
+                materialized[index, :live],
             )
 
 
@@ -364,9 +380,34 @@ class KDAReplayWorkspace:
                     "buffered workspace requires uniform local layer geometry"
                 )
         self._conv_strides = conv.stride()
+        if len(set(self.metadata._state_grains.values())) != 1:
+            raise ValueError(
+                "batched endpoint materialization requires one state block span"
+            )
+        self._state_strides = recurrent.stride()
+        first_history = self._history[self.layer_ids[0]]
+        self._history_strides = tuple(
+            t.stride()
+            for t in (first_history.key, first_history.correction, first_history.decay)
+        )
+        if any(
+            self._state[layer][1].stride() != self._state_strides
+            or tuple(
+                t.stride() for t in (history.key, history.correction, history.decay)
+            )
+            != self._history_strides
+            for layer, history in self._history.items()
+        ):
+            raise ValueError(
+                "batched endpoint materialization requires uniform field strides"
+            )
+        self._prefix_granularity = pool.arena.prefix_granularity
         layout = self.metadata.layout
         common = (max_bs, layout.max_window)
         device = conv.device
+        self._max_materialize_programs = (
+            2 * torch.cuda.get_device_properties(device).multi_processor_count
+        )
         self.payload = torch.empty(
             (len(self.layer_ids), *common, self.channels),
             dtype=torch.bfloat16,
@@ -392,6 +433,22 @@ class KDAReplayWorkspace:
             dtype=torch.int32,
             device=device,
         )
+        self.materialized = torch.zeros_like(self.metadata.ok)
+        self.endpoint_descriptors = torch.tensor(
+            [
+                [
+                    self._state[layer][1].data_ptr(),
+                    history.key.data_ptr(),
+                    history.correction.data_ptr(),
+                    history.decay.data_ptr(),
+                    self.metadata.layer(layer, max_bs).history_table.data_ptr(),
+                    self.metadata.layer(layer, max_bs).state_table.data_ptr(),
+                ]
+                for layer, history in self._history.items()
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
         self._producer_stream = torch.cuda.Stream(device=device, priority=-1)
         self._forks = {
             layer: StreamFork(self._producer_stream) for layer in self.layer_ids
@@ -411,6 +468,8 @@ class KDAReplayWorkspace:
                 self.output,
                 self.conv_ptrs,
                 self.group_indices,
+                self.materialized,
+                self.endpoint_descriptors,
                 meta.tables.tables,
                 meta.tables.decode_locs,
                 meta.tables.page_sizes,
@@ -527,15 +586,32 @@ class KDAReplayWorkspace:
         )
         return out
 
-    def commit(self, bs: int, accepted: torch.Tensor) -> None:
-        """Commit accepted conv windows, then every local layer's replay stamp.
+    def commit(
+        self, bs: int, accepted: torch.Tensor, force_materialize: torch.Tensor
+    ) -> None:
+        """Commit accepted conv windows and required endpoints before group stamps.
 
         Call only after all local layer forwards complete, with live accepted
-        input counts (no added token). This does not materialize an endpoint
-        for external consumers or grant snapshot publication provenance.
+        input counts (no added token). force_materialize is a caller-owned bool
+        live-batch GPU handoff mask. Aligned accepted endpoints are automatic.
+        Completion/publication and handoff scheduling still belong to the owner;
+        launching materialization alone does not establish those obligations.
         """
         if accepted.numel() > bs or bs > self.metadata.max_bs:
             raise ValueError("acceptance or batch exceeds prepared capacity")
+        live = accepted.numel()
+        for index, view in enumerate(self.metadata._batch(bs).values()):
+            prepare_endpoint_commit(
+                view.end[:live],
+                view.width[:live],
+                accepted,
+                view.checkpoint[:live],
+                view.flushed[:live],
+                view.ok[:live],
+                force_materialize,
+                self.materialized[index, :live],
+                prefix_granularity=self._prefix_granularity,
+            )
         commit_conv_windows(
             self.payload,
             self.conv_ptrs,
@@ -547,4 +623,25 @@ class KDAReplayWorkspace:
             accepted,
             conv_strides=self._conv_strides,
         )
-        self.metadata.commit(bs, accepted)
+        materialize_endpoints(
+            self.endpoint_descriptors,
+            self.group_indices,
+            self.metadata.end,
+            accepted,
+            self.metadata.checkpoint,
+            self.metadata.flushed,
+            self.metadata.ok,
+            self.materialized,
+            heads=self.heads,
+            key_dim=self.key_dim,
+            value_dim=self.value_dim,
+            history_block_tokens=self.metadata.layout.block_tokens,
+            state_block_tokens=next(iter(self.metadata._state_grains.values())),
+            table_stride=self.metadata.tables.tables.stride(1),
+            state_strides=self._state_strides,
+            key_strides=self._history_strides[0],
+            correction_strides=self._history_strides[1],
+            decay_strides=self._history_strides[2],
+            max_programs=self._max_materialize_programs,
+        )
+        self.metadata.commit(bs, accepted, self.materialized)

@@ -149,6 +149,7 @@ def test_buffered_rounds_and_graph_match_sequential(
     cp = torch.empty(batch, dtype=torch.int64, device="cuda")
     flush = torch.empty(batch, dtype=torch.bool, device="cuda")
     ok = torch.empty_like(flush)
+    endpoint_materialized = torch.zeros_like(flush)
 
     def run():
         prepare_positions(
@@ -205,7 +206,18 @@ def test_buffered_rounds_and_graph_match_sequential(
             dt_bias=dt_bias if native else None,
             lower_bound=lower_bound,
         )
-        commit_positions((stamps,), ht, end, valid, accepted, cp, length, flush, ok)
+        commit_positions(
+            (stamps,),
+            ht,
+            end,
+            valid,
+            accepted,
+            cp,
+            length,
+            flush,
+            ok,
+            endpoint_materialized,
+        )
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())

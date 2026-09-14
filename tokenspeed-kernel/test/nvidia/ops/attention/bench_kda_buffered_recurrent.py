@@ -171,6 +171,7 @@ def main():
                     length = torch.empty_like(endpoint)
                     flushed = torch.empty(batch, dtype=torch.bool, device="cuda")
                     ok = torch.empty_like(flushed)
+                    materialized = torch.zeros_like(flushed)
                     out = torch.empty_like(v)
 
                     def buffered():
@@ -238,6 +239,7 @@ def main():
                             length,
                             flushed,
                             ok,
+                            materialized,
                         )
 
                     timing = measure(buffered)

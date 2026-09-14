@@ -15,6 +15,8 @@ serving dispatch、端点物化与完整提交顺序仍待接入。M9 新增按 
 M10 将 conv producer、raw candidate capture、gate GEMM、recurrent 和跨层 conv
 commit 接入同一个实验工作区，并核对实际分配与 recipe 预算。端点物化、生命周期
 交付及完整模型验收仍未完成，不能据此启用 serving。
+M11 增加 acceptance 之后的跨层 endpoint 物化，复用 forward 的 FP32 历史重建；
+精确 endpoint 的 GPU 写回已有实验实现，scheduler 触发、交付完成与失败反馈仍待接入。
 
 ## 1. 目标与范围
 
