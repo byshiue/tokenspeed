@@ -17,24 +17,55 @@ The backend prepares stable capacity metadata before capture and refreshes
 live boundaries, convolution maps and state-page indices once before replay.
 The merged capture accepts any positive live length within its token bucket,
 with the same request count used at capture. The original outer graph remains
-available for mixed batches and other request counts. Layerwise PD transfer
+available for mixed batches and uncaptured request counts. Layerwise PD transfer
 and data parallelism retain that original route.
 
-An additional merged capture handles internal checkpoints. It records the
-same body scan, checkpoint write and tail scan as eager prefill. Both scans
-use stable token-index buffers; negative entries denote padding. The body
-reserves the outer bucket's capacity. Each checkpointed request contributes
-at most `prefix_granularity - 1` tail tokens, so the packed tail capacity is
-bounded separately. Replay refreshes both scans' live boundaries and indices,
-along with the scheduler's checkpoint page IDs, once before the first layer.
-The captured request count and checkpoint-row count must match the live batch;
-row identities, lengths and page IDs may change. Startup seeds all captured
-request slots with a checkpoint using only placeholder state pages. Other
-checkpoint-row counts use the ordinary attention break.
+Each merged capture reserves one checkpoint/tail slot per request and records
+the same body scan, checkpoint write and tail scan used by eager prefill.
+The graph key is just `(token bucket, request count)`: changing the number or
+identity of checkpointed requests refreshes metadata, not the graph.
+The body reserves the outer bucket's capacity. Tail storage reserves
+`min(bucket, BS * max(1, prefix_granularity - 1))` tokens.
+
+A request without an internal checkpoint runs entirely in the body. Its tail
+slot contains one zero-input dummy token, keeping every native scan sequence
+positive-length. Negative token indices suppress that slot's output, negative
+checkpoint destinations suppress cache writes, and a negative state-update
+row preserves the body's final state. Dummy scan results are discarded, not
+assumed to be identity updates. This leaves native scan/GEMM arithmetic intact.
+The tradeoff is a fixed tail launch even when no request has a checkpoint.
+
+Replay refreshes both scans' boundaries and token maps, state-update rows and
+scheduler-owned checkpoint page IDs once before the first layer. The metadata
+refresh does not allocate request state or modify the scheduler's source
+metadata. Startup uses only placeholder state pages.
+
+`--prefill-graph-capture-batch-sizes 1 2` captures exact request counts one
+and two. It is independent of the decode batch ladder. The token capacities
+still come from `--prefill-graph-capture-sizes`. When the request-count option
+is unset, each token bucket uses the minimum number of requests needed to fit
+within the model context. Capture balances tokens across those requests;
+it never inserts empty sequences. A configured count that cannot fill a
+particular token bucket within the context limit is skipped for that bucket.
+
+For example, two extends of 868 and 869 tokens with aligned cached prefixes
+use the 2048-token, two-request capture. Their bodies contain
+768 tokens each and their tails contain 100 and 101 tokens. The body reserves
+2048 tokens; the packed tail reserves at most 254 at prefix granularity 128.
+No-tail, one-tail and two-tail batches all reuse this capture, including when
+the checkpoint moves between request rows.
+
+Request-count coverage is opt-in because it multiplies startup work.
+Configuring 1 and 2 creates two inline variants per token bucket, in addition
+to the ordinary graph. With eight token buckets this is 16 inline variants,
+down from 40 with exact checkpoint-count variants. Shared pools reuse scratch,
+but retained metadata and
+graph objects still cost memory; bucket count alone does not bound that cost.
 
 All capture variants belong to the outer graph owner and share its pool;
 they are never replayed concurrently. This adds capture work and retained
-metadata. Its memory cost and full-model speedup have not yet been measured.
+metadata. The added cost relative to single-request capture and the full-model
+speedup still need controlled measurements.
 
 ### Separate KDA graphs for the original outer capture
 
@@ -127,6 +158,33 @@ two-request test moves the checkpoint between request rows. Each replay must
 match eager token outputs and the entire convolution/recurrent state pools
 bit-for-bit, with zero output padding. Padded pack/scatter tests also cover
 strided scan outputs and both KDA and GDN token-axis conventions.
+
+Multi-request regressions exercise startup capture and selection for configured
+request counts, balanced placeholder batches, and zero, some or all requests
+with checkpoints. Native KDA tests compare valid outputs and whole state pools
+against eager for request counts 1, 2 and 4, including the 868+869 example.
+These are operator and graph-owner checks, not an AIME accuracy result.
+
+A full-model correctness check used real 93-layer Kimi-K3 NVFP4 weights,
+TP8 on eight Blackwell GPUs, CuTeDSL KDA, BF16 computation, FP8 KV cache and
+overlap. Paired inputs were constructed from a frozen SWE-smith trajectory:
+both requests shared 50,304 cached tokens, followed by extends of 868/869,
+868/768 or 768/896 tokens. Each request generated eight tokens.
+Two ordinary-graph passes, three merged-graph passes and two eager passes
+produced identical output tokens for all 42 generated sequences. Actual replay
+records on all eight ranks verified the two-request, two/one/zero-checkpoint
+variants; HTTP request count alone was not used as evidence of batching.
+
+A further 16-sequence cold/warm check consumed the internal checkpoints from
+the 868/869 pair. Both requests then hit 51,072 cached tokens and extended only
+100/101 tokens. Outputs matched between cold and warm and between ordinary and
+merged graphs, including repeats. All-rank records verified the warm
+two-request, zero-checkpoint replay in the 256-token bucket.
+
+The paired requests were queued through the existing admission gate and
+released together to make batch size two reproducible. These runs used local
+path auditing, without NSYS. They establish correctness for the tested inputs,
+not benchmark latency, general batch-invariant generation or an AIME score.
 
 The following larger validation runs were performed on the earlier separate
 subgraphs:

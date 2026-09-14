@@ -401,6 +401,7 @@ class DummyGroupTablesTest(unittest.TestCase):
         context_len,
         physical,
         specs,
+        capture_bs,
         arena_blocks=64,
     ):
         """Drive make_dummy_batch to the backend hand-off and record it.
@@ -466,7 +467,10 @@ class DummyGroupTablesTest(unittest.TestCase):
             seen["max_prefix"] = int(pg.input_buffers.extend_prefix_lens_cpu.max())
 
         pg.attn_backend.init_forward_metadata = _record
-        ctx = pg.make_dummy_batch(num_tokens)
+        ctx = pg.make_dummy_batch(
+            num_tokens,
+            -(-num_tokens // context_len) if capture_bs is None else capture_bs,
+        )
         self.assertIs(ctx.attn_backend, pg.attn_backend)
         self.assertIs(ctx.token_to_kv_pool, pg.token_to_kv_pool)
         return seen
@@ -477,7 +481,11 @@ class DummyGroupTablesTest(unittest.TestCase):
         # 2048 tokens over a 960 context is three fabricated requests, so a
         # rule that collapsed rows to one would be visible here.
         seen = self._dummy_batch_probe(
-            num_tokens=2048, context_len=960, physical=1024, specs=(spec,)
+            num_tokens=2048,
+            context_len=960,
+            physical=1024,
+            specs=(spec,),
+            capture_bs=None,
         )
         tables = seen["block_tables"]
         table = tables["full_attention"]
@@ -494,6 +502,28 @@ class DummyGroupTablesTest(unittest.TestCase):
         self.assertEqual(table.device.type, "cpu")
         self.assertEqual(seen["max_prefix"], 0, "capture fabricates no prefix")
 
+    def test_explicit_request_count_uses_balanced_nonempty_placeholder_rows(self):
+        spec = _spec("full_attention", block_granularity=64)
+        seen = self._dummy_batch_probe(
+            num_tokens=1737,
+            context_len=2048,
+            physical=2048,
+            specs=(spec,),
+            capture_bs=2,
+        )
+        self.assertEqual(seen["extend_seq_lens_cpu"].tolist(), [869, 868])
+        self.assertEqual(seen["block_tables"]["full_attention"].shape[0], 2)
+        for tokens, bs in [(1, 2), (1737, 0), (1737, 17), (4096, 1)]:
+            with self.subTest(tokens=tokens, bs=bs):
+                with self.assertRaisesRegex(ValueError, "token/context capacity"):
+                    self._dummy_batch_probe(
+                        num_tokens=tokens,
+                        context_len=2048,
+                        physical=2048,
+                        specs=(spec,),
+                        capture_bs=bs,
+                    )
+
     def test_real_active_page_backend_gets_positions_alongside_its_tables(self):
         """A backend that validates live-page geometry (V4) is told how many
         tokens the batch carries and handed the live positions slice, and it
@@ -505,6 +535,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=960,
             physical=1024,
             specs=(spec,),
+            capture_bs=None,
         )
         self.assertEqual(seen["num_tokens"], 128)
         self.assertEqual(seen["positions"].shape[0], 128)
@@ -521,6 +552,7 @@ class DummyGroupTablesTest(unittest.TestCase):
             context_len=960,
             physical=1024,
             specs=(spec,),
+            capture_bs=None,
             arena_blocks=2,
         )
         with self.assertRaises(ValueError) as caught:
@@ -529,6 +561,7 @@ class DummyGroupTablesTest(unittest.TestCase):
                 context_len=960,
                 physical=1024,
                 specs=(spec,),
+                capture_bs=None,
                 arena_blocks=2,
             )
         self.assertIn("page ID outside", str(caught.exception))

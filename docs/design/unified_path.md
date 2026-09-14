@@ -711,11 +711,25 @@ own live GPU boundaries and CPU mirror. Checkpoint writes retain the eager
 ordering: convolution snapshots precede convolution updates, and recurrent
 snapshots precede the tail scan. The graph binds scheduler-owned checkpoint
 destinations, not backend-owned cache pages. Replay requires the captured
-request and checkpoint-row counts; row identities and lengths can change.
-Other checkpoint topologies retain the ordinary attention break, whose
+request count, but checkpoint counts, row identities and lengths can change.
+The outer owner captures exact request counts from
+`prefill_graph_capture_batch_sizes` (unset: the minimum count per token bucket)
+with one variant per token bucket and request count. Token buckets still follow the shared
+prefill token ladder. Capture requests have positive lengths and fit the
+model context and request buffers; zero-length request padding is not admitted.
+Uncaptured request counts retain the ordinary attention break, whose
 separate-subgraph cache still rejects internal checkpoints. Replay refresh includes
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
 the convolution boundary and existing int64 mirror.
+
+Merged graphs reserve one tail slot per real request. An inactive slot has
+one zero-input dummy token, a negative output-token map, no checkpoint
+destination and a negative state-update row. Its scan result must never replace
+the body's final state. This padding is graph execution scratch, not a
+scheduler request or cache allocation. Native scans still see positive-length
+sequences; ordinary eager prefill retains compact tails and skips the second
+scan when there is no internal checkpoint. Both use the same checkpoint
+writers and recurrent-state scatter, which ignore negative destinations/rows.
 
 ### Separate subgraphs in the ordinary outer capture
 

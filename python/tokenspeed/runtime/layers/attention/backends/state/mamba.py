@@ -147,6 +147,11 @@ class _PrefillCheckpointBatch:
     def token_extent(self) -> int:
         return self.body_token_indices.numel() + self.tail_token_indices.numel()
 
+    @property
+    def state_update_rows(self) -> torch.Tensor:
+        """Tail destinations; negative rows denote graph-only inactive slots."""
+        return self.rows
+
 
 def _slice_prefill_recurrent_inputs(
     query: torch.Tensor,
@@ -1700,7 +1705,12 @@ class MambaAttnBackend(AttentionBackend):
             token_dim,
             checkpoint_batch.token_extent,
         )
-        body_state.index_copy_(0, checkpoint_batch.rows, tail_state)
+        write_prefill_recurrent_checkpoints(
+            tail_state,
+            body_state,
+            checkpoint_batch.body_rows,
+            checkpoint_batch.state_update_rows,
+        )
         return output, body_state
 
     def forward_decode(

@@ -78,6 +78,7 @@ _HEADLESS_FLAG = "--headless"
 _ENGINE_MULTI_VALUE_FLAGS = {
     "--cudagraph-capture-sizes",
     "--prefill-graph-capture-sizes",
+    "--prefill-graph-capture-batch-sizes",
 }
 
 

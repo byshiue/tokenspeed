@@ -79,6 +79,7 @@ def _write_prefill_conv_checkpoints_kernel(
     destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0).to(
         tl.int64
     )
+    position_live = position_live & (destination >= 0)
 
     relative_token = checkpoint_len - state_len + positions
     from_raw = relative_token >= 0
@@ -114,6 +115,12 @@ def _torch_write_prefill_conv_checkpoints(
     checkpoint_seq_lens: torch.Tensor,
 ) -> None:
     state_len = conv_states.shape[-1]
+    active = checkpoint_blocks.index_select(0, rows) >= 0
+    rows = rows[active]
+    sequence_starts = sequence_starts[active]
+    checkpoint_seq_lens = checkpoint_seq_lens[active]
+    if rows.numel() == 0:
+        return
     destinations = checkpoint_blocks.index_select(0, rows).to(torch.int64)
     state_in = state_in_blocks.index_select(0, rows)
     state_out = state_out_blocks.index_select(0, rows)
@@ -154,7 +161,8 @@ def write_prefill_conv_checkpoints(
         conv_states: State pool ``[pages, channels, state_len]``, updated in place.
         state_in_blocks: Per-request input state page ids.
         state_out_blocks: Per-request final output state page ids.
-        checkpoint_blocks: Per-request internal-checkpoint destination page ids.
+        checkpoint_blocks: Per-request internal-checkpoint destination page ids;
+            negative destinations skip both state reads and writes.
         rows: Request rows that own an internal checkpoint.
         sequence_starts: Token offset of each selected request in ``raw_inputs``.
         checkpoint_seq_lens: Request-local length of each selected checkpoint.
@@ -675,9 +683,11 @@ def _write_prefill_recurrent_checkpoints_kernel(
     feature = offsets % state_width
     live = (row < num_rows) & (feature < state_width)
     request_row = tl.load(rows + row, mask=live, other=0)
-    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=0).to(
+    live = live & (request_row >= 0)
+    destination = tl.load(checkpoint_blocks + request_row, mask=live, other=-1).to(
         tl.int64
     )
+    live = live & (destination >= 0)
     dim_1_index = feature // (state_dim_2 * state_dim_3)
     remainder = feature % (state_dim_2 * state_dim_3)
     dim_2_index = remainder // state_dim_3
@@ -709,8 +719,10 @@ def write_prefill_recurrent_checkpoints(
     Args:
         checkpoint_state: Dense scan results, one state per selected row.
         ssm_states: Dense recurrent-state pool, updated in place.
-        checkpoint_blocks: Per-request checkpoint destination ids.
-        rows: Request rows corresponding to ``checkpoint_state``.
+        checkpoint_blocks: Per-request checkpoint destination ids; negative
+            destinations skip the write. Destination zero is valid.
+        rows: Request rows corresponding to ``checkpoint_state``; negative
+            rows skip the write without reading a destination.
 
     Returns:
         None. ``ssm_states`` is updated in place.
@@ -722,8 +734,11 @@ def write_prefill_recurrent_checkpoints(
     if checkpoint_state.shape[1:] != ssm_states.shape[1:]:
         raise ValueError("checkpoint and pool recurrent-state shapes must agree")
     if not checkpoint_state.is_cuda:
-        destinations = checkpoint_blocks.index_select(0, rows).to(torch.int64)
-        ssm_states.index_copy_(0, destinations, checkpoint_state.to(ssm_states.dtype))
+        active = rows >= 0
+        destinations = checkpoint_blocks.index_select(0, rows[active]).to(torch.int64)
+        values = checkpoint_state[active]
+        live = destinations >= 0
+        ssm_states.index_copy_(0, destinations[live], values[live].to(ssm_states.dtype))
         return
     state_width = checkpoint_state[0].numel()
     block = 256

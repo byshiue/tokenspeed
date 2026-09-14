@@ -179,12 +179,11 @@ class AttentionBackend(CachePoolBinding, ABC):
 
     prefill_graph_inline: bool = False
 
-    def prepare_prefill_graph_bindings(
-        self, bucket: int, with_checkpoint: bool
-    ) -> list:
+    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
         """Return stable metadata bindings for inline capture at `bucket`.
 
-        A binding owns capture metadata, checks replay compatibility and
+        A binding owns fixed-capacity checkpoint slots and capture metadata,
+        checks replay compatibility and
         refreshes device buffers before replay. Leaves default to eager breaks.
         Layerwise transfer keeps its host callbacks at those breaks.
         """

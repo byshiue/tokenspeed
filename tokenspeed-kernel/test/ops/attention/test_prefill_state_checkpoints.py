@@ -37,6 +37,48 @@ def _device() -> torch.device:
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_inactive_conv_checkpoint_destinations_do_not_access_state(device_name):
+    device = _device() if device_name == "cuda" else torch.device("cpu")
+    raw = torch.arange(24, dtype=torch.float32, device=device).reshape(8, 3)
+    pool = torch.randn(5, 3, 3, device=device)
+    before = pool.clone()
+    rows = torch.tensor([0, 1], device=device)
+    blocks = torch.tensor([-1, 3], device=device)
+    write_prefill_conv_checkpoints(
+        raw,
+        pool,
+        torch.tensor([1, 2], device=device),
+        torch.tensor([2, 4], device=device),
+        blocks,
+        rows,
+        torch.tensor([1000000, 4], device=device),
+        torch.tensor([1000000, 4], device=device),
+    )
+    before[3] = raw[5:8].T
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
+def test_inactive_recurrent_checkpoint_rows_preserve_destination(device_name):
+    device = _device() if device_name == "cuda" else torch.device("cpu")
+    state = torch.randn(3, 2, 4, 4, device=device).transpose(-1, -2)
+    state[0].fill_(float("nan"))
+    state[2].fill_(float("nan"))
+    pool = torch.randn(4, 2, 4, 4, device=device).transpose(-1, -2)
+    before = pool.clone()
+    # Slot 0 has no destination row; slot 2 has a row but no checkpoint page.
+    # Destination zero remains valid for merging tail results into body states.
+    write_prefill_recurrent_checkpoints(
+        state,
+        pool,
+        torch.tensor([0, 2, -1], device=device),
+        torch.tensor([-1, 0, 2], device=device),
+    )
+    before[0] = state[1]
+    torch.testing.assert_close(pool, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device_name", ["cpu", "cuda"])
 @pytest.mark.parametrize("token_dim", [0, 1])
 def test_padded_checkpoint_pack_and_output_merge(device_name, token_dim):
     device = _device() if device_name == "cuda" else torch.device("cpu")

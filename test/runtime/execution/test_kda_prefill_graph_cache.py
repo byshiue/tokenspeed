@@ -31,6 +31,7 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
 from tokenspeed.runtime.layers.attention.backends.state.prefill_graph import (
     KdaOuterGraphBinding,
     KdaPrefillGraphCache,
+    _checkpoint_slot_batch,
     _clone_metadata,
 )
 
@@ -54,6 +55,45 @@ def test_metadata_snapshot_does_not_alias():
     assert cloned.state_in_blocks_by_group["state"].item() == 1
     assert (
         cloned.extend_seq_lens_cpu.data_ptr() != source.extend_seq_lens_cpu.data_ptr()
+    )
+
+
+@pytest.mark.parametrize("count", [0, 1, 2])
+def test_checkpoint_slots_keep_shape_and_mask_inactive_requests(count):
+    from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+        _build_prefill_checkpoint_batch,
+    )
+
+    source = metadata("cpu", 1)
+    lengths = torch.tensor([868, 869])
+    prefixes = torch.tensor([50304, 50304])
+    source.extend_seq_lens_cpu = lengths
+    source.cu_extend_seq_lens_cpu = torch.cat(
+        (torch.zeros(1, dtype=torch.int64), lengths.cumsum(0))
+    )
+    source.prefill_checkpoint_batch = _build_prefill_checkpoint_batch(
+        lengths, prefixes, count, 128, "cpu"
+    )
+    fixed = _checkpoint_slot_batch(source, 2048, 254)
+    assert fixed.rows.tolist() == [0, 1]
+    assert fixed.tail_seq_lens_cpu.tolist() == [
+        [100, 101][row] if row < count else 1 for row in range(2)
+    ]
+    assert fixed.state_update_rows.tolist() == [
+        row if row < count else -1 for row in range(2)
+    ]
+    assert fixed.body_token_indices.shape == (2048,)
+    assert fixed.tail_token_indices.shape == (254,)
+    body = fixed.body_token_indices[fixed.body_token_indices >= 0]
+    tail = fixed.tail_token_indices[fixed.tail_token_indices >= 0]
+    torch.testing.assert_close(
+        torch.cat((body, tail)).sort().values, torch.arange(1737)
+    )
+    assert not fixed.use_token_views
+    assert (
+        source.prefill_checkpoint_batch is None
+        if count == 0
+        else source.prefill_checkpoint_batch.rows.numel() == count
     )
 
 
@@ -198,6 +238,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
 
     leaf = object.__new__(Leaf)
     leaf.cache_pool = object()
+    leaf._prefix_granularity = 128
     leaf.forward_metadata = metadata("cuda", 1)
     full = object.__new__(Leaf)
     full.device = torch.device("cuda")
@@ -264,7 +305,7 @@ def test_outer_graph_inlines_state_layers_and_retains_full_attention_break():
     leaf.forward_metadata.prefill_checkpoint_batch = SimpleNamespace(
         rows=torch.zeros(1)
     )
-    assert not binding.compatible(ctx)
+    assert binding.compatible(ctx)
     leaf.forward_metadata.prefill_checkpoint_batch = None
     leaf.cache_pool = object()
     assert not binding.compatible(ctx)
@@ -276,6 +317,7 @@ def test_outer_binding_restores_metadata_after_failure():
 
     backend = object.__new__(AttentionBackend)
     backend.cache_pool = object()
+    backend._prefix_granularity = 128
     original = metadata("cuda", 1)
     backend.forward_metadata = original
     binding = KdaOuterGraphBinding(backend, 8, original)
@@ -304,17 +346,20 @@ def test_internal_checkpoint_batch_bypasses_capacity_graph():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
 def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
-    from dataclasses import replace
+    from dataclasses import fields, replace
 
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
     )
 
-    from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
-    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.execution.forward_batch_info import (
+        CaptureHiddenMode,
+        ForwardMode,
+    )
+    from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
     from tokenspeed.runtime.layers.attention.backends.state.mamba import (
         _build_prefill_checkpoint_batch,
@@ -324,7 +369,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
     torch.manual_seed(42)
     # Eight BF16 beta heads keep eager tail views 16-byte aligned even when
     # the body has one token, as required by the native scan ABI.
-    bucket, heads, dim = 1024, 8, 128
+    bucket, heads, dim = 2048, 8, 128
     channels = heads * dim
     conv = torch.randn(12, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
     states = torch.randn(12, heads, dim, dim, device="cuda", dtype=torch.float32)
@@ -347,6 +392,8 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
     )
     backend._layer_prefill_checkpoint_blocks = lambda layer_id: (
         backend.forward_metadata.state_checkpoint_blocks_by_group["state"]
+        if backend.forward_metadata.state_checkpoint_blocks_by_group is not None
+        else None
     )
     kwargs = dict(
         conv_weights=torch.randn(3 * channels, 4, device="cuda", dtype=torch.bfloat16)
@@ -374,7 +421,7 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
             None,
             None,
             None,
-            batch_size,
+            backend.forward_metadata.extend_seq_lens_cpu.numel(),
             ForwardMode.EXTEND,
             save_kv_cache=True,
             mixed_qkv=raw.clone(),
@@ -390,14 +437,17 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         host = torch.cat((torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)))
         bounds = host.to(device="cuda", dtype=torch.int32)
         checkpoint = _build_prefill_checkpoint_batch(
-            lengths, torch.tensor(prefixes), batch_size, 128, "cuda"
+            lengths, torch.tensor(prefixes), lengths.numel(), 128, "cuda"
         )
-        checkpoint = replace(
-            checkpoint,
-            body_query_start_loc=checkpoint.body_query_start_loc.long(),
-            tail_query_start_loc=checkpoint.tail_query_start_loc.long(),
+        if checkpoint is not None:
+            checkpoint = replace(
+                checkpoint,
+                body_query_start_loc=checkpoint.body_query_start_loc.long(),
+                tail_query_start_loc=checkpoint.tail_query_start_loc.long(),
+            )
+        pages = (
+            torch.arange(lengths.numel(), device="cuda", dtype=torch.int32) + page_shift
         )
-        pages = torch.arange(batch_size, device="cuda", dtype=torch.int32) + page_shift
         return MambaForwardMetadata(
             query_start_loc=bounds,
             scan_query_start_loc=bounds.long(),
@@ -412,33 +462,73 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
                 )
             },
             state_out_blocks_by_group={"state": pages},
-            state_checkpoint_blocks_by_group={"state": pages + 4},
+            state_checkpoint_blocks_by_group=(
+                {"state": pages + 4} if checkpoint is not None else None
+            ),
             prefill_checkpoint_batch=checkpoint,
             conv_prefill_metadata=build_causal_conv1d_prefill_metadata(
                 bounds, lengths, CAUSAL_CONV1D_BLOCK_M
             ),
         )
 
-    cases = (
-        [([837], [50304]), ([769], [0]), ([1023], [128]), ([70], [127])]
-        if batch_size == 1
-        else [([512, 325], [0, 128]), ([197, 512], [128, 0]), ([512, 70], [0, 127])]
-    )
-    backend.forward_metadata = live_metadata(*cases[0], 2)
+    cases = []
+    # Reuse ONE capture across changing checkpoint counts, rows, and lengths.
+    for checkpoint_count in range(batch_size + 1):
+        for tail_lengths, prefix in [([837, 325, 197, 197], 0), ([70] * 4, 127)]:
+            lengths = tail_lengths[:checkpoint_count] + [128] * (
+                batch_size - checkpoint_count
+            )
+            prefixes = [prefix] * checkpoint_count + [0] * (
+                batch_size - checkpoint_count
+            )
+            cases.extend([(lengths, prefixes), (lengths[::-1], prefixes[::-1])])
+        cases.append(
+            (
+                [128] * batch_size,
+                [127] * checkpoint_count + [0] * (batch_size - checkpoint_count),
+            )
+        )
     if batch_size == 1:
-        backend._prefill_graph_enabled = True
-        (binding,) = backend.prepare_prefill_graph_bindings(bucket, True)
-        backend._prefill_graph_enabled = False
-    else:
-        binding = KdaOuterGraphBinding(backend, bucket, backend.forward_metadata)
-    with binding.bind(refresh=False):
-        reset()
-        forward()
-        torch.cuda.synchronize()
-        capture = BreakableCapture(pool=None, stream=None)
-        with capture:
-            output = forward()
+        cases.extend([([837], [50304]), ([769], [0]), ([1023], [128])])
+    if batch_size == 2:
+        cases.extend([([868, 869], [50304, 50304]), ([869, 868], [50304, 50304])])
+    cases.append(([1] * batch_size, [0] * batch_size))
+    # Exercise the real outer startup loop and shared-pool ownership.
+    owner = object.__new__(PrefillGraph)
+    owner.config = SimpleNamespace(
+        global_rank=1,
+        context_len=bucket,
+        max_num_seqs=4,
+        data_parallel_size=1,
+        prefill_graph_capture_batch_sizes=[batch_size],
+    )
+    owner.dp_size, owner.num_warmup, owner._pool = 1, 1, None
+    owner.capture_buckets = [bucket]
+    owner._captures, owner._outputs, owner._inline_captures = {}, {}, {}
+    owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
+    owner._embed_tokens = lambda ids: ids
+    owner._land_input_embeds = lambda *args: None
+    owner.attn_backend = backend
+    owner._run_inner = lambda bucket: (forward(), None)
+
+    def dummy(bucket, bs):
+        backend.forward_metadata = live_metadata([bucket // bs] * bs, [0] * bs, 2)
+        return SimpleNamespace(bs=bs, capture_hidden_mode=CaptureHiddenMode.NULL)
+
+    owner.make_dummy_batch = dummy
+    backend._prefill_graph_enabled = True
+    owner._capture_all_buckets(None)
+    backend._prefill_graph_enabled = False
+    assert set(owner._inline_captures) == {(bucket, batch_size)}
+    capture, captured, (binding,) = owner._inline_captures[bucket, batch_size]
+    output = captured.hidden_states
     assert capture.num_segments == 1
+    fixed = binding.metadata.prefill_checkpoint_batch
+    addresses = {
+        field.name: getattr(fixed, field.name).data_ptr()
+        for field in fields(fixed)
+        if isinstance(getattr(fixed, field.name), torch.Tensor)
+    }
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND, bs=batch_size, num_extends=batch_size
     )
@@ -446,11 +536,14 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         assert binding.compatible(ctx)
         reset()
-        expected = forward().clone()
+        expected = forward()[: sum(lengths)].clone()
         expected_conv, expected_states = conv.clone(), states.clone()
         reset()
         with binding.bind(refresh=True):
             capture.replay(valid_rows=sum(lengths))
+        assert addresses == {
+            name: getattr(fixed, name).data_ptr() for name in addresses
+        }
         torch.testing.assert_close(output[: sum(lengths)], expected, rtol=0, atol=0)
         torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
         torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
@@ -461,8 +554,9 @@ def test_checkpoint_outer_graph_replays_lengths_pages_and_states(batch_size):
     "compatible,transfer,expected",
     [(True, False, 2), (False, False, 1), (True, True, 1)],
 )
+@pytest.mark.parametrize("batch_size", [1, 2])
 def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
-    compatible, transfer, expected
+    compatible, transfer, expected, batch_size
 ):
     from contextlib import contextmanager, nullcontext
     from unittest.mock import patch
@@ -491,7 +585,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner._captures = {8: capture("ordinary")}
     owner._outputs = {8: CapturedForward(torch.ones(8, 4), None)}
     owner._inline_captures = {
-        (8, False): (
+        (8, batch_size): (
             capture("inline"),
             CapturedForward(torch.full((8, 4), 2.0), None),
             [Binding()],
@@ -506,7 +600,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
     )
-    ctx = SimpleNamespace(input_num_tokens=8)
+    ctx = SimpleNamespace(input_num_tokens=8, bs=batch_size)
     with patch(
         "tokenspeed.runtime.execution.prefill_graph.LogitsMetadata.from_forward_context",
         return_value=None,
@@ -516,3 +610,90 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     assert events == (
         ["refresh", "inline", "restore"] if expected == 2 else ["ordinary"]
     )
+
+
+@pytest.mark.parametrize(
+    "sizes,bucket,expected",
+    [
+        (None, 8, [1]),
+        (None, 17, [2]),
+        ([1, 2, 4], 8, [1, 2, 4]),
+        ([1, 2, 4], 2, [1, 2]),
+        ([1, 2, 4], 17, [2, 4]),
+        ([4, 2, 2], 8, [2, 4]),
+    ],
+)
+def test_inline_capture_request_counts(sizes, bucket, expected):
+    from tokenspeed.runtime.execution.prefill_graph import (
+        get_prefill_capture_batch_sizes,
+    )
+
+    config = SimpleNamespace(
+        context_len=16,
+        max_num_seqs=8,
+        data_parallel_size=2,
+        prefill_graph_capture_batch_sizes=sizes,
+    )
+    assert get_prefill_capture_batch_sizes(config, bucket) == expected
+    for invalid in [[0], [-1], [5]]:
+        config.prefill_graph_capture_batch_sizes = invalid
+        with pytest.raises(ValueError, match="capture batch sizes"):
+            get_prefill_capture_batch_sizes(config, bucket)
+
+
+def test_outer_capture_records_one_variant_per_configured_request_count():
+    from contextlib import contextmanager
+
+    from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+    from tokenspeed.runtime.execution.prefill_graph import CapturedForward, PrefillGraph
+
+    owner = object.__new__(PrefillGraph)
+    owner.config = SimpleNamespace(
+        global_rank=1,
+        context_len=16,
+        max_num_seqs=4,
+        data_parallel_size=1,
+        prefill_graph_capture_batch_sizes=[1, 2],
+    )
+    owner.dp_size = 1
+    owner.capture_buckets = [8]
+    owner._captures, owner._outputs, owner._inline_captures = {}, {}, {}
+    owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(8))
+    owner._embed_tokens = lambda ids: ids
+    owner._land_input_embeds = lambda *args: None
+    active_count = None
+
+    class Binding:
+        @contextmanager
+        def bind(self, refresh):
+            nonlocal active_count
+            assert not refresh
+            active_count = self.count
+            try:
+                yield
+            finally:
+                active_count = None
+
+    def prepare(bucket):
+        assert bucket == 8
+        binding = Binding()
+        binding.count = owner._ctx.bs
+        return [binding]
+
+    owner.attn_backend = SimpleNamespace(prepare_prefill_graph_bindings=prepare)
+    owner.make_dummy_batch = lambda bucket, bs: SimpleNamespace(
+        bs=bs, capture_hidden_mode=CaptureHiddenMode.NULL
+    )
+
+    def capture(bucket, wrapper):
+        label = (owner._ctx.bs, active_count)
+        owner._captures[bucket] = label
+        owner._outputs[bucket] = CapturedForward(torch.ones(bucket, 1), None)
+
+    owner._capture_bucket = capture
+    owner._capture_all_buckets(None)
+    assert owner._captures[8] == (1, None)
+    assert set(owner._inline_captures) == {(8, 1), (8, 2)}
+    for (_, bs), (capture, _, _) in owner._inline_captures.items():
+        assert capture == (bs, bs)
+    assert owner._ctx is None

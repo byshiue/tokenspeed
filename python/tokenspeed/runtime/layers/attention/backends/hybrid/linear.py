@@ -179,14 +179,10 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
-    def prepare_prefill_graph_bindings(
-        self, bucket: int, with_checkpoint: bool
-    ) -> list:
+    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
         if self.step_counter is not None:
             return []
-        return self.linear_attn_backend.prepare_prefill_graph_bindings(
-            bucket, with_checkpoint
-        )
+        return self.linear_attn_backend.prepare_prefill_graph_bindings(bucket)
 
     def forward(
         self,

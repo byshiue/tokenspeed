@@ -35,9 +35,9 @@ from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaForwardMetadata,
-    _build_prefill_checkpoint_batch,
     _PrefillCheckpointBatch,
 )
+from tokenspeed.runtime.utils.tensor import upload_packed
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +54,11 @@ class KdaPrefillGraphMetadata(MambaForwardMetadata):
 @dataclass(frozen=True)
 class _CheckpointCapacityBatch(_PrefillCheckpointBatch):
     packed_capacity: int
+    tail_state_rows: torch.Tensor
+
+    @property
+    def state_update_rows(self) -> torch.Tensor:
+        return self.tail_state_rows
 
     @property
     def use_token_views(self) -> bool:
@@ -66,33 +71,102 @@ class _CheckpointCapacityBatch(_PrefillCheckpointBatch):
         return self.packed_capacity
 
 
-def checkpoint_capture_source(source, prefix_granularity):
-    """Seed a checkpoint topology using only startup placeholder state pages."""
+def _checkpoint_slot_batch(source, bucket, tail_capacity):
+    """Pad checkpoint execution to one tail slot per real request.
+
+    Inactive slots get one zero-input token, never a zero-length native scan.
+    Their token map and state destination are negative, so dummy results cannot
+    escape into request outputs or persistent state. Real cache ownership and
+    checkpoint selection continue to come exclusively from source metadata.
+    """
     lengths = source.extend_seq_lens_cpu
-    if prefix_granularity <= 1 or (lengths < 2).any().item():
-        return None
-    # A one-token tail seeds every captured request slot. Page ownership still
-    # belongs to the scheduler: warmup only uses the existing placeholder pool.
-    prefixes = (1 - lengths).remainder(prefix_granularity)
-    batch = _build_prefill_checkpoint_batch(
-        lengths,
-        prefixes,
-        lengths.numel(),
-        prefix_granularity,
-        source.query_start_loc.device,
+    live = source.prefill_checkpoint_batch
+    body_lengths = lengths if live is None else live.body_seq_lens_cpu
+    tail_lengths = lengths - body_lengths
+    active = tail_lengths > 0
+    slot_lengths = tail_lengths.clamp_min(1)
+    rows = torch.arange(lengths.numel(), dtype=torch.int64)
+    starts = source.cu_extend_seq_lens_cpu[:-1]
+
+    def bounds(values):
+        return torch.cat((values.new_zeros(1), values.cumsum(0))).to(torch.int64)
+
+    body_bounds, tail_bounds = bounds(body_lengths), bounds(slot_lengths)
+    KdaPrefillCapacity(bucket, rows.numel()).validate(body_bounds, bucket)
+    KdaPrefillCapacity(tail_capacity, rows.numel()).validate(tail_bounds, tail_capacity)
+
+    def indices(sequence_starts, sequence_lengths, capacity):
+        offsets = torch.arange(int(sequence_lengths.sum()), dtype=torch.int64)
+        offsets -= torch.repeat_interleave(
+            bounds(sequence_lengths)[:-1], sequence_lengths
+        )
+        packed = torch.repeat_interleave(sequence_starts, sequence_lengths) + offsets
+        result = torch.full((capacity,), -1, dtype=torch.int64)
+        result[: packed.numel()] = packed
+        return result
+
+    body_indices = indices(starts, body_lengths, bucket)
+    tail_indices = indices(starts + body_lengths, slot_lengths, tail_capacity)
+    tail_indices[: int(slot_lengths.sum())].masked_fill_(
+        ~torch.repeat_interleave(active, slot_lengths), -1
     )
-    batch = replace(
-        batch,
-        body_query_start_loc=batch.body_query_start_loc.to(torch.int64),
-        tail_query_start_loc=batch.tail_query_start_loc.to(torch.int64),
+    parts = (
+        rows,
+        starts,
+        body_lengths,
+        torch.zeros_like(rows),
+        body_indices,
+        body_bounds,
+        tail_indices,
+        tail_bounds,
+        rows.masked_fill(~active, -1),
     )
-    return replace(
-        source,
-        prefill_checkpoint_batch=batch,
-        state_checkpoint_blocks_by_group=_clone_metadata(
-            source.state_out_blocks_by_group
-        ),
+    (
+        device_rows,
+        device_starts,
+        checkpoint_lengths,
+        positions,
+        body_indices,
+        body_boundaries,
+        tail_indices,
+        tail_boundaries,
+        state_rows,
+    ) = upload_packed(parts, source.query_start_loc.device)
+    if live is not None:
+        positions.index_copy_(0, live.rows, live.checkpoint_positions)
+    return _CheckpointCapacityBatch(
+        rows=device_rows,
+        sequence_starts=device_starts,
+        checkpoint_seq_lens=checkpoint_lengths,
+        checkpoint_positions=positions,
+        body_rows=device_rows,
+        body_token_indices=body_indices,
+        body_query_start_loc=body_boundaries,
+        body_seq_lens_cpu=body_lengths.clone(),
+        body_cu_seqlens_cpu=body_bounds,
+        tail_token_indices=tail_indices,
+        tail_query_start_loc=tail_boundaries,
+        tail_seq_lens_cpu=slot_lengths,
+        tail_cu_seqlens_cpu=tail_bounds,
+        packed_capacity=bucket,
+        tail_state_rows=state_rows,
     )
+
+
+def _refresh_checkpoint_destinations(target, source):
+    old = target.state_checkpoint_blocks_by_group
+    new = source.state_checkpoint_blocks_by_group
+    if new is not None and old.keys() != new.keys():
+        raise RuntimeError("KDA graph state groups changed without pool rebind")
+    inactive = target.prefill_checkpoint_batch.state_update_rows < 0
+    for group, indices in old.items():
+        if new is None:
+            indices.fill_(-1)
+        else:
+            if indices.shape != new[group].shape or indices.dtype != new[group].dtype:
+                raise RuntimeError("KDA graph state index geometry changed")
+            indices.copy_(new[group])
+            indices.masked_fill_(inactive, -1)
 
 
 def _capacity_metadata(source, bucket, tail_capacity):
@@ -106,27 +180,15 @@ def _capacity_metadata(source, bucket, tail_capacity):
         },
         capacity=capacity,
     )
-    checkpoint = cloned.prefill_checkpoint_batch
-    if checkpoint is not None:
-        # Each tail is shorter than the prefix grain. Bound its packed scratch
-        # independently instead of paying the full token bucket for both scans.
-        padded = {}
-        for name in ("body_token_indices", "tail_token_indices"):
-            indices = getattr(checkpoint, name)
-            padded[name] = torch.full(
-                (bucket if name == "body_token_indices" else tail_capacity,),
-                -1,
-                dtype=indices.dtype,
-                device=indices.device,
-            )
-            padded[name][: indices.numel()].copy_(indices)
-        result.prefill_checkpoint_batch = _CheckpointCapacityBatch(
-            **{
-                field.name: padded.get(field.name, getattr(checkpoint, field.name))
-                for field in fields(_PrefillCheckpointBatch)
-            },
-            packed_capacity=bucket,
+    if tail_capacity is not None:
+        result.prefill_checkpoint_batch = _checkpoint_slot_batch(
+            source, bucket, tail_capacity
         )
+        result.state_checkpoint_blocks_by_group = {
+            group: torch.full_like(indices, -1)
+            for group, indices in source.state_out_blocks_by_group.items()
+        }
+        _refresh_checkpoint_destinations(result, source)
     # Build immutable per-request capacity maps once, independently of live
     # packed boundaries. Overscheduled conv programs honor the live bounds.
     host_bounds = capacity.boundaries_cpu()
@@ -181,13 +243,10 @@ class KdaOuterGraphBinding:
     def __init__(self, backend, bucket, source):
         self.backend = backend
         self.pool = backend.cache_pool
-        checkpoint = source.prefill_checkpoint_batch
-        tail_capacity = (
-            None
-            if checkpoint is None
-            else min(
-                bucket, checkpoint.rows.numel() * (backend._prefix_granularity - 1)
-            )
+        tail_capacity = min(
+            bucket,
+            source.extend_seq_lens_cpu.numel()
+            * max(1, backend._prefix_granularity - 1),
         )
         self.metadata = _capacity_metadata(source, bucket, tail_capacity)
 
@@ -199,7 +258,6 @@ class KdaOuterGraphBinding:
             and self.backend.step_counter is None
             and ctx.forward_mode.is_extend()
             and ctx.num_extends == ctx.bs == self.metadata.capacity.num_sequences
-            and _checkpoint_geometry(source) == _checkpoint_geometry(self.metadata)
             and source.extend_seq_lens_cpu is not None
             and source.extend_seq_lens_cpu.numel()
             == self.metadata.capacity.num_sequences
@@ -222,11 +280,6 @@ class KdaOuterGraphBinding:
             backend.prefill_graph_inline = previous_inline
 
 
-def _checkpoint_geometry(metadata):
-    batch = metadata.prefill_checkpoint_batch
-    return None if batch is None else batch.rows.numel()
-
-
 def _refresh_capacity_metadata(target, source):
     target.capacity.validate(
         source.cu_extend_seq_lens_cpu, target.capacity.token_capacity
@@ -246,25 +299,19 @@ def _refresh_capacity_metadata(target, source):
     )
     checkpoint = target.prefill_checkpoint_batch
     if checkpoint is not None:
-        live = source.prefill_checkpoint_batch
-        if _checkpoint_geometry(target) != _checkpoint_geometry(source):
-            raise ValueError("KDA checkpoint request geometry changed")
-        for name in ("body", "tail"):
-            capacity = getattr(checkpoint, f"{name}_token_indices").numel()
-            KdaPrefillCapacity(
-                capacity, getattr(live, f"{name}_seq_lens_cpu").numel()
-            ).validate(getattr(live, f"{name}_cu_seqlens_cpu"), capacity)
-        for field in fields(_PrefillCheckpointBatch):
+        live = _checkpoint_slot_batch(
+            source,
+            target.capacity.token_capacity,
+            checkpoint.tail_token_indices.numel(),
+        )
+        for field in fields(_CheckpointCapacityBatch):
             old, new = getattr(checkpoint, field.name), getattr(live, field.name)
-            if field.name in ("body_token_indices", "tail_token_indices"):
-                old.fill_(-1)
-                old[: new.numel()].copy_(new)
-            else:
+            if isinstance(old, torch.Tensor):
                 old.copy_(new)
+        _refresh_checkpoint_destinations(target, source)
     for name in (
         "state_in_blocks_by_group",
         "state_out_blocks_by_group",
-        "state_checkpoint_blocks_by_group",
     ):
         old, new = getattr(target, name), getattr(source, name)
         if old is None and new is None:

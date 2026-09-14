@@ -66,7 +66,6 @@ from tokenspeed.runtime.layers.attention.backends.state.prefill_graph import (
     KdaOuterGraphBinding,
     KdaPrefillGraphCache,
     KdaPrefillGraphMetadata,
-    checkpoint_capture_source,
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
@@ -151,22 +150,13 @@ class KdaAttnBackend(MambaAttnBackend):
         self._prefill_graph_cache = None
         super().init_prefill_graph_state(max_num_tokens, max_bs)
 
-    def prepare_prefill_graph_bindings(
-        self, bucket: int, with_checkpoint: bool
-    ) -> list:
+    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
         if (
             self._prefill_graph_enabled
             and self.kda_backend == "cutedsl_kda"
             and self.step_counter is None
         ):
-            source = self.forward_metadata
-            if with_checkpoint:
-                source = checkpoint_capture_source(source, self._prefix_granularity)
-                if source is None:
-                    return []
-            elif source.prefill_checkpoint_batch is not None:
-                return []
-            return [KdaOuterGraphBinding(self, bucket, source)]
+            return [KdaOuterGraphBinding(self, bucket, self.forward_metadata)]
         return []
 
     def forward_extend(

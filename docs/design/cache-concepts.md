@@ -248,6 +248,13 @@ ignores them. GPU boundaries still determine the real tokens in each scan.
 This split
 does not change cache ownership or scheduler metadata.
 
+Merged capacity graphs may reserve a checkpoint/tail execution slot for every
+request, including requests with no internal checkpoint. Such an inactive
+slot has a negative checkpoint destination and output map; its dummy scan
+result cannot overwrite the body's final state. These slots are transient
+graph scratch, never new cache blocks or publishable checkpoints. The
+ordinary compact-tail path and the capacity path share masked state writers.
+
 The body/tail split uses the existing prefill-op state-layout contract. KDA
 solutions may retain their original K-major Python adapters; the kernel facade
 converts between that layout and the runtime's V-major state slab on both scans.

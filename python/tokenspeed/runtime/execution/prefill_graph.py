@@ -167,6 +167,30 @@ def _prefill_bucket_step(size: int) -> int:
     return min(largest_pow2, PREFILL_BUCKET_MAX_STEP)
 
 
+def get_prefill_capture_batch_sizes(
+    config: ModelExecutorConfig, bucket: int
+) -> list[int]:
+    """Return configured exact request counts that can fill this token bucket.
+
+    Each request must have at least one token and fit the model context.
+    Unset configuration retains the minimum count required by the bucket.
+    Counts outside a particular bucket's range are skipped, not padded with
+    empty sequences. Invalid configured counts fail before capture.
+    """
+    context = max(1, int(config.context_len))
+    minimum = -(-bucket // context)
+    maximum = config.max_num_seqs // config.data_parallel_size
+    sizes = config.prefill_graph_capture_batch_sizes
+    if sizes is None:
+        sizes = [minimum]
+    if any(size <= 0 or size > maximum for size in sizes):
+        raise ValueError(
+            "prefill graph capture batch sizes must be positive and no larger "
+            "than max_num_seqs / data_parallel_size"
+        )
+    return sorted({size for size in sizes if minimum <= size <= bucket})
+
+
 class CapturedForward(NamedTuple):
     """A bucket's captured inner-forward outputs (stable pool addresses)."""
 
@@ -327,7 +351,9 @@ class PrefillGraph:
                 capture_range.set_description(
                     f"Capturing prefill buckets ({bucket=} {avail_mem=:.2f} GB)"
                 )
-            self._ctx = self.make_dummy_batch(bucket)
+            minimum_bs = -(-bucket // max(1, int(self.config.context_len)))
+            batch_sizes = get_prefill_capture_batch_sizes(self.config, bucket)
+            self._ctx = self.make_dummy_batch(bucket, minimum_bs)
             self._land_input_embeds(
                 self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
             )
@@ -336,24 +362,22 @@ class PrefillGraph:
             try:
                 with active_forward(self._ctx):
                     self._capture_bucket(bucket, decode_wrapper)
-                    # Retain the ordinary graph for mixed/different-count batches.
-                    # DP admission must be rank-uniform; keep its existing route.
-                    for with_checkpoint in (False, True):
-                        bindings = (
-                            self.attn_backend.prepare_prefill_graph_bindings(
-                                bucket, with_checkpoint
-                            )
-                            if self.dp_size == 1
-                            else []
+                # Retain the ordinary graph for mixed/different-count batches.
+                # DP admission must be rank-uniform; keep its existing route.
+                ordinary = self._captures[bucket], self._outputs[bucket]
+                for bs in batch_sizes if self.dp_size == 1 else []:
+                    self._ctx = self.make_dummy_batch(bucket, bs)
+                    with active_forward(self._ctx):
+                        bindings = self.attn_backend.prepare_prefill_graph_bindings(
+                            bucket
                         )
                         if not bindings:
                             continue
-                        ordinary = self._captures[bucket], self._outputs[bucket]
                         with ExitStack() as stack:
                             for binding in bindings:
                                 stack.enter_context(binding.bind(refresh=False))
                             self._capture_bucket(bucket, decode_wrapper)
-                        self._inline_captures[bucket, with_checkpoint] = (
+                        self._inline_captures[bucket, bs] = (
                             self._captures[bucket],
                             self._outputs[bucket],
                             bindings,
@@ -371,7 +395,8 @@ class PrefillGraph:
             )
             if self._inline_captures:
                 logger.info(
-                    "prefill inline attention: captured buckets %s "
+                    "prefill inline attention: captured (tokens, requests) %s "
+                    "with fixed checkpoint slots "
                     "(segments=%d, ordinary captures retained for fallback)",
                     sorted(self._inline_captures),
                     next(iter(self._inline_captures.values()))[0].num_segments,
@@ -488,18 +513,17 @@ class PrefillGraph:
             out[str(spec.group_id)] = first_block[:, None].expand(bs, cols).contiguous()
         return out
 
-    def make_dummy_batch(self, num_tokens: int) -> ForwardContext:
+    def make_dummy_batch(self, num_tokens: int, bs: int) -> ForwardContext:
         """Populate the static buffers + attention metadata for a dummy extend
-        forward of ``num_tokens`` tokens, and return its ForwardContext.
+        forward of ``num_tokens`` tokens over ``bs`` positive-length requests,
+        and return its ForwardContext.
 
-        The tokens are split across ``ceil(num_tokens / context_len)`` dummy
-        requests so no single request exceeds the model context length: every
+        The tokens are balanced across the requested count, with the longer
+        requests first. No request may exceed the model context length: every
         per-request structure (page-table rows, DSA indexer tables) is sized
         for ``physical_context_len``, and a longer fabricated request indexes
-        past them. It does not bound the request-indexed buffers, which are
-        sized ``max_num_seqs // dp``: a bucket above ``context_len * max_bs``
-        overflows them and kills the boot (pre-existing; ``_autotune`` clamps
-        its token count for exactly that reason, the bucket ladder does not). A real forward carries more than ``context_len`` tokens only as
+        past them. The request count must also fit the input buffers. A real
+        forward carries more than ``context_len`` tokens only as
         a multi-request batch, never as one sequence.
 
         The prefill analogue of decode's ``_init_capture_metadata``. KV writes
@@ -514,10 +538,15 @@ class PrefillGraph:
         # the rope tables; per-request structures are sized for the (larger)
         # physical extent, so this remains in bounds.
         max_req_tokens = max(1, int(self.config.context_len))
-        bs = max(1, -(-num_tokens // max_req_tokens))
-        seq_lens = [max_req_tokens] * (bs - 1) + [
-            num_tokens - max_req_tokens * (bs - 1)
-        ]
+        if not (
+            1 <= bs <= min(num_tokens, ib.seq_lens_buf.numel())
+            and num_tokens <= bs * max_req_tokens
+        ):
+            raise ValueError(
+                "prefill capture requests do not fit token/context capacity"
+            )
+        length, remainder = divmod(num_tokens, bs)
+        seq_lens = [length + (row < remainder) for row in range(bs)]
         seq_lens_cpu = torch.tensor(seq_lens, dtype=ib.seq_lens_buf.dtype)
         seq_lens_gpu = seq_lens_cpu.to(self.config.device)
         ib.input_ids_buf[:num_tokens].fill_(1)
@@ -647,15 +676,13 @@ class PrefillGraph:
         cap, output = self._captures[bucket], self._outputs[bucket]
         with ExitStack() as stack:
             if self.attn_backend.step_counter is None:
-                for with_checkpoint in (False, True):
-                    inline = self._inline_captures.get((bucket, with_checkpoint))
-                    if inline is not None and all(
-                        binding.compatible(ctx) for binding in inline[2]
-                    ):
-                        cap, output, bindings = inline
-                        for binding in bindings:
-                            stack.enter_context(binding.bind(refresh=True))
-                        break
+                inline = self._inline_captures.get((bucket, ctx.bs))
+                if inline is not None and all(
+                    binding.compatible(ctx) for binding in inline[2]
+                ):
+                    cap, output, bindings = inline
+                    for binding in bindings:
+                        stack.enter_context(binding.bind(refresh=True))
             with self._padded_to(ctx, bucket):
                 cap.replay(valid_rows=num_tokens)
         hidden_states, aux_hidden_states = output.sliced(num_tokens)

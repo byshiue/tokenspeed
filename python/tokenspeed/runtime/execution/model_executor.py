@@ -214,6 +214,7 @@ class ModelExecutorConfig:
     prefill_graph_max_tokens: int = 0
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    prefill_graph_capture_batch_sizes: list[int] | None = None
 
     @staticmethod
     def from_server_args(
@@ -283,6 +284,7 @@ class ModelExecutorConfig:
             disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
+            prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
             model_is_mrope=model_is_mrope,
             data_parallel_size=server_args.mapping.attn.dp_size,
             world_size=server_args.mapping.world_size,
