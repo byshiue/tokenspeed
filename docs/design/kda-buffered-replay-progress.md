@@ -18,8 +18,8 @@ M4 source commit: `ac74d6785ee921efcd2b4c061e74a562b82ac47f`
 (`feat(cache): reserve only replay history decode tails`).
 M5 source commit: `f4312f1ce25a0ff95c78a97fc70bada0013ce8af`
 (`feat(kda): bind cache-owned replay history and positions`).
-M6 source: uncommitted during validation; the signed-off commit will be recorded
-after the final tests and repository hooks.
+M6 source commit: `bb330bf0a86152388254af7263a59cff0b191098`
+(`feat(kda): run buffered recurrence through cache block tables`).
 No default capacity or performance benefit has been established. M1 adds
 an unregistered prototype, not the complete serving feature.
 
@@ -559,8 +559,37 @@ advance during timing, and source/destination state blocks are separate so a
 flush cannot change the next sample's input. This is not the M1 rolling-ring
 benchmark, an amortized rollout, or a serving comparison. Baseline timing is
 prepared eager recurrence only; model, conv/gates, scheduler, publication and
-baseline speculative replay-commit costs are excluded. Final isolated timing
-and formatted-source results will be recorded below after validation completes.
+baseline speculative replay-commit costs are excluded. The final isolated sweep
+and formatted-source results are recorded below.
+
+Final-source validation repeated **501 runtime tests and 317 subtests** (28
+warnings, 19.46s) and **36 reference/GPU tests** (15 warnings, 13.34s). The actual
+arena test now continues through a history-block boundary and a capacity flush.
+The first repository hook run formatted four files; those edits are included.
+The final `pre-commit run --all-files` passed before the signed-off source commit.
+
+The isolated timing sweep ran only after correctness steps completed, without
+a profiler. It covers 48 cases: B=1/8, T=1/4, L=2*T/16/32/64 and three history
+phases. Each median uses five samples of 50 graph replays, with 32 calls per
+graph, after four call warmups and five graph warmups. Full samples, source
+patch, environment and hashes are retained in the local M6 runbook.
+
+L=64 results, microseconds per fixed round:
+
+| Batch | T | Prepared eager recurrence | Paged, h=0 | Paged, h=L-2*T | Paged flush, h=L-T |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | 2.24 | 8.00 | 27.11 | 27.77 |
+| 1 | 4 | 4.42 | 10.30 | 28.34 | 28.61 |
+| 8 | 1 | 3.58 | 8.39 | 32.05 | 32.95 |
+| 8 | 4 | 6.22 | 12.28 | 31.77 | 34.95 |
+
+**This prototype regresses against prepared eager recurrence.** It avoids full
+state stores on non-flush rounds, but the four launches and serial history
+reconstruction outweigh that saving in this test. The timing split does not
+isolate each launch's contribution. It is not a full-model comparison or an
+amortized capacity recommendation, and it does not establish a speedup over M1.
+Reducing launch overhead and reconstruction cost remains a gate before serving
+activation, alongside the lifecycle work below.
 
 Production recipe/backend guards remain unchanged. Paged recurrence is not yet
 dispatched by the model. Shared runtime refresh, conv/gate preparation, unified
