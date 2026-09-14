@@ -1,0 +1,189 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""Prepared-input recurrence microbenchmark; NOT a serving comparison."""
+
+import argparse
+import importlib.metadata
+import json
+import platform
+import statistics
+import sys
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
+    buffered_commit,
+    buffered_recurrent,
+)
+from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    fused_recurrent_kda_pool,
+)
+
+
+def measure(fn):
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(4):
+            fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(32):
+            fn()
+    for _ in range(5):
+        graph.replay()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(5):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+            enable_timing=True
+        )
+        start.record()
+        for _ in range(50):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        times.append(start.elapsed_time(end) * 1000 / (32 * 50))
+    return {"median_us": statistics.median(times), "samples_us": times}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    torch.manual_seed(93)
+    results = []
+    for batch in (1, 8):
+        for width in (1, 4):
+            heads = 12
+            dim = 128
+            q = F.normalize(
+                torch.randn(batch, width, heads, dim, device="cuda"), dim=-1
+            )
+            k = F.normalize(torch.randn_like(q), dim=-1)
+            v = torch.randn_like(q) * 0.2
+            g = -torch.rand_like(q) * 0.1
+            d = g.exp()
+            beta = torch.rand(batch, width, heads, device="cuda")
+            state = torch.zeros(batch, heads, dim, dim, device="cuda")
+            indices = torch.arange(batch, dtype=torch.int32, device="cuda")
+            alog = torch.zeros(heads, device="cuda")
+
+            def baseline():
+                return fused_recurrent_kda_pool(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    alog,
+                    None,
+                    state,
+                    indices,
+                    indices,
+                    scale=dim**-0.5,
+                    cu_seqlens=None,
+                    lower_bound=None,
+                    use_qk_l2norm_in_kernel=False,
+                    use_gate_in_kernel=False,
+                    use_beta_sigmoid_in_kernel=False,
+                )
+
+            baseline_time = measure(baseline)
+            for capacity in (2 * width, 16, 32, 64):
+                history_k = torch.zeros(batch, capacity, heads, dim, device="cuda")
+                history_u = torch.zeros_like(history_k)
+                history_d = torch.ones_like(history_k)
+                checkpoint = torch.zeros_like(state)
+                ring_start = torch.zeros(batch, dtype=torch.int32, device="cuda")
+                length = torch.zeros_like(ring_start)
+                valid = torch.full_like(ring_start, width)
+                accepted = torch.full_like(ring_start, width)
+                flushed = torch.zeros(batch, dtype=torch.bool, device="cuda")
+                out = torch.empty_like(v)
+
+                def buffered():
+                    buffered_recurrent(
+                        q,
+                        k,
+                        v,
+                        d,
+                        beta,
+                        checkpoint,
+                        history_k,
+                        history_u,
+                        history_d,
+                        ring_start,
+                        length,
+                        valid,
+                        flushed,
+                        out,
+                    )
+                    buffered_commit(
+                        ring_start, length, valid, accepted, flushed, capacity
+                    )
+
+                timing = measure(buffered)
+                row = {
+                    "batch": batch,
+                    "T": width,
+                    "L": capacity,
+                    "heads": heads,
+                    "dim": dim,
+                    "baseline": baseline_time,
+                    "buffered": timing,
+                    "buffered_over_baseline": timing["median_us"]
+                    / baseline_time["median_us"],
+                }
+                results.append(row)
+                print(json.dumps(row), flush=True)
+    args.output.write_text(
+        json.dumps(
+            {
+                "scope": "prepared-input recurrence, full acceptance, single layer/GPU, graph replay; excludes model, conv/gates, LCM and speculative replay commit",
+                "environment": {
+                    "python": sys.version,
+                    "machine": platform.machine(),
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "gpu": torch.cuda.get_device_name(0),
+                    "tokenspeed_triton": importlib.metadata.version(
+                        "tokenspeed-triton"
+                    ),
+                },
+                "timer": {
+                    "calls_per_graph": 32,
+                    "graph_replays_per_sample": 50,
+                    "samples": 5,
+                    "warmup_replays": 5,
+                    "seed": 93,
+                },
+                "results": results,
+            },
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
