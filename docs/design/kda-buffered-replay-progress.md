@@ -1214,7 +1214,8 @@ environment, raw logs and the source patch are retained in the local M14 runbook
 
 ### M15: experimental serving configuration and cache-owner resume
 
-Source: based on `f54c642d` (M14 record), not yet committed.
+Source: `fea0e94fbd816116d9eebd0ac6b833e05bc8054b`, based on `f54c642d`
+(M14 record).
 
 `--ssm-replay-buffer-capacity` now reaches the Kimi-K3 recipe before memory
 planning. A positive value selects buffered fields and the common backend path;
@@ -1262,3 +1263,10 @@ The model recipe now documents the experimental option and removes an obsolete
 claim that K3 prefix granularity depends on the memory budget. Full-model
 EAGLE3 performance, capacity choice, AIME and NSYS remain pending; this milestone
 does not establish an end-to-end speedup or accuracy score.
+
+After formatting, the final integration suite passed **200 cases plus
+77 subtests** (three optional/vendor-specific skips, 23 warnings, 50.07s).
+The shared runtime suite passed **527 cases plus 317 subtests** (31 warnings,
+48.86s). These counts overlap with the focused suites above. All applicable
+all-files hooks passed before the signed-off source commit. The local M15
+runbook retains the environment, exact commands, source patch and raw logs.
