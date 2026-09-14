@@ -36,6 +36,8 @@ M13 source commit: `265ca5b97b8c9776e1c9a4989e84311a3c7c8df1`
 (`feat(kda): materialize quiescent replay endpoints`).
 M14 source commit: `fd31239aa518c75a3dc7dcd0172d49313d6bc03a`
 (`feat(kda): compose mixed prefill and buffered decode`).
+M15 source commit: `fea0e94fbd816116d9eebd0ac6b833e05bc8054b`
+(`feat(kda): expose experimental buffered decode`).
 No default capacity or serving performance benefit has been established.
 M15 registers the GPU recurrence and adds an explicit experimental capacity;
 it is not a production-validated default. Eagle3 must run the new path without a performance regression
@@ -47,7 +49,7 @@ against the frozen baseline before the work meets its completion gate.
 | B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
 | C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
 | D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
-| E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
+| E. Real-model correctness and performance | Baseline smoke and first timing run complete; buffered model validation in progress | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces remain acceptance gates |
 
 ## Recording a result
 
@@ -1270,3 +1272,49 @@ The shared runtime suite passed **527 cases plus 317 subtests** (31 warnings,
 48.86s). These counts overlap with the focused suites above. All applicable
 all-files hooks passed before the signed-off source commit. The local M15
 runbook retains the environment, exact commands, source patch and raw logs.
+
+### Real-model validation: first baseline run
+
+The frozen original `2e4b540743878959eb51793ce01d74b5898b0e38` completed a
+real-weight agentic smoke and its first unprofiled timing run. The buffered
+comparison uses the independent M15 source archive; results below describe
+the baseline only, not an optimization benefit or a no-regression pass.
+
+Environment: eight GB300 GPUs across two nodes in one healthy, full-bandwidth
+NVLink fabric, under a fresh persistent allocation. Driver 580.167.08,
+Python 3.12.3, Torch 2.13.0+cu130, FlashInfer 0.6.18 and
+tokenspeed-triton 3.8.10.post20260906. Both archives use the same cached
+dependencies/native kernel objects and their own matching scheduler binaries.
+The full 93-layer NVFP4 model uses TP8 attention/MoE, BF16 activations, FP8 KV,
+MLA attention, CuteDSL KDA prefill and FlashInfer TRT-LLM MoE. EAGLE3 uses the
+MLA draft, three draft steps, four target tokens and top-k one. CUDA graphs
+and overlap remain enabled, with decode capture sizes 1/2/4 and prefill graphs.
+Context is 65,536, prefix granularity 128, maximum live requests four,
+prefill chunk/budget 8,192 and memory utilization 0.80. Autotuning is disabled
+equally in both cases; no communication override is applied.
+
+The smoke reuses a frozen, rendered real-content agentic conversation: 51,936
+input tokens, 51,328 cached tokens and 608 new tokens, followed by 16 outputs.
+All 16 output IDs match the prior frozen-baseline smoke. This is execution
+evidence, not an AIME or agent task-resolution score.
+
+Unprofiled timing uses that same continuation with 256 outputs, greedy sampling
+and seed one. Each batch flushes the test cache, primes the identical frozen
+parent, then submits either one or four simultaneous identical continuations.
+There are three rounds per concurrency, each with one warmup and five measured
+batches: 15 C1 requests and 60 C4 requests in total. All samples completed with
+the expected cache/token counts and no preemption. C1 client latency has a
+median of **1,070.642 ms**, with median decode throughput **287.9 tokens/s**;
+C4 per-request client latency has a median of **1,631.700 ms**, with median
+decode throughput **218.7 tokens/s**. C4 admission spans multiple prefill
+batches, so those per-request rates are not aggregate batch throughput.
+C1 reproduces one exact output sequence across all samples; C4 produces two.
+All sequences, engine statistics, raw timings and warmups are retained.
+
+Host-side Slurm/process audits confirm all eight workers belong to the test
+and no Nsight injection is present. PyTorch's ordinary CUDA13 CUPTI library
+is mapped even without profiling; its presence alone is not a trace session.
+The local runbook records the corrected audit assumptions and initial failed
+audit attempts. No failed model request was replaced or filtered. Buffered
+timings, independent restart repeats, the capacity sweep, AIME and fresh NSYS
+remain pending.
