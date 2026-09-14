@@ -34,6 +34,8 @@ M12 source commit: `931eeaf21110265593e38e6563b0c1981003f361`
 (`feat(kda): wire buffered decode and validate state commits`).
 M13 source commit: `265ca5b97b8c9776e1c9a4989e84311a3c7c8df1`
 (`feat(kda): materialize quiescent replay endpoints`).
+M14 source commit: `fd31239aa518c75a3dc7dcd0172d49313d6bc03a`
+(`feat(kda): compose mixed prefill and buffered decode`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -1150,7 +1152,8 @@ and environment are retained in the local M13 artifacts.
 
 ### M14: mixed prefill and buffered decode
 
-Source: based on `58d42fa4` (M13 record), not yet committed.
+Source: `fd31239aa518c75a3dc7dcd0172d49313d6bc03a`, based on `58d42fa4`
+(M13 record).
 
 Mixed KDA metadata now describes prefill only for leading extend requests and
 uses the ordinary buffered refresh for the decode suffix. Within each layer,
@@ -1201,3 +1204,10 @@ recurrence-only timing is not evidence for this runtime change or the final
 full-model no-regression gate. The plan's introduction now summarizes current
 status rather than repeating superseded per-milestone statements; historical
 details remain in this record and the full acceptance requirements are unchanged.
+
+After formatting, the final integration run again passed **169 cases plus
+62 subtests** (three skips, 23 warnings, 38.37s), and the shared regression run
+passed **527 cases plus 317 subtests** (28 warnings, 37.68s). All applicable
+all-files hooks passed before the signed-off source commit. Native prefill used
+`tokenspeed-cutedsl-kda 0.1.0.post20260830`; binary hashes, exact commands,
+environment, raw logs and the source patch are retained in the local M14 runbook.
