@@ -10,6 +10,8 @@ Baseline: `2e4b540743878959eb51793ce01d74b5898b0e38` (upstream main).
 Implementation branch: `kda-buffered-replay`.
 M1 source commit: `2619669e51d7eeb438069964d042fd21a5bc0736`
 (`test(kda): establish buffered replay reference and GPU prototype`).
+M2 source commit: `3f3615e11bef462b2c1390ef29b289b612dc2f38`
+(`feat(cache): add bounded live-state retention`).
 No default capacity or performance benefit has been established. M1 adds
 an unregistered prototype, not the complete serving feature.
 
@@ -190,8 +192,8 @@ only the final reclamation call leaves admission able to reclaim the source.
 
 ### M2: bounded live-state retention
 
-Source: the M2 retention milestone on M1; validated before committing. The
-follow-up validation record identifies the source commit.
+Source: M2 commit above (tested before committing), based on M1 and its
+validation record at `b9a7a5c39a1a4efeb1e43554bc228597414eac17`.
 
 Added the explicit `max_state_lag_tokens` cache contract. The Python spec,
 scheduler binding and C++ translation carry the same non-negative token bound;
