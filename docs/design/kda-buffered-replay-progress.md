@@ -26,6 +26,8 @@ M8 source commit: `f7e780f15c595eec34501644e612ef55b6eddf7e`
 (`feat(kda): unify commit entry and fuse native recurrence inputs`).
 M9 source commit: `eb55b1dac8195dd6aca06238c018dd959c0bd0ca`
 (`perf(kda): share replay metadata and stamp commits across layers`).
+M10 source commit: `014c7a6f6b17ceba6fbfce6ef52cc78d31d079e5`
+(`feat(kda): compose buffered conv and recurrent workspace`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -841,8 +843,8 @@ Eagle3 throughput result for buffered serving.
 
 ### M10: conv capture, accepted windows and the shared forward workspace
 
-Source: based on `291935c9fd0cbe5c76b15836f77824df8d7fb5b0` (M9 record).
-The signed-off source commit will be recorded after final validation.
+Source commit: `014c7a6f6b17ceba6fbfce6ef52cc78d31d079e5` (signed off),
+based on `291935c9fd0cbe5c76b15836f77824df8d7fb5b0` (M9 record).
 
 The four-tap BF16 conv producer now captures raw candidates in the same kernel
 that produces conv outputs. The later commit gathers the accepted raw suffix
