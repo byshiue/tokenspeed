@@ -58,7 +58,7 @@ def direct(state, query, key, value, decay, beta):
 
 
 @pytest.mark.parametrize("width", [1, 4])
-@pytest.mark.parametrize("extra_capacity", [0, 9])
+@pytest.mark.parametrize("extra_capacity", [0, 9, 56])
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph_mode):
     torch.manual_seed(93)
@@ -66,7 +66,7 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
     requests, batch, heads, dk, dv = 3, 4, 12, 128, 128
     capacity = 2 * width + extra_capacity
     rows = 3 if extra_capacity else 8
-    grain, context = 16 if width == 4 else 128, 512
+    grain, context = 16 if width == 4 else 128, 1024 if extra_capacity == 56 else 512
     columns, state_columns = math.ceil(context / rows), math.ceil(context / grain)
     count = 1 + requests * (math.ceil(capacity / rows) + 4)
     # Different strides from dense tensors, including padded channel dimensions.
@@ -160,7 +160,7 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
             run()
     pointers = [t.data_ptr() for t in (pool, hk, hu, hd, stamps, ht, st, cp, out)]
     saw_flush = saw_no_flush = saw_zero_accept_flush = saw_block_reuse = False
-    for step in range(64):
+    for step in range(256 if extra_capacity == 56 else 64):
         if step == 32:
             # Simulated cancel/reuse after readers complete, seeded at a new exact endpoint.
             req = 2
@@ -218,9 +218,15 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
             F.normalize(torch.randn(q.shape), dim=-1),
             F.normalize(torch.randn(k.shape), dim=-1),
             torch.randn(v.shape) * 0.2,
-            torch.exp(-torch.rand(d.shape) * 0.1),
+            torch.exp(-torch.rand(d.shape) * (1e-4 if extra_capacity == 56 else 0.1)),
             torch.rand(beta.shape),
         )
+        if extra_capacity == 56:
+            # Weak decay retains rounding error across tiles and flushes. Include
+            # identity and zero decay: suffix reconstruction must not divide by D.
+            inputs[3][..., 0] = 1
+            if step % 13 == 0:
+                inputs[3][..., 1] = 0
         for dest, src in zip((q, k, v, d, beta), inputs, strict=True):
             dest.copy_(src)
         before = pool.clone()

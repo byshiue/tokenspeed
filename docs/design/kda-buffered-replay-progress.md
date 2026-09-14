@@ -20,14 +20,16 @@ M5 source commit: `f4312f1ce25a0ff95c78a97fc70bada0013ce8af`
 (`feat(kda): bind cache-owned replay history and positions`).
 M6 source commit: `bb330bf0a86152388254af7263a59cff0b191098`
 (`feat(kda): run buffered recurrence through cache block tables`).
-No default capacity or performance benefit has been established. M1 adds
-an unregistered prototype, not the complete serving feature.
+No default capacity or serving performance benefit has been established.
+The GPU implementation remains an unregistered prototype, not the complete
+serving feature. Eagle3 must run the new path without a performance regression
+against the frozen baseline before the work meets its completion gate.
 
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | M2–M4 cache contracts verified; M5 fields, pool views and isolated GPU positions verified | Runtime position refresh, endpoint materialization and handoff still pending |
-| C. Unified GPU forward and commit | M6 prototype uses paged LCM fields and position prepare/commit; not registered | Runtime refresh, conv/gates, endpoint materialization and serving dispatch remain pending |
+| C. Unified GPU forward and commit | M6 uses paged LCM fields; M7 tiles accepted-history reconstruction; not registered | Runtime refresh, conv/gates, endpoint materialization and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
@@ -596,3 +598,79 @@ dispatched by the model. Shared runtime refresh, conv/gate preparation, unified
 ordinary/speculative commit, exact-endpoint materialization/publication and
 overlap/transfer/retraction integration remain pending. No real-weight TP8,
 AIME or full-model NSYS result is claimed.
+
+### M7: tiled accepted-history reconstruction
+
+Based on `dbca788740b769e2ac8a0db94688250f0998f5d8` (M6 validation record).
+Replace token-at-a-time replay of accepted history with tiles of up to eight
+tokens (bounded by the capacity's maximum committed history).
+For each tile, compute the exclusive reverse product of per-channel decay,
+then reconstruct `S' = S * product(D) + U^T @ (K * suffix(D))` with FP32
+reductions. Shift decay before the scan instead of dividing by it, so zero
+decay remains valid. The formula still builds the full recurrent state;
+this is not the deferred output-only route.
+
+The compute tile is independent of the history block span and checkpoint
+granularity. Raw block tables and field strides still resolve every history
+load. Candidate tokens retain their sequential dependence. Flush, candidate
+writes, acceptance, four-launch ordering and non-flush store suppression are
+unchanged; the kernel needs no additional workspace. Standard and speculative
+windows continue through the same operation.
+
+The initial tensor-core version passed the numerical gate but regressed at
+batch 8. A compiled 16-by-16 variant used 255 registers and spilled; increasing
+warps or reducing pipeline stages did not resolve the timing tradeoff. The
+selected FP32 reduction uses 32 value rows, up to eight history rows, four warps and
+one pipeline stage. A local geometry sweep measured both batch sizes before
+selecting it. No TF32/BF16 history conversion is retained.
+
+The existing parameterized recurrence test now also covers L=2*T+56 over 256
+rounds with weak decay, identity/zero-decay channels and repeated tile/flush
+boundaries. T=1/4, eager/graph, reordering, simulated allocation reuse,
+rejection poisoning and exact-state checks remain in that same test. The
+FP32 gate stays atol=2e-5, rtol=2e-4; no tolerance is widened.
+
+Validation uses the existing persistent GB300 allocation via submit/srun,
+one GPU, no weights. Environment: Python 3.12.3, PyTorch 2.13.0+cu130,
+CUDA 13.0, driver 580.167.08, tokenspeed-triton 3.8.10.post20260906,
+pytest 9.1.1, aarch64. The M4 scheduler binary/extension is unchanged.
+The final capacity-bounded source passed **40 reference/GPU tests** (15 warnings,
+44.74s) and **501 runtime tests and 317 subtests** (28 warnings, 18.53s), with
+unchanged tolerances. Its T=4/L=64 compiled kernel uses 128 registers, zero
+spills and 5,120 bytes shared memory. Repository hooks passed before the
+capacity-bound refinement and are repeated before committing the final source.
+
+The isolated before/after sweep reloads M6's exact archived kernel and uses
+the unchanged fixed-round benchmark on the same GPU, sequentially and without
+a profiler. It covers 48 cases: B=1/8, T=1/4, L=2*T/16/32/64 and empty,
+no-flush and flush history. Each median retains five samples of 50 graph
+replays with 32 calls per graph, after warmup. Both sides include position
+prepare, backing validation, recurrence and stamp commit.
+
+L=64 results, microseconds per fixed round:
+
+| Batch | T | Phase | M6 serial | M7 tiled | Latency reduction |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 1 | no flush, h=62 | 27.10 | 17.61 | 35.0% |
+| 1 | 1 | flush, h=63 | 27.76 | 17.98 | 35.2% |
+| 1 | 4 | no flush, h=56 | 28.34 | 17.87 | 37.0% |
+| 1 | 4 | flush, h=60 | 28.60 | 19.70 | 31.1% |
+| 8 | 1 | no flush, h=62 | 32.05 | 22.69 | 29.2% |
+| 8 | 1 | flush, h=63 | 32.96 | 23.52 | 28.6% |
+| 8 | 4 | no flush, h=56 | 31.77 | 24.32 | 23.5% |
+| 8 | 4 | flush, h=60 | 34.95 | 26.78 | 23.4% |
+
+This is not an across-the-board improvement: 38 of 48 measured medians are
+lower, while T=1/L=2 includes regressions up to 6.7% (batch 8 flush,
+9.66 to 10.31 us). Empty-history results at L=64 range from 5.2% faster to
+1.2% slower. All samples and exploratory configurations remain in the local
+runbook; the table must not stand in for the full sweep.
+
+The prototype still costs more than the benchmark's prepared eager recurrence,
+which excludes the original speculative replay commit. These measurements
+neither establish Eagle3 serving performance nor select a default capacity.
+
+Runtime integration remains the next gate: shared position refresh, conv/gate
+preparation and commit, ordinary/speculative commit dispatch, and exact endpoint
+materialization before publication or handoff. Serving guards remain enabled.
+Real NVFP4 TP8 Eagle3 performance, AIME 2026 and full-model traces are pending.

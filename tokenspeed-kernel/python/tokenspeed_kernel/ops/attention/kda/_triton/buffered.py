@@ -107,6 +107,11 @@ def _history_offset(TABLE, row, token, table_stride: tl.constexpr, rows: tl.cons
 
 
 @triton.jit
+def _multiply(left, right):
+    return left * right
+
+
+@triton.jit
 def _buffered_recurrent(
     Q,
     K,
@@ -140,6 +145,7 @@ def _buffered_recurrent(
     HD_STRIDES: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
+    BH: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     head, tile = tl.program_id(1), tl.program_id(2)
@@ -168,38 +174,70 @@ def _buffered_recurrent(
     )
     # Absolute token positions replace ring offsets. LCM owns the sliding
     # residency; no modulo-capacity placement or per-request allocation lives here.
-    for offset in range(length):
-        block, token_row = _history_offset(
-            HISTORY_TABLE, row, checkpoint + offset, HISTORY_TABLE_STRIDE, ROWS
-        )
+    # Within a history tile, S' = S * prod(D) + U^T @ (K * suffix(D)).
+    # Corrections are already known for accepted history, so reconstruct it in
+    # parallel; only the new candidates below still depend on one another.
+    # Shift D before the reverse product to obtain an exclusive suffix without
+    # division (decay may be zero). Invalid rows are the affine identity.
+    hh = tl.arange(0, BH).to(tl.int64)
+    for offset in range(tl.cdiv(length, BH)):
+        history_index = offset * BH + hh
+        position = checkpoint + history_index
+        live = history_index < length
+        block = tl.load(
+            HISTORY_TABLE + row * HISTORY_TABLE_STRIDE + position // ROWS, live, 0
+        ).to(tl.int64)
+        token_row = position % ROWS
         hk = tl.load(
             HK
-            + block * HK_STRIDES[0]
-            + token_row * HK_STRIDES[1]
+            + block[:, None] * HK_STRIDES[0]
+            + token_row[:, None] * HK_STRIDES[1]
             + head * HK_STRIDES[2]
-            + kk * HK_STRIDES[3],
-            kk < DK,
+            + kk[None, :] * HK_STRIDES[3],
+            live[:, None] & (kk[None, :] < DK),
             0,
         )
-        hd = tl.load(
+        next_live = live & (hh + 1 < BH) & (history_index + 1 < length)
+        next_block = tl.load(
+            HISTORY_TABLE + row * HISTORY_TABLE_STRIDE + (position + 1) // ROWS,
+            next_live,
+            0,
+        ).to(tl.int64)
+        next_decay = tl.load(
             HD
-            + block * HD_STRIDES[0]
-            + token_row * HD_STRIDES[1]
+            + next_block[:, None] * HD_STRIDES[0]
+            + ((position + 1) % ROWS)[:, None] * HD_STRIDES[1]
             + head * HD_STRIDES[2]
-            + kk * HD_STRIDES[3],
-            kk < DK,
-            0,
+            + kk[None, :] * HD_STRIDES[3],
+            next_live[:, None] & (kk[None, :] < DK),
+            1,
         )
+        suffix = tl.associative_scan(next_decay, 0, _multiply, reverse=True)
+        first_decay = tl.load(
+            HD
+            + block[:, None] * HD_STRIDES[0]
+            + token_row[:, None] * HD_STRIDES[1]
+            + head * HD_STRIDES[2]
+            + kk[None, :] * HD_STRIDES[3],
+            (hh[:, None] == 0) & live[:, None] & (kk[None, :] < DK),
+            1,
+        )
+        product = tl.sum(tl.where(hh[:, None] == 0, suffix * first_decay, 0), 0)
         hu = tl.load(
             HU
-            + block * HU_STRIDES[0]
-            + token_row * HU_STRIDES[1]
+            + block[None, :] * HU_STRIDES[0]
+            + token_row[None, :] * HU_STRIDES[1]
             + head * HU_STRIDES[2]
-            + vv * HU_STRIDES[3],
-            vv < DV,
+            + vv[:, None] * HU_STRIDES[3],
+            (vv[:, None] < DV) & live[None, :],
             0,
         )
-        state = state * hd[None, :] + hu[:, None] * hk[None, :]
+        # FP32 reductions keep the recurrent tile in its ordinary layout. A
+        # tensor-core dot needs extra layout conversions and register storage
+        # at this small history width; no history quantization is required here.
+        state = state * product[None, :] + tl.sum(
+            hu[:, :, None] * (hk * suffix)[None, :, :], 1
+        )
     if flush:
         dst = tl.load(
             STATE_TABLE + row * STATE_TABLE_STRIDE + (end - 1) // STATE_GRAIN
@@ -434,6 +472,8 @@ def buffered_recurrent(
         history_decay.stride(),
         triton.next_power_of_2(key_dim),
         32,
+        min(8, triton.next_power_of_2(capacity - width)),
         num_warps=4,
+        num_stages=1,
         enable_fp_fusion=False,
     )

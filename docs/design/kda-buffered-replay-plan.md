@@ -7,7 +7,8 @@
 的 dependency/reuse contract，以及 prefill 的空 history 尾部预留。M5 新增显式的
 Kimi-K3 history 字段规划、零拷贝 view，以及未注册的 GPU position 原型；
 M6 将未注册的 dense-ring GPU 原型改成通过 raw block table 读写 LCM 字段，
-并接上 position prepare/commit 原型。Runtime metadata refresh、serving dispatch、
+并接上 position prepare/commit 原型；M7 将已接受历史的重建改为分块 FP32 计算。
+Runtime metadata refresh、serving dispatch、
 端点物化与提交顺序仍待接入。
 
 ## 1. 目标与范围
@@ -221,6 +222,12 @@ Commit 如独立于模型 forward 捕获，也必须保持同一语义、固定 
 Baseline 使用冻结的当前代码：standard decode 为逐步 state 更新，speculative
 decode 为当前 eager replay-and-commit。两者分别和新实现对比，不能用不同
 acceptance 或不同生成 token 数直接推断 kernel 加速。
+
+EAGLE3 是必须通过的验收场景：真实 NVFP4、TP8、完整模型，使用原有
+四 token verify 配置与相同 CUDA graph/overlap 设置。新 buffered 路径必须
+实际执行，且性能不得慢于冻结的原实现。比较范围包含 verify、accepted-prefix
+commit 和 agentic 边界物化；只比较 prepared recurrence，或保持旧路径启用，
+都不能满足这个门槛。重复测量并报告波动，结果不明确时继续验证，不视为通过。
 
 固定 GPU、模型、输入、batch、后端、warmup 和 graph 设置；在持久分配的计算
 节点上按 runbook 执行。覆盖 concurrency 1 与较大 batch，并测试多个合法容量。
