@@ -397,9 +397,33 @@ output and suppress stores; consumers must enforce that result before publishing
 Zero or missing stamps are **not** a recovery mechanism for lost live history.
 They are valid seeds only after exact-endpoint materialization and fresh-page
 zeroing. The runtime still needs to enforce this transition, integrate stable
-batch outputs and paged recurrence, and order materialization before publication,
+batch outputs and paged recurrence dispatch, and order materialization before publication,
 incremental prefill, transfer and retraction. A capacity-flush decision alone
 does not establish prefix-publication provenance.
+
+The unregistered recurrence prototype now consumes the arena's strided fields
+and current raw history/state tables. It reads `S_c` from slot `(c-1)/G` (or
+implicit zero state at `c=0`), reconstructs `[c,e)`, and writes candidates at
+absolute positions `[e,e+width)`. LCM owns physical reuse: there is no dense
+per-request ring allocation or modulo-capacity placement. A capacity flush
+writes only the reconstructed, pre-candidate state `S_e`, in slot `(e-1)/G`;
+otherwise it writes no full state. The destination must be request-writable,
+never an immutable published snapshot.
+
+A separate GPU backing check validates the whole read/write range before any
+recurrence stores. Failure clears per-row validity and suppresses that row's
+state, history and output writes. Position prepare, backing check, recurrence
+and stamp commit run in the same order in eager execution and CUDA graphs.
+The extra launch is deliberate correctness groundwork, not a tuned dispatch
+decision. This replaces the earlier unregistered dense-ring GPU prototype;
+the CPU recurrence reference remains independent.
+
+The caller must preserve the allocator's exclusive ownership across all live
+readers and writers. Different cache groups cannot claim the same LCM parent:
+their field views overlay the same physical bytes even when their child ids
+differ. Positive block ids and valid tensor bounds do not establish ownership.
+No kernel in this prototype grants allocation, prefix-publication, transfer or
+in-flight-reuse permission.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 

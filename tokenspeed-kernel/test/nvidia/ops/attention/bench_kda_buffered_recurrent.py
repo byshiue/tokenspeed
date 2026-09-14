@@ -31,8 +31,11 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
-    buffered_commit,
     buffered_recurrent,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
+    commit_positions,
+    prepare_positions,
 )
 from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
     fused_recurrent_kda_pool,
@@ -111,56 +114,121 @@ def main():
 
             baseline_time = measure(baseline)
             for capacity in (2 * width, 16, 32, 64):
-                history_k = torch.zeros(batch, capacity, heads, dim, device="cuda")
-                history_u = torch.zeros_like(history_k)
-                history_d = torch.ones_like(history_k)
-                checkpoint = torch.zeros_like(state)
-                ring_start = torch.zeros(batch, dtype=torch.int32, device="cuda")
-                length = torch.zeros_like(ring_start)
-                valid = torch.full_like(ring_start, width)
-                accepted = torch.full_like(ring_start, width)
-                flushed = torch.zeros(batch, dtype=torch.bool, device="cuda")
-                out = torch.empty_like(v)
-
-                def buffered():
-                    buffered_recurrent(
-                        q,
-                        k,
-                        v,
-                        d,
-                        beta,
-                        checkpoint,
-                        history_k,
-                        history_u,
-                        history_d,
-                        ring_start,
-                        length,
-                        valid,
-                        flushed,
-                        out,
+                # Fixed-round replay: end/c do not advance during timing.
+                # A separate source/destination state block keeps a flush from
+                # changing the next timing sample's checkpoint input.
+                rows, start = 8, 8
+                for phase, history_len in (
+                    ("empty", 0),
+                    ("no_flush", capacity - 2 * width),
+                    ("flush", capacity - width),
+                ):
+                    end_value = start + history_len
+                    columns = (end_value + width + rows - 1) // rows
+                    count = batch * columns + 1
+                    history_k = torch.zeros(count, rows, heads, dim, device="cuda")
+                    history_u = torch.zeros_like(history_k)
+                    history_d = torch.ones_like(history_k)
+                    stamps = torch.zeros(count, rows, dtype=torch.int64, device="cuda")
+                    table = torch.arange(
+                        1, count, dtype=torch.int32, device="cuda"
+                    ).view(batch, columns)
+                    # State G=1 isolates source c from the flush destination e.
+                    state_table = torch.zeros(
+                        batch, end_value, dtype=torch.int32, device="cuda"
                     )
-                    buffered_commit(
-                        ring_start, length, valid, accepted, flushed, capacity
+                    state_ids = torch.arange(
+                        1, batch + 1, dtype=torch.int32, device="cuda"
                     )
+                    state_table[:, start - 1] = state_ids
+                    if history_len:
+                        state_table[:, end_value - 1] = state_ids + batch
+                    checkpoint_pool = torch.zeros(
+                        1 + 2 * batch, heads, dim, dim, device="cuda"
+                    )
+                    stamps[
+                        table[:, (end_value - 1) // rows].long(), (end_value - 1) % rows
+                    ] = (start + 1)
+                    endpoint = torch.full(
+                        (batch,), end_value, dtype=torch.int32, device="cuda"
+                    )
+                    valid = torch.full_like(endpoint, width)
+                    accepted = torch.full_like(endpoint, width)
+                    checkpoint = torch.empty(batch, dtype=torch.int64, device="cuda")
+                    length = torch.empty_like(endpoint)
+                    flushed = torch.empty(batch, dtype=torch.bool, device="cuda")
+                    ok = torch.empty_like(flushed)
+                    out = torch.empty_like(v)
 
-                timing = measure(buffered)
-                row = {
-                    "batch": batch,
-                    "T": width,
-                    "L": capacity,
-                    "heads": heads,
-                    "dim": dim,
-                    "baseline": baseline_time,
-                    "buffered": timing,
-                    "buffered_over_baseline": timing["median_us"]
-                    / baseline_time["median_us"],
-                }
-                results.append(row)
-                print(json.dumps(row), flush=True)
+                    def buffered():
+                        prepare_positions(
+                            stamps,
+                            table,
+                            endpoint,
+                            valid,
+                            checkpoint,
+                            length,
+                            flushed,
+                            ok,
+                            capacity=capacity,
+                            max_window=width,
+                        )
+                        buffered_recurrent(
+                            q,
+                            k,
+                            v,
+                            d,
+                            beta,
+                            checkpoint_pool,
+                            history_k,
+                            history_u,
+                            history_d,
+                            table,
+                            state_table,
+                            endpoint,
+                            checkpoint,
+                            length,
+                            valid,
+                            flushed,
+                            ok,
+                            out,
+                            capacity=capacity,
+                            state_block_tokens=1,
+                        )
+                        commit_positions(
+                            stamps,
+                            table,
+                            endpoint,
+                            valid,
+                            accepted,
+                            checkpoint,
+                            length,
+                            flushed,
+                            ok,
+                        )
+
+                    timing = measure(buffered)
+                    if not bool(ok.all()):
+                        raise RuntimeError("invalid paged benchmark backing")
+                    row = {
+                        "batch": batch,
+                        "T": width,
+                        "L": capacity,
+                        "h": history_len,
+                        "phase": phase,
+                        "heads": heads,
+                        "dim": dim,
+                        "baseline": baseline_time,
+                        "buffered": timing,
+                        "buffered_over_baseline": timing["median_us"]
+                        / baseline_time["median_us"],
+                    }
+                    results.append(row)
+                    print(json.dumps(row), flush=True)
     args.output.write_text(
         json.dumps(
             {
-                "scope": "prepared-input recurrence, full acceptance, single layer/GPU, graph replay; excludes model, conv/gates, LCM and speculative replay commit",
+                "scope": "fixed-round prepared-input recurrence, full acceptance, single layer/GPU, graph replay; paged path includes position prepare, backing validation, recurrence and stamp commit. Endpoints do not advance during timing; this is not an amortized rollout or serving comparison. Excludes model, conv/gates, scheduler, endpoint publication and baseline speculative replay commit",
                 "environment": {
                     "python": sys.version,
                     "machine": platform.machine(),

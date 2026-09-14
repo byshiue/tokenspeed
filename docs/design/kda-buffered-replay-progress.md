@@ -18,6 +18,8 @@ M4 source commit: `ac74d6785ee921efcd2b4c061e74a562b82ac47f`
 (`feat(cache): reserve only replay history decode tails`).
 M5 source commit: `f4312f1ce25a0ff95c78a97fc70bada0013ce8af`
 (`feat(kda): bind cache-owned replay history and positions`).
+M6 source: uncommitted during validation; the signed-off commit will be recorded
+after the final tests and repository hooks.
 No default capacity or performance benefit has been established. M1 adds
 an unregistered prototype, not the complete serving feature.
 
@@ -25,7 +27,7 @@ an unregistered prototype, not the complete serving feature.
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | M2–M4 cache contracts verified; M5 fields, pool views and isolated GPU positions verified | Runtime position refresh, endpoint materialization and handoff still pending |
-| C. Unified GPU forward and commit | Isolated recurrence prototype; not registered or integrated | LCM, conv/gate integration and serving dispatch remain pending |
+| C. Unified GPU forward and commit | M6 prototype uses paged LCM fields and position prepare/commit; not registered | Runtime refresh, conv/gates, endpoint materialization and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
@@ -506,3 +508,62 @@ multiplication. The local runbook records the source patch and artifact hashes.
 Next: integrate paged recurrence and shared runtime position refresh, then
 materialization/publication ordering and ordinary/speculative commit. Capacity
 CLI/defaults and real-model validation remain gated on that work.
+
+### M6: paged recurrence and position commit
+
+Based on `68ecf326dfd6ee9305d35a96a6470d4281ae30c9` (M5 validation record).
+The unregistered GPU prototype now reads/writes strided LCM field views through
+current raw history and state tables. It replaces the dense per-request ring
+prototype; the independent CPU recurrence reference is unchanged. Standard and
+multi-token input windows use the same forward and position-commit sequence.
+
+The kernel reads state at `c`, reconstructs accepted history `[c,e)`, and writes
+candidate K/U/decay at `[e,e+width)`. A capacity flush stores `S_e` before any
+candidate update; a non-flush round stores no full state. Current block tables
+resolve both checkpoint positions, including across state-block boundaries and
+after physical remapping. The null checkpoint at `c=0` is implicit zero state,
+not a read from the arena's null block. Rejected suffixes remain uncommitted.
+
+A GPU backing check validates the complete history range, checkpoint source,
+flush destination and position consistency before recurrence stores. Invalid
+rows leave state/history/output untouched and clear validity. This deliberately
+adds a launch: the prototype sequence is position prepare, backing check,
+recurrence, then stamp commit. Validity handling in serving is still pending.
+The caller must preserve LCM ownership and stream ordering; valid block ids do
+not prove that two cache groups may occupy the same physical parent.
+
+Validation runs on a fresh persistent four-GB300 allocation under the same
+binding, using submit/srun and the cached container. One GPU is used, with no
+target/draft weights. Python 3.12.3, PyTorch 2.13.0+cu130, CUDA 13.0,
+driver 580.167.08, tokenspeed-triton 3.8.10.post20260906, pytest 9.1.1, aarch64.
+The scheduler binary/extension remain the M4 build; there are no C++ edits.
+
+Initial validation:
+
+- **36 reference/GPU tests passed**: 19 CPU reference, 10 paged recurrence and
+  invalid-backing cases, and seven position-metadata cases. The recurrence
+  matrix retains T=1/4, minimum/non-power-of-two capacities and eager/graph
+  coverage, expanded to 64 rounds with absolute holes, block reuse, physical
+  state remapping, simulated request reuse and poisoned rejected suffixes.
+  History spans 3/8 and state spans 16/128 are independent. These are isolated
+  lifecycle simulations, not proof of scheduler overlap or prefix publication.
+- **501 runtime tests and 317 subtests passed** after fixing an arena test
+  fixture. Its first version assigned state and history to the same LCM parent,
+  violating allocator ownership and causing overlapping writes. The corrected
+  fixture assigns separate parents. No numerical tolerance was relaxed.
+- **487 scheduler tests, 134 suites passed** using the unchanged binary.
+
+The microbenchmark now measures a fixed round at empty, no-flush and flush
+history lengths, including all four prototype launches. Endpoints do not
+advance during timing, and source/destination state blocks are separate so a
+flush cannot change the next sample's input. This is not the M1 rolling-ring
+benchmark, an amortized rollout, or a serving comparison. Baseline timing is
+prepared eager recurrence only; model, conv/gates, scheduler, publication and
+baseline speculative replay-commit costs are excluded. Final isolated timing
+and formatted-source results will be recorded below after validation completes.
+
+Production recipe/backend guards remain unchanged. Paged recurrence is not yet
+dispatched by the model. Shared runtime refresh, conv/gate preparation, unified
+ordinary/speculative commit, exact-endpoint materialization/publication and
+overlap/transfer/retraction integration remain pending. No real-weight TP8,
+AIME or full-model NSYS result is claimed.

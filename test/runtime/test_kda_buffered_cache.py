@@ -251,13 +251,14 @@ def test_incomplete_replay_layout_and_serving_dispatch_are_rejected():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_gpu_arena_zeroing_seeds_only_the_reused_history_page():
+def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
+    from tokenspeed_kernel.ops.attention.kda._triton.buffered import buffered_recurrent
     from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
         commit_positions,
         prepare_positions,
     )
 
-    recipe = _recipe(64)
+    recipe = _recipe(8)
     arena, pool = _pool(recipe, _layout(recipe).bind(2), "cuda", 0, 93)
     layer = min(pool.state_group_by_layer)
     replay = pool.get_replay_buffers(layer)
@@ -293,7 +294,114 @@ def test_gpu_arena_zeroing_seeds_only_the_reused_history_page():
         max_window=replay.layout.max_window,
     )
     assert checkpoint.item() == 3 and length.item() == 0 and ok.item()
+    state = pool.get_component(layer, "recurrent_state")
+    # Different cache groups cannot occupy the same physical LCM parent.
+    # History blocks 1..6 use parent 1; state block 2 uses parent 2.
+    state_table = torch.tensor([[2]], dtype=torch.int32, device="cuda")
+    state[2].fill_(0.25)
+    heads, value_dim, key_dim = state.shape[1:]
+    q = torch.full((1, 1, heads, key_dim), key_dim**-0.5, device="cuda")
+    v = torch.ones((1, 1, heads, value_dim), device="cuda")
+    decay = torch.full_like(q, 0.9)
+    beta = torch.full((1, 1, heads), 0.5, device="cuda")
+    out = torch.empty_like(v)
+    buffered_recurrent(
+        q,
+        q,
+        v,
+        decay,
+        beta,
+        state,
+        replay.key,
+        replay.correction,
+        replay.decay,
+        table,
+        state_table,
+        end,
+        checkpoint,
+        length,
+        width,
+        flush,
+        ok,
+        out,
+        capacity=replay.layout.capacity,
+        state_block_tokens=128,
+    )
+    expected_state = state[2].clone() * 0.9
+    correction = 0.5 * (v[0, 0] - torch.einsum("hvk,hk->hv", expected_state, q[0, 0]))
+    expected_state += correction[:, :, None] * q[0, 0, :, None, :]
+    torch.testing.assert_close(
+        out[0, 0],
+        torch.einsum("hvk,hk->hv", expected_state, q[0, 0]) * key_dim**-0.5,
+        atol=2e-5,
+        rtol=2e-4,
+    )
+    assert torch.all(state[2] == 0.25)  # No full-state store without a flush.
+    torch.testing.assert_close(
+        replay.correction[1, 3], correction, atol=2e-5, rtol=2e-4
+    )
     commit_positions(
         replay.checkpoint, table, end, width, width, checkpoint, length, flush, ok
     )
     assert replay.checkpoint[1, 3] == 4 and ok.item()
+    # Continue through a history-block boundary and a capacity flush using
+    # the actual packed field strides, not separate dense allocations.
+    pool.zero_new_blocks({replay.group_id: [2]})
+    table = torch.tensor([[1, 2]], dtype=torch.int32, device="cuda")
+    end.add_(1)
+    saw_flush = False
+    for _ in range(9):
+        prepare_positions(
+            replay.checkpoint,
+            table,
+            end,
+            width,
+            checkpoint,
+            length,
+            flush,
+            ok,
+            capacity=replay.layout.capacity,
+            max_window=replay.layout.max_window,
+        )
+        buffered_recurrent(
+            q,
+            q,
+            v,
+            decay,
+            beta,
+            state,
+            replay.key,
+            replay.correction,
+            replay.decay,
+            table,
+            state_table,
+            end,
+            checkpoint,
+            length,
+            width,
+            flush,
+            ok,
+            out,
+            capacity=replay.layout.capacity,
+            state_block_tokens=128,
+        )
+        assert ok.item()
+        if flush.item():
+            saw_flush = True
+            torch.testing.assert_close(state[2], expected_state, atol=2e-5, rtol=2e-4)
+        expected_state *= 0.9
+        correction = 0.5 * (
+            v[0, 0] - torch.einsum("hvk,hk->hv", expected_state, q[0, 0])
+        )
+        expected_state += correction[:, :, None] * q[0, 0, :, None, :]
+        torch.testing.assert_close(
+            out[0, 0],
+            torch.einsum("hvk,hk->hv", expected_state, q[0, 0]) * key_dim**-0.5,
+            atol=2e-5,
+            rtol=2e-4,
+        )
+        commit_positions(
+            replay.checkpoint, table, end, width, width, checkpoint, length, flush, ok
+        )
+        end.add_(1)
+    assert saw_flush

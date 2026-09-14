@@ -18,9 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GPU numerical/graph gates for the unregistered buffered KDA prototype."""
+
+"""Paged recurrence/commit gates; no serving scheduler or model is dispatched."""
 
 from __future__ import annotations
+
+import math
+import random
 
 import pytest
 import torch
@@ -30,8 +34,11 @@ if not torch.cuda.is_available():
     pytest.skip("requires a GPU", allow_module_level=True)
 
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (  # noqa: E402
-    buffered_commit,
     buffered_recurrent,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # noqa: E402
+    commit_positions,
+    prepare_positions,
 )
 
 
@@ -40,8 +47,9 @@ def direct(state, query, key, value, decay, beta):
     state = state.clone()
     for token in range(query.shape[0]):
         state = state * decay[token, :, None, :]
-        prediction = torch.einsum("hvk,hk->hv", state, key[token])
-        correction = (value[token] - prediction) * beta[token, :, None]
+        correction = (
+            value[token] - torch.einsum("hvk,hk->hv", state, key[token])
+        ) * beta[token, :, None]
         state = state + torch.einsum("hv,hk->hvk", correction, key[token])
         outputs.append(
             torch.einsum("hvk,hk->hv", state, query[token]) / query.shape[-1] ** 0.5
@@ -54,48 +62,93 @@ def direct(state, query, key, value, decay, beta):
 @pytest.mark.parametrize("graph_mode", [False, True])
 def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph_mode):
     torch.manual_seed(93)
-    batch, heads, dk, dv = 3, 12, 128, 128
+    rng = random.Random(93)
+    requests, batch, heads, dk, dv = 3, 4, 12, 128, 128
     capacity = 2 * width + extra_capacity
-    shape = (batch, width, heads, dk)
-    query = torch.empty(shape, device="cuda")
-    key = torch.empty_like(query)
-    decay = torch.empty_like(query)
-    value = torch.empty((batch, width, heads, dv), device="cuda")
+    rows = 3 if extra_capacity else 8
+    grain, context = 16 if width == 4 else 128, 512
+    columns, state_columns = math.ceil(context / rows), math.ceil(context / grain)
+    count = 1 + requests * (math.ceil(capacity / rows) + 4)
+    # Different strides from dense tensors, including padded channel dimensions.
+    hk = torch.full((count, rows, heads, dk + 3), float("nan"), device="cuda")[..., :dk]
+    hu = torch.full((count, rows, heads, dv + 5), float("nan"), device="cuda")[..., :dv]
+    hd = torch.full((count, rows, heads, dk + 7), float("nan"), device="cuda")[..., :dk]
+    stamps = torch.zeros((count, rows, 3), dtype=torch.int64, device="cuda")[:, :, 1]
+    state_count = 1 + requests * (state_columns + 1)
+    pool = torch.full((state_count, heads, dv, dk + 1), float("nan"), device="cuda")[
+        ..., :dk
+    ]
+    state_tables = torch.arange(
+        1, 1 + requests * state_columns, dtype=torch.int32
+    ).view(requests, state_columns)
+    spare = list(range(1 + requests * state_columns, state_count))
+    histories = torch.full((requests, columns), -1, dtype=torch.int32)
+    free = list(range(1, count))
+    rng.shuffle(free)
+    ends = [125, 127, 0]
+    checkpoints = list(ends)
+    states = torch.randn(requests, heads, dv, dk) * 0.1
+    states[2].zero_()  # c=0 uses implicit zero state, never null-block contents.
+    for req in range(2):
+        pool[state_tables[req, (ends[req] - 1) // grain]].copy_(states[req])
+    q = torch.empty((batch, width, heads, dk), device="cuda")
+    k, d = torch.empty_like(q), torch.empty_like(q)
+    v = torch.empty((batch, width, heads, dv), device="cuda")
     beta = torch.empty((batch, width, heads), device="cuda")
-    state = torch.randn((batch, heads, dv, dk)) * 0.1
-    checkpoint = state.cuda()
-    history_key = torch.full((batch, capacity, heads, dk), float("nan"), device="cuda")
-    history_decay = torch.full_like(history_key, float("nan"))
-    history_correction = torch.full(
-        (batch, capacity, heads, dv), float("nan"), device="cuda"
+    out = torch.empty_like(v)
+    ht = torch.full((batch, columns + 2), -1, dtype=torch.int32, device="cuda")[
+        :, :columns
+    ]
+    st = torch.full((batch, state_columns + 2), -1, dtype=torch.int32, device="cuda")[
+        :, :state_columns
+    ]
+    end = torch.zeros(batch, dtype=torch.int32, device="cuda")
+    valid, accepted, length = (
+        torch.zeros_like(end),
+        torch.zeros_like(end),
+        torch.empty_like(end),
     )
-    start = torch.zeros(batch, dtype=torch.int32, device="cuda")
-    length = torch.zeros_like(start)
-    valid = torch.zeros_like(start)
-    accepted = torch.zeros_like(start)
-    flushed = torch.zeros(batch, dtype=torch.bool, device="cuda")
-    out = torch.full_like(value, float("nan"))
+    cp = torch.empty(batch, dtype=torch.int64, device="cuda")
+    flush = torch.empty(batch, dtype=torch.bool, device="cuda")
+    ok = torch.empty_like(flush)
 
     def run():
+        prepare_positions(
+            stamps,
+            ht,
+            end,
+            valid,
+            cp,
+            length,
+            flush,
+            ok,
+            capacity=capacity,
+            max_window=width,
+        )
         buffered_recurrent(
-            query,
-            key,
-            value,
-            decay,
+            q,
+            k,
+            v,
+            d,
             beta,
-            checkpoint,
-            history_key,
-            history_correction,
-            history_decay,
-            start,
+            pool,
+            hk,
+            hu,
+            hd,
+            ht,
+            st,
+            end,
+            cp,
             length,
             valid,
-            flushed,
+            flush,
+            ok,
             out,
+            capacity=capacity,
+            state_block_tokens=grain,
         )
-        buffered_commit(start, length, valid, accepted, flushed, capacity)
+        commit_positions(stamps, ht, end, valid, accepted, cp, length, flush, ok)
 
-    # Compile on a non-default stream before graph capture, with all rows idle.
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -105,63 +158,193 @@ def test_buffered_rounds_and_graph_match_sequential(width, extra_capacity, graph
     if graph_mode:
         with torch.cuda.graph(graph):
             run()
-
-    histories = [0] * batch
-    starts = [0] * batch
-    saw_flush = saw_no_flush = False
-    for step in range(32):
-        q = F.normalize(torch.randn(shape), dim=-1)
-        k = F.normalize(torch.randn(shape), dim=-1)
-        v = torch.randn(value.shape) * 0.2
-        d = torch.exp(-torch.rand(shape) * 0.1)
-        b = torch.rand(beta.shape)
-        widths = [width, 1 + step % width, 0 if step % 3 else width]
-        accepts = [width, step % (widths[1] + 1), widths[2]]
-        before_checkpoint = checkpoint.cpu()
-        for dst, src in ((query, q), (key, k), (value, v), (decay, d), (beta, b)):
-            dst.copy_(src)
+    pointers = [t.data_ptr() for t in (pool, hk, hu, hd, stamps, ht, st, cp, out)]
+    saw_flush = saw_no_flush = saw_zero_accept_flush = saw_block_reuse = False
+    for step in range(64):
+        if step == 32:
+            # Simulated cancel/reuse after readers complete, seeded at a new exact endpoint.
+            req = 2
+            for block in histories[req][histories[req] > 0].tolist():
+                free.append(block)
+            histories[req].fill_(-1)
+            ends[req] = checkpoints[req] = 8
+            states[req] = torch.randn_like(states[req]) * 0.1
+            pool[state_tables[req, 0]].copy_(states[req])
+        for req in range(requests):
+            # A test allocator reuses physical blocks, but preserves absolute
+            # table columns. This does not simulate scheduler overlap itself.
+            first = max(0, min(checkpoints[req], ends[req] - 1)) // rows
+            last = (ends[req] + width - 1) // rows
+            for col in range(first):
+                block = int(histories[req, col])
+                if block > 0:
+                    free.append(block)
+                    histories[req, col] = -1
+                    saw_block_reuse = True
+            for col in range(first, last + 1):
+                if histories[req, col] <= 0:
+                    block = free.pop()
+                    histories[req, col] = block
+                    stamps[block].zero_()
+                    for field in (hk, hu, hd):
+                        field[block].fill_(float("nan"))
+            if step and step % 11 == 0 and checkpoints[req] > 0:
+                # A new physical address between forwards must be read through
+                # the current table, never remembered as a request pointer.
+                col = (checkpoints[req] - 1) // grain
+                previous = int(state_tables[req, col])
+                pool[spare[req]].copy_(pool[previous])
+                state_tables[req, col], spare[req] = spare[req], previous
+                pool[previous].fill_(float("nan"))
+        order = [(step + i) % requests for i in range(requests)]
+        widths = [width, 1 + step % width, 0 if step % 3 else width, 0]
+        accepts = [widths[0], step % (widths[1] + 1), widths[2], 0]
+        flags = [
+            widths[row] > 0 and ends[req] - checkpoints[req] + 2 * width > capacity
+            for row, req in enumerate(order)
+        ]
+        if not saw_zero_accept_flush:
+            for row, flag in enumerate(flags):
+                if flag:
+                    accepts[row] = 0
+        end.copy_(
+            torch.tensor([ends[req] for req in order] + [2**31 - 1], dtype=torch.int32)
+        )
         valid.copy_(torch.tensor(widths, dtype=torch.int32))
         accepted.copy_(torch.tensor(accepts, dtype=torch.int32))
+        ht[:requests].copy_(histories[order])
+        st[:requests].copy_(state_tables[order])
+        inputs = (
+            F.normalize(torch.randn(q.shape), dim=-1),
+            F.normalize(torch.randn(k.shape), dim=-1),
+            torch.randn(v.shape) * 0.2,
+            torch.exp(-torch.rand(d.shape) * 0.1),
+            torch.rand(beta.shape),
+        )
+        for dest, src in zip((q, k, v, d, beta), inputs, strict=True):
+            dest.copy_(src)
+        before = pool.clone()
         out.fill_(float("nan"))
         if graph_mode:
             graph.replay()
         else:
             run()
-        got = out.cpu()
-        flags = flushed.cpu().tolist()
-        next_checkpoint = checkpoint.cpu()
-        hk, hu, hd = history_key.cpu(), history_correction.cpu(), history_decay.cpu()
-        for row in range(batch):
-            n, a = widths[row], accepts[row]
-            expected_flush = n > 0 and histories[row] + 2 * width > capacity
-            assert flags[row] == expected_flush
-            expected, _ = direct(
-                state[row], q[row, :n], k[row, :n], v[row, :n], d[row, :n], b[row, :n]
+        assert ok.all()
+        assert flush.tolist() == flags + [False]
+        changed_blocks = set()
+        for row, req in enumerate(order):
+            n, a, e, c = widths[row], accepts[row], ends[req], checkpoints[req]
+            expected, _ = direct(states[req], *(x[row, :n] for x in inputs))
+            torch.testing.assert_close(
+                out[row, :n].cpu(), expected, atol=2e-5, rtol=2e-4
             )
-            torch.testing.assert_close(got[row, :n], expected, atol=2e-5, rtol=2e-4)
-            assert torch.isnan(got[row, n:]).all()
-            if expected_flush:
-                saw_flush = True
+            assert torch.isnan(out[row, n:]).all()
+            if flags[row]:
+                block = int(state_tables[req, (e - 1) // grain])
+                changed_blocks.add(block)
                 torch.testing.assert_close(
-                    next_checkpoint[row], state[row], atol=2e-5, rtol=2e-4
+                    pool[block].cpu(), states[req], atol=2e-5, rtol=2e-4
                 )
-                starts[row] = (starts[row] + histories[row]) % capacity
-                histories[row] = 0
+                checkpoints[req] = c = e
+                saw_flush = True
+                saw_zero_accept_flush |= a == 0
             else:
                 saw_no_flush = True
-                assert torch.equal(next_checkpoint[row], before_checkpoint[row])
-            _, state[row] = direct(
-                state[row], q[row, :a], k[row, :a], v[row, :a], d[row, :a], b[row, :a]
+            _, states[req] = direct(states[req], *(x[row, :a] for x in inputs))
+            ends[req] += a
+            materialized = (
+                torch.zeros_like(states[req])
+                if c == 0
+                else pool[state_tables[req, (c - 1) // grain]].cpu()
             )
-            histories[row] += a
-            materialized = next_checkpoint[row].clone()
-            for offset in range(histories[row]):
-                slot = (starts[row] + offset) % capacity
+            for token in range(c, ends[req]):
+                block, token_row = int(histories[req, token // rows]), token % rows
                 materialized = (
-                    materialized * hd[row, slot, :, None, :]
-                    + hu[row, slot, :, :, None] * hk[row, slot, :, None, :]
+                    materialized * hd[block, token_row].cpu()[:, None, :]
+                    + hu[block, token_row].cpu()[:, :, None]
+                    * hk[block, token_row].cpu()[:, None, :]
                 )
-            torch.testing.assert_close(materialized, state[row], atol=2e-5, rtol=2e-4)
-        assert length.cpu().tolist() == histories
-        assert start.cpu().tolist() == starts
-    assert saw_flush and saw_no_flush
+            torch.testing.assert_close(materialized, states[req], atol=2e-5, rtol=2e-4)
+            # Rejected data is poisoned after validation. Future reads must not
+            # observe it until the corresponding token is recomputed.
+            for token in range(e + a, e + n):
+                block = int(histories[req, token // rows])
+                for field in (hk, hu, hd):
+                    field[block, token % rows].fill_(float("nan"))
+        keep = [i for i in range(state_count) if i not in changed_blocks]
+        torch.testing.assert_close(
+            pool[keep], before[keep], rtol=0, atol=0, equal_nan=True
+        )
+        assert torch.isnan(out[-1]).all()
+    assert saw_flush and saw_no_flush and saw_zero_accept_flush and saw_block_reuse
+    assert [
+        t.data_ptr() for t in (pool, hk, hu, hd, stamps, ht, st, cp, out)
+    ] == pointers
+
+
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_invalid_backing_rejects_entire_row_before_stores(graph_mode):
+    batch, width, heads, dim = 4, 4, 1, 16
+    shape = (batch, width, heads, dim)
+    q = torch.ones(shape, device="cuda") / 4
+    v, d = torch.ones_like(q), torch.ones_like(q)
+    beta = torch.ones((batch, width, heads), device="cuda") / 2
+    pool = torch.ones((9, heads, dim, dim), device="cuda")
+    hk = torch.ones((13, 2, heads, dim), device="cuda")
+    hu, hd = torch.ones_like(hk), torch.ones_like(hk)
+    ht = torch.tensor(
+        [[1, 0, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    st = torch.tensor(
+        [[1, 2], [0, 4], [5, 0], [7, 8]], dtype=torch.int32, device="cuda"
+    )
+    end = torch.full((batch,), 2, dtype=torch.int32, device="cuda")
+    cp = torch.ones(batch, dtype=torch.int64, device="cuda")
+    length = torch.ones(batch, dtype=torch.int32, device="cuda")
+    valid = torch.full_like(end, width)
+    flush = torch.ones(batch, dtype=torch.bool, device="cuda")
+    ok = torch.ones_like(flush)
+    out = torch.full_like(q, float("nan"))
+    before = [t.clone() for t in (pool, hk, hu, hd)]
+
+    def run():
+        buffered_recurrent(
+            q,
+            q,
+            v,
+            d,
+            beta,
+            pool,
+            hk,
+            hu,
+            hd,
+            ht,
+            st,
+            end,
+            cp,
+            length,
+            valid,
+            flush,
+            ok,
+            out,
+            capacity=8,
+            state_block_tokens=1,
+        )
+
+    run()
+    if graph_mode:
+        ok.fill_(True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+    assert ok.tolist() == [False, False, False, True]
+    assert torch.isnan(out[:3]).all()
+    # Valid fourth row may write only state block 8 and history blocks 11/12.
+    for tensor, original, allowed in zip(
+        (pool, hk, hu, hd), before, ({8}, {11, 12}, {11, 12}, {11, 12}), strict=True
+    ):
+        keep = [i for i in range(tensor.shape[0]) if i not in allowed]
+        torch.testing.assert_close(tensor[keep], original[keep], rtol=0, atol=0)

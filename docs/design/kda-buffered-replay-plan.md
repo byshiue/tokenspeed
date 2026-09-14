@@ -6,7 +6,9 @@
 已实现的 cache 基础包含 lagging checkpoint retention、request-local history
 的 dependency/reuse contract，以及 prefill 的空 history 尾部预留。M5 新增显式的
 Kimi-K3 history 字段规划、零拷贝 view，以及未注册的 GPU position 原型；
-runtime metadata refresh、paged recurrence、端点物化与提交顺序仍待接入。
+M6 将未注册的 dense-ring GPU 原型改成通过 raw block table 读写 LCM 字段，
+并接上 position prepare/commit 原型。Runtime metadata refresh、serving dispatch、
+端点物化与提交顺序仍待接入。
 
 ## 1. 目标与范围
 
