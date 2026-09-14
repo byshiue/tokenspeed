@@ -56,6 +56,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
 )
 from tokenspeed_kernel.ops.attention.kda.triton import verify_state_blocks
 from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+from typing_extensions import override
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -850,6 +851,15 @@ class MambaAttnBackend(AttentionBackend):
             )
             cache[key] = rows
         return rows
+
+    @override
+    def commit_state_after_verify(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ) -> None:
+        # Legacy extend/mixed scans commit final states during forward. A
+        # deferred consumer may override this hook to commit its decode suffix.
+        if num_extends == 0:
+            self.commit_verified_state(accepted_lengths)
 
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
         """Commit the accepted draft prefix into each group's state slab."""

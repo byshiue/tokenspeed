@@ -43,8 +43,8 @@ against the frozen baseline before the work meets its completion gate.
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Owner-triggered handoff and recovery integration still pending |
-| C. Unified GPU forward and commit | M12 connects the workspace to KDA decode and accepted commit, with rank-agreed failure feedback | Lifecycle handoff and mixed batches remain pending; recurrence not registered and factory still gated |
-| D. Graphs, overlap and lifecycle integration | M10–M13 pipeline and endpoint checks pass in eager/graph; owner lifecycle still pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
+| C. Unified GPU forward and commit | M14 adds mixed-batch decode composition to M12's backend/commit integration | Lifecycle handoff pending; recurrence not registered and factory still gated |
+| D. Graphs, overlap and lifecycle integration | M10–M14 pipeline, endpoint and mixed-to-graph checks pass; owner lifecycle still pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
 ## Recording a result
@@ -1147,3 +1147,57 @@ microbenchmark. It excludes model execution, conv/gate producers, CPU feedback,
 scheduler and quiescent handoff latency; it cannot satisfy the full-model
 Eagle3 no-regression gate. Raw samples, source extraction, comparison script
 and environment are retained in the local M13 artifacts.
+
+### M14: mixed prefill and buffered decode
+
+Source: based on `58d42fa4` (M13 record), not yet committed.
+
+Mixed KDA metadata now describes prefill only for leading extend requests and
+uses the ordinary buffered refresh for the decode suffix. Within each layer,
+zero-copy producer slices feed the existing prefill scan and buffered decode;
+the outputs rejoin in request/token order, with projection padding zeroed.
+There is still one model forward. The common accepted-state hook delegates
+through the hybrid wrapper; KDA commits only live decode counts. Legacy Mamba
+retains its existing pure-decode commit behavior. Result validity likewise
+covers only the live decode suffix, and the CPU check uses that row count.
+No new persistent tensor workspace or request state is allocated.
+
+This does not complete lifecycle handoff. Prefill still requires an exact
+input snapshot from the owner; materializing after admission has recycled its
+history would be too late. An eventual prefill handoff must also preserve its
+borrowed failure flags before a later decode refresh overwrites metadata.
+Neither shortcut is installed here. Scheduler-triggered handoff, factory and
+kernel registration, real-model correctness and Eagle3 performance remain open.
+
+Validation uses the same persistent four-GB300 environment as M13. Synthetic
+TP8 per-layer dimensions span six local KDA layers and two cache groups. The
+new parameterized test compares a real CuteDSL-prefill/buffered-decode mixed
+batch against separate forwards on identical pools, then resumes all requests
+through eager or captured decode. It covers fresh and cached prefill, an
+internal aligned checkpoint, lagging decode state, partial/zero acceptance,
+flush, projection padding and mode transitions. The comparison requires
+bitwise-equal outputs and complete pool bytes; existing kernel tests retain
+their independent CPU references. An initial fixture used the wrong backend
+name and failed before kernels ran; it now selects `cutedsl_kda` explicitly.
+The native kernel requires the real model's gate lower bound **-5.0**, so this
+test uses that value rather than the prototype's synthetic -0.3. The first
+actual composition run also caught the existing output-rank difference:
+prefill returns `[tokens,H,D]`, while buffered decode returns `[1,tokens,H,D]`.
+The join now adds a zero-copy leading dimension to prefill output. With that
+fix, the focused suite passed **4 cases** (22 warnings, 18.48s), including
+bitwise pool/output comparisons after mixed execution and graph decode.
+The integration suite passed **169 cases plus 62 subtests** (23 warnings,
+39.23s), with the same three optional/vendor-specific skips as M13. It also
+checks invalid mixed acceptance before pool stores and successful/failed CPU
+feedback for both pure decode and a mixed decode suffix. The scheduler/cache/GDN
+suite passed **527 cases plus 317 subtests** (28 warnings, 36.46s). Counts overlap.
+All-files hooks corrected imports and formatted two files; final validation and
+source hashes are retained with the local milestone artifacts.
+
+The real CuteDSL prefill kernel ran in the new test; only the older optional
+FLA reference cases were skipped. No numerical tolerance was widened and no
+kernel math changed. No new latency measurement is claimed for M14: M13's
+recurrence-only timing is not evidence for this runtime change or the final
+full-model no-regression gate. The plan's introduction now summarizes current
+status rather than repeating superseded per-milestone statements; historical
+details remain in this record and the full acceptance requirements are unchanged.

@@ -53,7 +53,8 @@ class StateCommitValidator:
         The caller must have joined the output copy event. Missing decode
         flags and malformed results fail through the same collective as false
         flags, never through an early rank-local exception. Prefill has no
-        deferred commit and may return None. Padding must already be sliced off.
+        deferred commit and may return None. bs counts only the live decode
+        suffix; leading mixed-batch prefills and graph padding are excluded.
         """
         if not self.enabled:
             return

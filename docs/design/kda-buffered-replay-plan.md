@@ -1,28 +1,12 @@
 # Kimi-K3 Buffered Replay：统一 Decode 实现计划
 
-状态：实现中。Reference 和未注册的 GPU 原型已完成，cache contract 正在接入；
-当前服务端尚未启用 buffered replay。验证与剩余工作见
-[implementation record](kda-buffered-replay-progress.md)。本文件仍是完整方案与验收计划。
-已实现的 cache 基础包含 lagging checkpoint retention、request-local history
-的 dependency/reuse contract，以及 prefill 的空 history 尾部预留。M5 新增显式的
-Kimi-K3 history 字段规划、零拷贝 view，以及未注册的 GPU position 原型；
-M6 将未注册的 dense-ring GPU 原型改成通过 raw block table 读写 LCM 字段，
-并接上 position prepare/commit 原型；M7 将已接受历史的重建改为分块 FP32 计算。
-M8 接通普通/speculative decode 的共同 commit hook，并在未注册的 recurrence
-中融合原生 conv/gate 输入的转换。共享 runtime metadata refresh、buffered
-serving dispatch、端点物化与完整提交顺序仍待接入。M9 新增按 cache group
-共享的固定地址 metadata owner 与跨层 stamp commit；尚未接入 serving dispatch。
-M10 将 conv producer、raw candidate capture、gate GEMM、recurrent 和跨层 conv
-commit 接入同一个实验工作区，并核对实际分配与 recipe 预算。端点物化、生命周期
-交付及完整模型验收仍未完成，不能据此启用 serving。
-M11 增加 acceptance 之后的跨层 endpoint 物化，复用 forward 的 FP32 历史重建；
-精确 endpoint 的 GPU 写回已有实验实现，scheduler 触发、交付完成与失败反馈仍待接入。
-M12 已将工作区接入 KDA backend 的统一 decode/commit，并将有效性随输出拷回
-CPU，在 scheduler 接受结果前作跨 rank 检查。生命周期交接、mixed batch、配置
-启用与完整模型验收仍待完成；本阶段不据此选择默认容量。
-M13 增加不依赖本轮 forward 的 quiescent endpoint 物化：重新载入请求表和
-accepted endpoint，仅重建已接受历史，不要求 candidate 空间，也不改 conv。
-这提供生命周期交接所需的计算操作；scheduler 的触发与完成反馈仍未接入。
+状态：实现中，服务端尚未启用 buffered replay。已实现 LCM-owned history、
+固定地址 metadata、统一 decode/accepted commit、跨 rank 失败检查，以及
+accepted/quiescent endpoint 物化。M14 接通 mixed batch 中的 buffered decode
+部分，复用同一个 forward/commit；prefill 仍要求 cache owner 提供精确输入状态。
+Scheduler 生命周期交接、公开 kernel 注册、配置启用和真实 TP8 Eagle3/AIME/NSYS
+验收仍待完成，尚未选择默认容量。各阶段 commit、环境和验证证据见
+[implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 
 ## 1. 目标与范围
 

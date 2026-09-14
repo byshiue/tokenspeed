@@ -170,6 +170,9 @@ become successful token feedback or checkpoint provenance. This is a fatal
 cache-invariant failure, not the recoverable NaN-output guard. Contracts without
 buffered state perform no additional collective. The validator holds CPU values
 only and neither advances the scheduler nor performs GPU work.
+For mixed batches these flags contain only the live decode suffix; the loop
+validates against `len(request_ids) - num_extends`. Leading prefills have
+already written their final state and owe no deferred acceptance commit.
 
 ## Principle 4: correctness never depends on the in-flight depth
 

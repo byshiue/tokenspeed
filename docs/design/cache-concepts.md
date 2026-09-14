@@ -358,8 +358,10 @@ This is an integration foundation, not a serving option. The production recipe
 factory names no replay dependency. An explicit, internal Kimi-K3 planning input
 can bind the fields below. Its KDA backend now consumes them through unified
 buffered decode and accepted-endpoint commit, with rank-agreed failure feedback.
-Mixed batches and lifecycle handoffs remain gated; the recipe factory still
-enables no replay layout.
+Mixed batches compose exact-state prefill with the same buffered decode suffix.
+Lifecycle handoffs remain gated; the recipe factory still enables no replay
+layout. A prefill consumer must receive an exact snapshot before cache admission
+can discard its history; runtime dispatch cannot recover already-recycled rows.
 PD rejects replay-history declarations and wire contracts until materialized
 handoff is implemented. This explicit gate must not be removed by giving the
 history a `full_suffix` transfer policy: there may be no initialized prefill

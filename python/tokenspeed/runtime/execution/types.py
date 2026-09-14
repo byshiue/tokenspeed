@@ -125,7 +125,8 @@ class ModelExecutionResult:
     next_input_ids: torch.Tensor | None = None
     # Per-request NaN-guard flags (int32, [bs]); None when the guard is disabled.
     output_nan_flags: torch.Tensor | None = None
-    # CPU bool [local cache groups, live requests], copied after state commit.
+    # CPU bool [local cache groups, live decode requests], after state commit.
+    # Mixed batches exclude leading prefill requests (no deferred commit).
     # Unlike numerical-output flags, these may differ across TP ranks and must
     # be rank-agreed before the scheduler accepts any output from this round.
     state_commit_validity: torch.Tensor | None = None

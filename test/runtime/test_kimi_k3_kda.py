@@ -603,6 +603,7 @@ class _KDAHarness:
             bs=bs,
             forward_mode=ForwardMode.EXTEND,
             mixed_qkv=mixed.clone(),
+            save_kv_cache=True,
             g_raw=g_raw,
             beta_raw=beta_raw,
             seq_len=seq_len,

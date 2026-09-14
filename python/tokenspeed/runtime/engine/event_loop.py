@@ -789,7 +789,7 @@ class EventLoop:
             results = pending.result()
         self._state_commit_validator.validate(
             results.state_commit_validity,
-            bs=len(forward_op.request_ids),
+            bs=len(forward_op.request_ids) - forward_op.num_extends(),
             requires_commit=forward_op.num_extends() < len(forward_op.request_ids),
         )
         self.request_handler.forward_ct += 1

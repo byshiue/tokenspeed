@@ -92,6 +92,16 @@ def _slice_kda_prefill_inputs(
     )
 
 
+def _slice_kda_token_inputs(inputs: dict, start: int, end: int) -> dict:
+    """Slice token-leading producers, keeping model-static weights unchanged."""
+    sliced = {**inputs, "seq_len": end - start}
+    for name in ("mixed_qkv", "f_a_out", "beta_raw", "g_raw", "a", "b", "output_gate"):
+        value = inputs.get(name)
+        if value is not None:
+            sliced[name] = value[start:end]
+    return sliced
+
+
 class KdaAttnBackend(MambaAttnBackend):
     """Attention backend for KDA linear attention layers (Kimi-K3).
 
@@ -143,6 +153,8 @@ class KdaAttnBackend(MambaAttnBackend):
         self.forward_decode_metadata: dict[str, KDAReplayGroupMetadata] | None = None
         self._buffered_bs = 0
         self._buffered_actual_bs = 0
+        self._buffered_num_extends = 0
+        self._buffered_prefill_tokens = 0
         self._buffered_commit_pending = False
         self._verify_producer_stream: torch.cuda.Stream | None = None
         self._verify_producer_forks: dict[int, StreamFork] = {}
@@ -568,6 +580,8 @@ class KdaAttnBackend(MambaAttnBackend):
         if num_extends or not forward_mode.is_decode_or_idle():
             raise RuntimeError("buffered refresh requires a pure decode batch")
         self._buffered_bs, self._buffered_actual_bs = bs, actual_bs
+        self._buffered_num_extends = 0
+        self._buffered_prefill_tokens = 0
         self._buffered_commit_pending = actual_bs > 0
         workspace.metadata.refresh(
             bs, actual_bs, seq_lens, block_tables, for_handoff=False
@@ -599,8 +613,40 @@ class KdaAttnBackend(MambaAttnBackend):
     ) -> None:
         self._buffered_actual_bs = 0
         self._buffered_commit_pending = False
-        if self._buffered_replay is not None and 0 < num_extends < bs:
-            raise RuntimeError("buffered mixed-batch handoff is not integrated")
+        self._buffered_num_extends = num_extends
+        self._buffered_prefill_tokens = 0
+        if self._buffered_replay is not None and forward_mode.is_mixed():
+            if not 0 < num_extends < bs:
+                raise ValueError("mixed KDA metadata requires extend and decode rows")
+            # The decode suffix uses exactly the pure-decode refresh. Prefill
+            # metadata covers only leading extend rows, whose input snapshots
+            # must already be exact under the cache-owner handoff contract.
+            decodes = bs - num_extends
+            self.refresh_decode_metadata(
+                decodes,
+                decodes,
+                req_pool_indices[num_extends:bs],
+                seq_lens[num_extends:bs],
+                forward_mode=ForwardMode.DECODE,
+                block_tables={
+                    gid: rows[num_extends:bs] for gid, rows in block_tables.items()
+                },
+                num_extends=0,
+                for_graph_replay=False,
+            )
+            self._buffered_num_extends = num_extends
+            self._buffered_prefill_tokens = int(extend_seq_lens_cpu[:num_extends].sum())
+            bs = num_extends
+            req_pool_indices = req_pool_indices[:bs]
+            seq_lens = seq_lens[:bs]
+            block_tables = {gid: rows[:bs] for gid, rows in block_tables.items()}
+            forward_mode = ForwardMode.EXTEND
+        elif (
+            self._buffered_replay is not None
+            and not forward_mode.is_idle()
+            and num_extends != bs
+        ):
+            raise ValueError("buffered prefill metadata must describe only extend rows")
         super().init_forward_metadata(
             bs,
             num_extends,
@@ -615,6 +661,78 @@ class KdaAttnBackend(MambaAttnBackend):
             extend_with_prefix=extend_with_prefix,
             **kwargs,
         )
+
+    @override
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        bs: int,
+        forward_mode: ForwardMode,
+        save_kv_cache: bool,
+        **kwargs,
+    ):
+        workspace = self._buffered_replay
+        if workspace is None or not forward_mode.is_mixed():
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                token_to_kv_pool,
+                bs,
+                forward_mode,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        extends = self._buffered_num_extends
+        decodes = self._buffered_actual_bs
+        prefill_tokens = self._buffered_prefill_tokens
+        real_tokens = prefill_tokens + decodes * workspace.metadata.layout.max_window
+        if (
+            not save_kv_cache
+            or not 0 < extends < bs
+            or extends + decodes != bs
+            or kwargs["seq_len"] < real_tokens
+        ):
+            raise RuntimeError("mixed KDA forward differs from its refreshed metadata")
+        # This is one model dispatch. Within each KDA layer, variable-length
+        # prefill scans its exact input states and the decode suffix consumes
+        # the same buffered operation as pure decode. Slices are zero-copy;
+        # shared decode output must be consumed before the next layer reuses it.
+        prefill = super().forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            extends,
+            ForwardMode.EXTEND,
+            save_kv_cache=save_kv_cache,
+            **_slice_kda_token_inputs(kwargs, 0, prefill_tokens),
+        )
+        decode = self.forward_decode(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            decodes,
+            save_kv_cache=save_kv_cache,
+            **_slice_kda_token_inputs(kwargs, prefill_tokens, real_tokens),
+        )
+        # KDA prefill returns packed [tokens,H,D]; buffered decode retains
+        # the scan-compatible leading dimension until the hybrid wrapper.
+        parts = [prefill.unsqueeze(0), decode]
+        padding = kwargs["seq_len"] - real_tokens
+        if padding:
+            parts.append(
+                decode.new_zeros((1, padding, workspace.heads, workspace.value_dim))
+            )
+        return torch.cat(parts, dim=1)
 
     @override
     def forward_decode(
@@ -680,14 +798,35 @@ class KdaAttnBackend(MambaAttnBackend):
     ) -> torch.Tensor | None:
         if (
             self._buffered_replay is None
-            or num_extends
             or not self._buffered_actual_bs
             or self._buffered_commit_pending
         ):
             return None
-        if bs != self._buffered_actual_bs:
+        if (
+            num_extends != self._buffered_num_extends
+            or bs - num_extends != self._buffered_actual_bs
+        ):
             raise RuntimeError("commit validity must exclude graph padding")
-        return self._buffered_replay.metadata.ok[:, :bs]
+        return self._buffered_replay.metadata.ok[:, : self._buffered_actual_bs]
+
+    @override
+    def commit_state_after_verify(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ) -> None:
+        if self._buffered_replay is None:
+            return super().commit_state_after_verify(
+                accepted_lengths, num_extends=num_extends
+            )
+        if not self._buffered_actual_bs:
+            return  # Pure prefill, idle or the graph's zero-live capture warmup.
+        if (
+            num_extends != self._buffered_num_extends
+            or accepted_lengths.numel() != num_extends + self._buffered_actual_bs
+        ):
+            raise RuntimeError("buffered commit must match the live mixed/decode rows")
+        # Prefill has already written exact final states. Only decode rows owe
+        # accepted commit; their counts include the target input, without +1.
+        self.commit_verified_state(accepted_lengths[num_extends:])
 
     def _kda_gate(
         self,

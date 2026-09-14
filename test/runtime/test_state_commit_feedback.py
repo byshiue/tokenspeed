@@ -58,19 +58,22 @@ def test_state_validity_contract_and_disabled_consumers():
     )
 
 
-def test_invalid_commit_stops_feedback_after_copy_completion():
+@pytest.mark.parametrize("num_extends", [0, 2])
+@pytest.mark.parametrize("invalid", [False, True])
+def test_commit_feedback_after_copy_completion(num_extends, invalid):
     from tokenspeed.runtime.engine.event_loop import EventLoop
+    from tokenspeed.runtime.execution.device import DeviceRole
 
     flags = torch.ones(2, 1, dtype=torch.bool)
     order = []
 
     def copied():
         order.append("copy completed")
-        flags[1, 0] = False
+        flags[1, 0] = not invalid
 
     result = ModelExecutionResult(
-        output_tokens=torch.tensor([7]),
-        output_lengths=torch.tensor([1]),
+        output_tokens=torch.full((num_extends + 1,), 7),
+        output_lengths=torch.ones(num_extends + 1, dtype=torch.int32),
         copy_event=SimpleNamespace(synchronize=copied),
         state_commit_validity=flags,
     )
@@ -81,16 +84,27 @@ def test_invalid_commit_stops_feedback_after_copy_completion():
         _state_commit_validator=StateCommitValidator(
             enabled=True, local_groups=2, groups=()
         ),
-        request_handler=SimpleNamespace(forward_ct=0),
+        request_handler=SimpleNamespace(forward_ct=0, _profile_batch_predicate=Mock()),
         output_processor=Mock(),
         _pp_broadcast_output_tokens=Mock(),
+        _device=SimpleNamespace(role=DeviceRole.PLAIN),
+        _batch_logger=Mock(),
     )
-    op = SimpleNamespace(request_ids=["request"], num_extends=lambda: 0)
-    with pytest.raises(RuntimeError, match="must not be published"):
+    op = SimpleNamespace(
+        request_ids=[f"prefill-{i}" for i in range(num_extends)] + ["decode"],
+        num_extends=lambda: num_extends,
+    )
+    if invalid:
+        with pytest.raises(RuntimeError, match="must not be published"):
+            EventLoop._commit_forward_results(loop, op, pending)
+        assert loop.request_handler.forward_ct == 0
+        loop.output_processor.post_process_forward_op.assert_not_called()
+        loop._pp_broadcast_output_tokens.assert_not_called()
+    else:
         EventLoop._commit_forward_results(loop, op, pending)
-    assert order == ["copy completed"] and loop.request_handler.forward_ct == 0
-    loop.output_processor.post_process_forward_op.assert_not_called()
-    loop._pp_broadcast_output_tokens.assert_not_called()
+        assert loop.request_handler.forward_ct == 1
+        loop.output_processor.post_process_forward_op.assert_called_once()
+        loop._pp_broadcast_output_tokens.assert_called_once_with(op, result)
     assert pending.result() is result and order == ["copy completed"]
 
 

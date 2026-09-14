@@ -651,6 +651,332 @@ def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width,capacity", [(1, 8), (4, 37)])
+@pytest.mark.parametrize("captured_decode", [False, True])
+def test_mixed_prefill_and_buffered_decode_match_separate_batches(
+    width, capacity, captured_decode
+):
+    """Compare real mixed dispatch with separate prefill/decode on identical pools.
+
+    Prefill includes a fresh request and an internal aligned checkpoint. Decode
+    includes lagging state, partial/zero acceptance and a possible capacity
+    flush. All four requests then resume through ordinary or captured decode.
+    Numerical kernels already have independent CPU references; this check
+    isolates routing, acceptance offsets and metadata transitions.
+    """
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+
+    torch.manual_seed(727)
+    batch, extends, context, heads, dim, rank = 4, 2, 256, 12, 128, 128
+    channels = 3 * heads * dim
+    recipe = _recipe(
+        capacity, decode_input_tokens=width, max_bs=batch, context_len=context
+    )
+    plan = _layout(recipe).bind(40).narrow_to_layers(28, 36)
+    backends, roots, pools = [], [], []
+    for _ in range(2):
+        _, pool = _pool(recipe, plan, "cuda", 28, 36)
+        config = replace(
+            recipe.attn_config, device="cuda", speculative_num_draft_tokens=width
+        )
+        backend = KdaAttnBackend(
+            config, config.component(MLAConfig), kda_backend="cutedsl_kda"
+        )
+        backend.set_cache_pool(pool)
+        backend.init_cuda_graph_state(batch)
+        backends.append(backend)
+        pools.append(pool)
+        roots.append(
+            HybridLinearAttnBackend(
+                AttentionBackend(config, config.component(MLAConfig)), backend, []
+            )
+        )
+    candidate, reference = backends
+    meta = candidate._buffered_replay.metadata
+    layers = candidate._buffered_replay.layer_ids
+    tables = {}
+    for index, (gid, group) in enumerate(meta._groups.items()):
+        first = index * 96 + 1
+        ht = torch.zeros((batch, 24), dtype=torch.int32, device="cuda")
+        for row, start in enumerate((0, 15, 14, 14)):
+            ht[row, start : start + 8].copy_(
+                torch.arange(first + row * 8, first + (row + 1) * 8)
+            )
+        ht[0, :1] = 0
+        ht[1, :17] = 0  # Fresh history only at the completing prefill's tail.
+        st = torch.arange(
+            index * 16 + 9, index * 16 + 17, dtype=torch.int32, device="cuda"
+        ).view(batch, 2)
+        tables[gid], tables[group[0].checkpoint_group_id] = ht, st
+        pools[0].zero_new_blocks(
+            {
+                gid: list(range(first, first + 32)),
+                group[0].checkpoint_group_id: st.flatten().tolist(),
+            }
+        )
+    before = [0, 120, 126, 132]
+    checkpoints = [0, 120, 122, 132 - min(8, capacity - width)]
+    for layer in layers:
+        history = pools[0].get_replay_buffers(layer)
+        conv, state = pools[0].get_state_buffers(layer)
+        ht, st = tables[history.group_id], tables[history.checkpoint_group_id]
+        for row in (1, 2, 3):
+            c, e = checkpoints[row], before[row]
+            state[st[row, (c - 1) // 128]] = torch.randn_like(state[0]) * 0.02
+            conv[st[row, (e - 1) // 128]] = torch.randn_like(conv[0]) * 0.1
+            for position in range(c, e):
+                page, slot = ht[row, position // 8], position % 8
+                history.key[page, slot] = torch.randn_like(history.key[0, 0]) * 0.1
+                history.correction[page, slot] = (
+                    torch.randn_like(history.correction[0, 0]) * 0.02
+                )
+                history.decay[page, slot] = 0.97
+            if row >= extends:
+                history.checkpoint[ht[row, (e - 1) // 8], (e - 1) % 8] = c + 1
+    pools[1].arena.buffer.copy_(pools[0].arena.buffer)
+    lengths_cpu = torch.tensor([11, 19], dtype=torch.int32)
+    prefixes_cpu = torch.tensor(before[:extends], dtype=torch.int32)
+    lengths, prefixes = lengths_cpu.cuda(), prefixes_cpu.cuda()
+    after = [11, 139, before[2] + width, before[3] + width]
+    seq_lens = torch.tensor(after, dtype=torch.int32, device="cuda")
+    slots = torch.arange(batch, dtype=torch.int32, device="cuda")
+    prefill_tokens, real_tokens = 30, 30 + 2 * width
+    count = real_tokens + 3  # Padded projection tail must not become a request.
+    raw = (
+        torch.randn(len(layers), count, channels, dtype=torch.bfloat16, device="cuda")
+        * 0.1
+    )
+    f_a = (
+        torch.randn(len(layers), count, rank, dtype=torch.bfloat16, device="cuda") * 0.1
+    )
+    beta = (
+        torch.randn(len(layers), count, heads, dtype=torch.bfloat16, device="cuda")
+        * 0.2
+    )
+    weights = (
+        torch.randn(len(layers), channels, 4, dtype=torch.bfloat16, device="cuda") * 0.2
+    )
+    f_b = (
+        torch.randn(len(layers), heads * dim, rank, dtype=torch.bfloat16, device="cuda")
+        * 0.05
+    )
+    a_log = torch.full((heads,), -1.0, device="cuda")
+    bias = torch.randn(len(layers), heads * dim, device="cuda") * 0.2
+
+    def inputs(index, start, end):
+        return dict(
+            mixed_qkv=raw[index, start:end].clone(),
+            conv_weights=weights[index],
+            bias=None,
+            activation="silu",
+            key_dim=heads * dim * 8,
+            value_dim=heads * dim * 8,
+            attention_tp_size=8,
+            head_k_dim=dim,
+            head_v_dim=dim,
+            f_a_out=f_a[index, start:end],
+            f_b_weight=f_b[index],
+            beta_raw=beta[index, start:end],
+            A_log=a_log,
+            dt_bias=bias[index],
+            lower_bound=-5.0,
+            output_gate=None,
+            norm_weight=None,
+            norm_eps=None,
+            layer_id=layers[index],
+            seq_len=end - start,
+        )
+
+    def prefill_metadata(backend, size, mode, delivered):
+        backend.init_forward_metadata(
+            size,
+            extends,
+            slots[:size],
+            seq_lens[:size],
+            mode,
+            block_tables=delivered,
+            extend_seq_lens=lengths,
+            extend_seq_lens_cpu=lengths_cpu,
+            extend_prefix_lens=prefixes,
+            extend_prefix_lens_cpu=prefixes_cpu,
+            extend_with_prefix=True,
+        )
+
+    def refresh(backend, live, delivered, lens):
+        backend.refresh_decode_metadata(
+            live,
+            live,
+            slots[:live],
+            lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=delivered,
+            num_extends=0,
+            for_graph_replay=captured_decode,
+        )
+
+    prefill_metadata(candidate, batch, ForwardMode.MIXED, tables)
+    assert candidate.forward_metadata.query_start_loc.tolist() == [0, 11, 30]
+    assert meta.end[:2].tolist() == before[extends:]
+    mixed_outputs = []
+    for index in range(len(layers)):
+        mixed_outputs.append(
+            roots[0].forward(
+                None,
+                None,
+                None,
+                None,
+                pools[0],
+                ForwardMode.MIXED,
+                batch,
+                save_kv_cache=True,
+                record_kv_cache=None,
+                **inputs(index, 0, count),
+            )
+        )
+    assert roots[0].state_commit_validity(batch, num_extends=extends) is None
+    accepted = torch.tensor([1, 1, min(2, width), 0], dtype=torch.int32, device="cuda")
+    roots[0].commit_state_after_verify(accepted, num_extends=extends)
+    validity = roots[0].state_commit_validity(batch, num_extends=extends)
+    assert validity.shape == (len(meta._groups), batch - extends) and validity.all()
+
+    prefill_metadata(
+        reference,
+        extends,
+        ForwardMode.EXTEND,
+        {gid: t[:extends] for gid, t in tables.items()},
+    )
+    prefill_outputs = [
+        roots[1].forward(
+            None,
+            None,
+            None,
+            None,
+            pools[1],
+            ForwardMode.EXTEND,
+            extends,
+            save_kv_cache=True,
+            record_kv_cache=None,
+            **inputs(index, 0, prefill_tokens),
+        )
+        for index in range(len(layers))
+    ]
+    refresh(
+        reference,
+        batch - extends,
+        {gid: t[extends:] for gid, t in tables.items()},
+        seq_lens[extends:],
+    )
+    decode_outputs = [
+        roots[1]
+        .forward(
+            None,
+            None,
+            None,
+            None,
+            pools[1],
+            ForwardMode.DECODE,
+            batch - extends,
+            save_kv_cache=True,
+            record_kv_cache=None,
+            **inputs(index, prefill_tokens, real_tokens),
+        )
+        .clone()
+        for index in range(len(layers))
+    ]
+    roots[1].commit_state_after_verify(accepted[extends:], num_extends=0)
+    for mixed, prefill, decode in zip(
+        mixed_outputs, prefill_outputs, decode_outputs, strict=True
+    ):
+        torch.testing.assert_close(mixed[:prefill_tokens], prefill, atol=0, rtol=0)
+        torch.testing.assert_close(
+            mixed[prefill_tokens:real_tokens], decode, atol=0, rtol=0
+        )
+        assert not mixed[real_tokens:].any()
+    torch.testing.assert_close(
+        pools[0].arena.buffer, pools[1].arena.buffer, atol=0, rtol=0
+    )
+
+    # Malformed decode acceptance must survive the mixed offset and suppress
+    # every deferred store. No prefill count is treated as a decode count.
+    prefill_metadata(candidate, batch, ForwardMode.MIXED, tables)
+    invalid = accepted.clone()
+    invalid[extends:] = width + 1
+    roots[0].commit_state_after_verify(invalid, num_extends=extends)
+    assert not roots[0].state_commit_validity(batch, num_extends=extends).any()
+    torch.testing.assert_close(
+        pools[0].arena.buffer, pools[1].arena.buffer, atol=0, rtol=0
+    )
+
+    # Prefill rows now join the ordinary buffered path with empty history;
+    # previous decode rows retain exactly their accepted histories. Capture
+    # must not inherit the prior mixed split or its prefill metadata.
+    next_lens = torch.tensor(
+        [11 + width, 139 + width, before[2] + min(2, width) + width, before[3] + width],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    next_outputs = []
+    next_accepted = torch.full((batch,), width, dtype=torch.int32, device="cuda")
+    for which, (backend, root, pool) in enumerate(
+        zip(backends, roots, pools, strict=True)
+    ):
+        projected = [inputs(index, 0, batch * width) for index in range(len(layers))]
+        out = torch.empty(
+            (len(layers), batch * width, heads, dim),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+
+        def run():
+            for index, arguments in enumerate(projected):
+                out[index].copy_(
+                    root.forward(
+                        None,
+                        None,
+                        None,
+                        None,
+                        pool,
+                        ForwardMode.DECODE,
+                        batch,
+                        save_kv_cache=True,
+                        record_kv_cache=None,
+                        **arguments,
+                    )
+                )
+
+        if captured_decode and which == 0:
+            backend.init_forward_metadata_capture_cuda_graph(
+                batch, slots, next_lens, ForwardMode.DECODE, block_tables=tables
+            )
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                run()
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                run()
+        refresh(backend, batch, tables, next_lens)
+        if captured_decode and which == 0:
+            graph.replay()
+        else:
+            run()
+        root.commit_state_after_verify(next_accepted, num_extends=0)
+        assert root.state_commit_validity(batch, num_extends=0).all()
+        next_outputs.append(out)
+    torch.testing.assert_close(*next_outputs, atol=0, rtol=0)
+    torch.testing.assert_close(
+        pools[0].arena.buffer, pools[1].arena.buffer, atol=0, rtol=0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("width,capacity", [(1, 8), (4, 8), (4, 37)])
 @pytest.mark.parametrize("captured", [False, True])
 def test_quiescent_endpoint_without_candidate_backing(width, capacity, captured):

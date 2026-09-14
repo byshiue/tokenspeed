@@ -87,12 +87,14 @@ def _runner(
             ),
         )
 
+    recurrent_backend = object.__new__(MambaAttnBackend)
+    recurrent_backend.commit_verified_state = commit_recurrent
     wrapper.attn_backend = Qwen4ExpBackend(
         config=config(False),
         attention_backend=(
             HybridLinearAttnBackend(
                 full_backend,
-                SimpleNamespace(commit_verified_state=commit_recurrent),
+                recurrent_backend,
                 [1, 3],
             )
             if "recurrent" in consumers

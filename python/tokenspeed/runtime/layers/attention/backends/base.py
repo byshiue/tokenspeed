@@ -412,7 +412,7 @@ class AttentionBackend(CachePoolBinding, ABC):
     def state_commit_validity(
         self, bs: int, *, num_extends: int
     ) -> torch.Tensor | None:
-        """Return device bool ``[local groups, live requests]`` commit validity.
+        """Return device bool ``[local groups, live decode requests]`` validity.
 
         Called after forward and accepted-state commit, before output D2H.
         These are borrowed per-round flags: the executor snapshots them on the
@@ -420,6 +420,8 @@ class AttentionBackend(CachePoolBinding, ABC):
         this consumer has no deferred-state validation for this round. Padding
         is excluded; the control plane must agree across ranks before publishing
         any successful result. This is not checkpoint provenance.
+        In a mixed batch the leading num_extends requests already wrote exact
+        prefill states, so the flags cover only the deferred decode suffix.
         """
         return None
 

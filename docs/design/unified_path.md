@@ -564,12 +564,28 @@ Its decode metadata slot exposes cached group views to the graph pointer guard.
 Normal commit uses a preallocated false handoff mask and materializes aligned
 accepted endpoints automatically. Refresh arms one commit; a repeated commit
 is rejected, and validity is not exposed while that commit is still pending.
-The executor copies live group-validity flags
+The executor copies live decode-suffix group-validity flags
 with its outputs; CPU rank agreement rejects a failed round before scheduler
 feedback (see `event-loop.md`). Pure prefill retains its existing exact-state
-path and reports no deferred commit flags. Mixed buffered batches are rejected
-until their handoff is integrated; they cannot consume lagging state through
-the legacy scan. The recipe factory still enables no replay layout. Explicit
+path and reports no deferred commit flags. In a mixed batch, KDA constructs
+prefill metadata only for the leading extend requests and refreshes the decode
+suffix through the same buffered entry as pure decode. The CPU-known extend
+token count slices token-leading producer views within each layer; static
+weights are shared. Prefill scans only its exact input states, decode reads
+checkpoint plus accepted history, and their outputs are concatenated in the
+original token order, with any projection padding zeroed. This remains one
+model forward, not two scheduled requests. Accepted commit ignores leading
+prefill counts; returned validity is `[local groups, live decode requests]`.
+The hybrid wrapper delegates the common hook to its linear child; legacy
+Mamba/GDN consumers retain their existing pure-decode-only deferred commit.
+Mixed composition adds no persistent workspace allocation and does not alter
+ordinary decode capture. A subsequent pure refresh clears the mixed split.
+
+Prefill's exact-input contract still belongs to the cache owner. In particular,
+inserting quiescent materialization after admission has reshaped or zeroed
+history pages is too late. No such lifecycle shortcut is installed here, and
+an eventual handoff must preserve its failure flags before another metadata
+refresh can overwrite them. The recipe factory still enables no replay layout. Explicit
 lifecycle handoff, registration, configuration and full-model validation remain
 required before serving is enabled.
 

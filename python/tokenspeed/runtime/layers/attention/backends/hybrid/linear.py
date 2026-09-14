@@ -249,8 +249,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def commit_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        if num_extends == 0:
-            self.linear_attn_backend.commit_verified_state(accepted_lengths)
+        self.linear_attn_backend.commit_state_after_verify(
+            accepted_lengths, num_extends=num_extends
+        )
 
     def state_commit_validity(
         self, bs: int, *, num_extends: int
