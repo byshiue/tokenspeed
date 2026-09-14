@@ -30,6 +30,8 @@ M10 source commit: `014c7a6f6b17ceba6fbfce6ef52cc78d31d079e5`
 (`feat(kda): compose buffered conv and recurrent workspace`).
 M11 source commit: `c86d483db192b4bb72c01dbe0c305ff6c2d19d11`
 (`feat(kda): materialize accepted replay endpoints`).
+M12 source commit: `931eeaf21110265593e38e6563b0c1981003f361`
+(`feat(kda): wire buffered decode and validate state commits`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -1023,7 +1025,8 @@ milestone artifacts.
 
 ### M12: backend dispatch and rank-agreed commit validity
 
-Source: based on `648c41bd` (M11 record); source commit follows final hooks.
+Source: `931eeaf21110265593e38e6563b0c1981003f361`, based on `648c41bd`
+(M11 record). The repository-wide pre-commit hooks passed before committing.
 No new serving performance or real-model correctness result.
 
 An explicitly planned buffered pool now binds `KDAReplayWorkspace` in the KDA
