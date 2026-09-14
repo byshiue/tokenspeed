@@ -331,10 +331,31 @@ residency events and Host writeback. Direct Host publication is rejected. They
 are freed with the request or reclaimed through the ordinary sliding policy.
 History ownership grants no materialization provenance to its checkpoint.
 
+Local prefill seeds empty replay history from its exact output checkpoint.
+Its replay demand uses the absolute endpoint, with a sparse suffix beginning
+at `floor(after / block_granularity)`. An intermediate chunk ends aligned and
+reserves no decode tokens, so its table advances using holes only. A completing
+chunk allocates the blocks covering `[after, after + decode_width)`, including
+any partial starting block; earlier rows in that block remain uninitialized.
+Consumers must use the initialized-history endpoint, not assume every row in
+an allocated block is valid. Ordinary sliding attention still allocates the
+whole prefill extent because its kernels actually write those rows.
+
+An empty sparse suffix is legal only at an aligned extent with no reserve. Otherwise the table
+would advertise writable tail capacity in a null block. Allocation planning and
+commit share this check; failed admission does not advance the table. Decode
+continues through normal dense admission and sliding reclamation.
+
+Replay capacity excludes prefill chunk rows, but still includes the retained
+window, candidates and overlap. Decode's conservative reclamation frontier is
+`TokenSize() - decode_width`, up to `decode_width - 1` behind the accepted
+endpoint; this guard costs storage even without overlap. Both the Python group
+budget and C++ startup bound include it, plus partial-block rounding. Logical
+table width remains absolute and is not reduced to the resident window.
+
 This is an integration foundation, not a serving option. Current recipes name
 no replay dependency. GPU position metadata, KDA field binding and endpoint
-materialization are still pending. Prefill allocation still follows ordinary
-sliding-group demand; reserving only its empty endpoint tail is future work.
+materialization are still pending.
 PD rejects replay-history declarations and wire contracts until materialized
 handoff is implemented. This explicit gate must not be removed by giving the
 history a `full_suffix` transfer policy: there may be no initialized prefill

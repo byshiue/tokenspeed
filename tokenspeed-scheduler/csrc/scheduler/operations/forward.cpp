@@ -87,13 +87,22 @@ std::vector<GroupDemand> makeGroupDemands(std::vector<BlockTable>& tables, Group
     return demands;
 }
 
-void makeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
-                                    const CacheCoordinator& coordinator, std::int32_t before_tokens,
-                                    std::int32_t after_tokens) {
+void makePrefillSuffixesSparse(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
+                               const CacheCoordinator& coordinator, std::int32_t before_tokens,
+                               std::int32_t after_tokens) {
     _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
-    _assert(before_tokens >= 0 && after_tokens > before_tokens,
-            "snapshot-state prefill requires a positive advancing extent");
+    _assert(before_tokens >= 0 && after_tokens > before_tokens, "sparse prefill requires a positive advancing extent");
     for (std::size_t i = 0; i < demands.size(); ++i) {
+        if (cache_groups[i].replay_checkpoint_group.has_value()) {
+            // Prefill materializes an exact state, not replay entries. Keep
+            // absolute holes through its endpoint and allocate only the
+            // completing chunk's decode reserve (including a partial block).
+            // Intermediate chunks end aligned and need no physical suffix.
+            demands[i].num_tokens = after_tokens;
+            demands[i].materialized_suffix_start =
+                after_tokens / coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i));
+            continue;
+        }
         if (!cache_groups[i].IsSnapshotStateGroup()) {
             continue;
         }
@@ -387,7 +396,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
     std::vector<GroupDemand> demands = makeGroupDemands(tables, GroupDemand{.num_tokens = prefill_tokens});
     reservePrefillDemands(demands, config_.cache_groups, reserve);
     if (source == fsm::PrefillSource::kLocal) {
-        makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
+        makePrefillSuffixesSparse(demands, config_.cache_groups, coordinator_, hit_tokens, after_tokens);
     }
 
     if (source == fsm::PrefillSource::kRemote) {
@@ -489,7 +498,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
                                  });
     reservePrefillDemands(demands, config_.cache_groups, reserve);
-    makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
+    makePrefillSuffixesSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
     if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page, demands)) {
         return std::nullopt;
     }

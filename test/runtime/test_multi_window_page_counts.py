@@ -31,6 +31,7 @@ import pathlib
 import sys
 import types
 import unittest
+from dataclasses import replace
 
 # CI Registration (parsed via AST, runtime no-op)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -168,6 +169,44 @@ class MultiWindowPageCountsTest(unittest.TestCase):
     def test_sliding_without_window_raises(self):
         with self.assertRaises(ValueError):
             self.counts([_spec("s", "sliding_window", window=None)])
+
+    def test_replay_budget_covers_live_windows_without_prefill_rows(self):
+        for grain in (1, 2, 4, 128):
+            for width in (1, 4):
+                for depth in (0, 1):
+                    with self.subTest(grain=grain, width=width, depth=depth):
+                        ordinary = _spec(
+                            "ordinary", "sliding_window", window=64, rows_per_page=grain
+                        )
+                        replay = replace(
+                            ordinary, group_id="replay", replay_checkpoint_group="state"
+                        )
+                        expected = (
+                            4
+                            * (
+                                math.ceil(63 / grain)
+                                + math.ceil((2 * width - 1) / grain)
+                                + 1
+                                + math.ceil(depth * width / grain)
+                            )
+                            + NULL_PAGE
+                        )
+                        for chunk in (128, 8192):
+                            counts = self.counts(
+                                [ordinary, replay],
+                                max_scheduled_tokens=chunk,
+                                decode_input_tokens=width,
+                                overlap_schedule_depth=depth,
+                            )
+                            self.assertEqual(counts["replay"], expected)
+                            self.assertEqual(
+                                counts["ordinary"],
+                                4 * math.ceil(63 / grain)
+                                + math.ceil(min(chunk, 4096) / grain)
+                                + 4
+                                + 4 * math.ceil(depth * width / grain)
+                                + NULL_PAGE,
+                            )
 
 
 class SuffixedGroupIdFlowTest(unittest.TestCase):

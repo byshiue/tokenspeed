@@ -315,8 +315,18 @@ def compute_cache_group_page_counts(
             resident_pages = max_live_requests * _ceil_div(
                 resident_tokens_per_req, block_granularity
             )
-            scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
-            scheduled_pages = _ceil_div(scheduled_tokens, block_granularity)
+            if spec.replay_checkpoint_group is not None:
+                # Prefill seeds empty history from its exact checkpoint. Only
+                # decode candidates need new rows. Reclamation additionally
+                # trails the accepted endpoint by up to decode width minus one.
+                # Round each request independently, never the prefill chunk.
+                scheduled_pages = max_live_requests * _ceil_div(
+                    decode_input_tokens + max(decode_input_tokens - 1, 0),
+                    block_granularity,
+                )
+            else:
+                scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
+                scheduled_pages = _ceil_div(scheduled_tokens, block_granularity)
             total = (
                 resident_pages
                 + scheduled_pages

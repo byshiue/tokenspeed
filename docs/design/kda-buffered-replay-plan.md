@@ -3,8 +3,9 @@
 状态：实现中。Reference 和未注册的 GPU 原型已完成，cache contract 正在接入；
 当前服务端尚未启用 buffered replay。验证与剩余工作见
 [implementation record](kda-buffered-replay-progress.md)。本文件仍是完整方案与验收计划。
-已实现的 cache 基础包含 lagging checkpoint retention 与 request-local history
-的 dependency/reuse contract；GPU metadata、history 字段接入及端点物化仍待完成。
+已实现的 cache 基础包含 lagging checkpoint retention、request-local history
+的 dependency/reuse contract，以及 prefill 的空 history 尾部预留；GPU metadata、
+history 字段接入及端点物化仍待完成。
 
 ## 1. 目标与范围
 

@@ -106,6 +106,8 @@ struct GroupDemand {
     // earlier logical slots as null holes and materializes only this suffix.
     // Snapshot-state local prefill uses an absolute endpoint here; Decode-side
     // PD also uses it for latest snapshots and retained sliding tails.
+    // Replay prefill leaves history empty: the suffix begins at the endpoint's
+    // block, or at the end of the table for an aligned chunk with no reserve.
     std::int32_t materialized_suffix_start{-1};
     // Prefill publication streams newly completed history and snapshot-state
     // blocks to Host. Decode publication leaves this false so only sliding

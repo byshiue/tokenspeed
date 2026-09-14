@@ -4070,6 +4070,72 @@ TEST(DecodeDestinationTest, AdmitMaterializesOnlyRequestedStateSuffix) {
     coordinator.Free(tables);
 }
 
+TEST(ReplayHistoryTest, EmptySuffixAdvancesWithoutStorageAndAdmitsDecodeAtomically) {
+    BlockPool pool(4, {1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.kind = AttnKind::kMambaState, .block_granularity = 4},
+        {.kind = AttnKind::kSlidingWindow, .sliding_window = 5, .block_granularity = 2, .replay_checkpoint_group = 0},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    std::vector<BlockTable> tables(coordinator.NumGroups());
+    for (const std::int32_t after : {8, 16}) {
+        const std::vector<GroupDemand> demands{
+            {.table = &tables[0],
+             .num_tokens = after,
+             .num_computed_tokens = after - 8,
+             .materialized_suffix_start = after / 4 - 1},
+            {.table = &tables[1],
+             .num_tokens = after,
+             .num_computed_tokens = after - 8,
+             .materialized_suffix_start = after / 2},
+        };
+        auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands);
+        ASSERT_TRUE(admission);
+        EXPECT_TRUE(admission->new_page_ids[1].empty());
+        EXPECT_EQ(tables[1].NumBlocks(), after / 2);
+        EXPECT_EQ(tables[1].ReclaimedPrefixBlocks(), after / 2);
+        EXPECT_EQ(tables[1].AvailableTokens(), 0);
+    }
+    // Missing state capacity must not advance the empty history table or
+    // install half of its new decode suffix.
+    auto held = pool.AcquireBlocks(0, pool.NumEmptyLcmBlocks());
+    const std::vector<GroupDemand> final_demands{
+        {.table = &tables[0], .num_tokens = 19, .reserve_tokens = 4, .materialized_suffix_start = 4},
+        {.table = &tables[1], .num_tokens = 19, .reserve_tokens = 3, .materialized_suffix_start = 9},
+    };
+    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), final_demands));
+    EXPECT_EQ(tables[0].NumBlocks(), 4);
+    EXPECT_EQ(tables[1].NumBlocks(), 8);
+    held.clear();
+    // Free the synthetic state input to provide four physical suffix blocks.
+    coordinator.Free(tables);
+    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), final_demands);
+    ASSERT_TRUE(admission);
+    EXPECT_EQ(admission->new_page_ids[1].size(), 2u);
+    EXPECT_EQ(tables[1].NumBlocks(), 11);
+    EXPECT_EQ(tables[1].AvailableTokens(), 3);
+    EXPECT_FALSE(tables[1].Blocks()[8]);
+    EXPECT_TRUE(tables[1].Blocks()[9]);
+    EXPECT_TRUE(tables[1].Blocks()[10]);
+    coordinator.Free(tables);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 4);
+
+    // A partial unbacked block must not masquerade as writable tail capacity.
+    const GroupGeometry geometry(2);
+    const GroupDemand invalid{.table = &tables[1], .num_tokens = 19, .materialized_suffix_start = 10};
+    EXPECT_THROW(geometry.PlanAcquire(tables[1], invalid), std::runtime_error);
+    const GroupDemand unbacked_reserve{
+        .table = &tables[1], .num_tokens = 19, .reserve_tokens = 1, .materialized_suffix_start = 10};
+    EXPECT_THROW(geometry.PlanAcquire(tables[1], unbacked_reserve), std::runtime_error);
+    for (const std::int32_t extent :
+         {std::numeric_limits<std::int32_t>::max() - 1, std::numeric_limits<std::int32_t>::max()}) {
+        const auto plan = geometry.PlanAcquire(
+            tables[1], GroupDemand{.table = &tables[1], .num_tokens = extent, .materialized_suffix_start = extent / 2});
+        EXPECT_EQ(plan.num_blocks, extent % 2);
+        EXPECT_EQ(plan.available_tokens_after, extent % 2);
+    }
+}
+
 TEST(SnapshotStateSparsePrefillTest, ReclaimsOldInputAcrossIntermediateHoles) {
     BlockPool pool(/*num_lcm_blocks=*/4, {1});
     std::vector<CacheGroupSpec> specs = {

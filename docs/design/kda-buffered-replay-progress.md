@@ -20,7 +20,7 @@ an unregistered prototype, not the complete serving feature.
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
-| B. LCM ownership, retention and lifecycle contract | M2 retention/capacity and M3 request-local history foundation verified | GPU field/metadata binding, endpoint materialization and handoff still pending |
+| B. LCM ownership, retention and lifecycle contract | M2 retention/capacity, M3 request-local ownership and M4 empty-prefill allocation verified | GPU field/metadata binding, endpoint materialization and handoff still pending |
 | C. Unified GPU forward and commit | Isolated recurrence prototype; not registered or integrated | LCM, conv/gate integration and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
@@ -353,3 +353,62 @@ Required before runtime dispatch:
 
 **Serving remains unchanged.** Capacity CLI, GPU cache binding, lifecycle tests,
 real-weight TP8 performance, AIME 2026 and full-model NSYS are still pending.
+
+### M4: empty-history prefill allocation
+
+Source: worktree changes based on `e6e99fbf8ab1665a7d0d9d1ea2ba05681768b66f`
+(M3 validation record), tested before committing.
+
+This milestone closes an allocation prerequisite before KDA field binding.
+Prefill materializes an exact state and starts empty replay history, so reserving
+history rows for an entire prefill chunk would waste storage. Local admission
+now advances replay tables with absolute holes and reserves only the final
+chunk's decode window. Intermediate aligned chunks acquire no replay blocks.
+Ordinary sliding attention still reserves and writes its prefill extent.
+
+The existing sparse allocator now accepts an aligned, empty suffix without
+inventing writable capacity in a null block. It advances the known-empty
+prefix without rescanning earlier chunks. Allocation remains atomic across
+groups, and decode uses the existing dense admission and reclamation path.
+
+Python capacity planning and the C++ single-request bound exclude prefill rows
+for replay groups. Both still account for retained history, candidates, overlap
+and partial blocks. They also include the `T-1` tokens between the conservative
+decode reclamation frontier and the accepted endpoint; this guard is needed
+even at overlap depth zero. This is a storage bound, not a longer logical
+history or a change to flush policy.
+
+No model recipe enables replay history yet, and no attention kernel, weight
+format or numerical tolerance changes in M4. GPU field binding, request-position
+metadata, endpoint materialization and serving dispatch remain pending. The M1
+serial reconstruction regression is still unresolved; this allocation change
+is not evidence of a serving speedup.
+
+Validation commands and logs are retained in ignored
+`outputs/kda-buffered-replay/m4/`. The build and runtime environments follow M3;
+the same persistent allocation, cached image and read-only serving venv are
+reused, with the freshly rebuilt extension staged in M4's artifact directory.
+No target/draft weights are loaded, and there is no TP8 model run, AIME result
+or NSYS capture for this cache-only milestone.
+
+Validation results:
+
+- Full C++ scheduler suite: **487 passed**. The consolidated scenario covers
+  replay block spans 1/2/4, decode widths 1/3, overlap-depth configurations 0/1,
+  chunked/one-forward prefill, Device prefix reuse, aligned/unaligned endpoints,
+  partial acceptance, bounded decode residency and finish-time release. This
+  is cache scheduling evidence, not GPU metadata or in-flight overlap validation.
+  Allocator checks cover all-hole advancement, failed-admission atomicity,
+  partial-tail backing and int32-limit geometry.
+- Runtime and scheduler bindings: **392 passed, 313 subtests**, 27 dependency
+  warnings, 28.99 seconds. The new budget case covers spans 1/2/4/128, T=1/4,
+  both overlap depths and prefill budgets 128/8192; ordinary sliding budgets
+  remain unchanged. Existing Kimi, GDN GPU, prefill, Qwen and PD checks pass.
+- Buffered reference/GPU: **27 passed**, 15 dependency warnings, 6.97 seconds.
+  These repeat the existing eager/captured prototype tests, not buffered serving.
+- Small CPU page-budget suite: **7 passed**. This repeats the pure math cases
+  without the serving-container dependencies.
+
+The remaining field/metadata work is unchanged. In particular, none of these
+tests proves that a lagging checkpoint may be published at the accepted
+endpoint: materialization and lifecycle ordering must be integrated first.

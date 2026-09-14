@@ -118,7 +118,9 @@ public:
             _assert(plan.suffix_start + plan.num_blocks <= plan.table_blocks_after,
                     "sparse suffix exceeds the planned table size");
             table.blocks_.resize(static_cast<std::size_t>(plan.table_blocks_after));
-            if (old_num_blocks == 0) {
+            if (table.reclaimed_prefix_blocks_ == old_num_blocks) {
+                // The old table and newly skipped interval are all holes.
+                // Advancing an empty prefill history needs no later rescan.
                 table.reclaimed_prefix_blocks_ = plan.suffix_start;
             }
             for (std::size_t i = 0; i < block_refs.size(); ++i) {

@@ -69,7 +69,8 @@ public:
             .num_blocks = num_blocks,
             .suffix_start = demand.materialized_suffix_start,
             .table_blocks_after = logical_blocks,
-            .available_tokens_after = logical_blocks * block_granularity_ - demand.num_tokens,
+            .available_tokens_after = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(logical_blocks) * block_granularity_ - demand.num_tokens),
         };
     }
 
@@ -128,10 +129,16 @@ private:
                 "sparse suffix materialization requires a positive extent");
         const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
         _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
-        const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / block_granularity_);
-        _assert(demand.materialized_suffix_start <= last_block,
+        // An aligned, empty suffix still advances absolute table positions.
+        // Do not round up this limit: an unbacked partial block would report
+        // writable AvailableTokens even though its table entry is a hole.
+        _assert(demand.materialized_suffix_start <= extent / block_granularity_,
                 "materialized suffix starts beyond the requested extent");
-        return last_block - demand.materialized_suffix_start + 1;
+        const std::int32_t logical_blocks =
+            static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
+        _assert(demand.materialized_suffix_start < logical_blocks || demand.reserve_tokens == 0,
+                "empty sparse suffix cannot reserve unbacked tokens");
+        return logical_blocks - demand.materialized_suffix_start;
     }
 
     std::int32_t block_granularity_;

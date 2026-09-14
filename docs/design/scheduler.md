@@ -46,6 +46,13 @@ group's retention, never by call site:
 - *Snapshot-state* groups reserve at least one growth block on a decoding
   role's completing chunk or remote landing, and nothing on other rounds (§1.2).
 
+Request-local replay history keeps the sliding group's decode reserve, but
+prefill produces no replay entries: its exact state output starts a new empty
+history. Local admission therefore leaves holes through the prefill endpoint
+and allocates only its completing chunk's decode tail. Intermediate aligned
+chunks allocate no replay blocks. This policy keys on the declared checkpoint
+dependency, not on a model name, and does not apply to ordinary sliding KV.
+
 ### 1.1 Head-of-line: an incomplete prefill holds the queue
 
 `holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
@@ -180,6 +187,13 @@ Admission credit and reclamation use the same extended retention rule in
 `GroupGeometry`, while prefix matching still requires only one exact snapshot
 ([Cache concepts](cache-concepts.md#live-state-retention-lag)). This declaration
 does not enable buffered execution or make a lagging snapshot publishable.
+
+For request-local replay history, the bound counts the retained window,
+`decode_width - 1` tokens of conservative reclamation lag, the candidate
+window, overlap protection and worst-case starting-block offset. It does not
+count a dense prefill chunk or a reusable-history lookback island: prefill and
+prefix resume both start empty. This bound is separate from checkpoint-state
+lag headroom, and neither changes the absolute width of emitted block tables.
 
 ## 2. Retraction: when admission fails
 
