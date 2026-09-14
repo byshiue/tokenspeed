@@ -70,7 +70,7 @@ def test_paged_positions_reordering_acceptance_and_graph(
             max_window=max_window,
         )
         commit_positions(
-            stamps, table, end, width, accepted, checkpoint, length, flush, ok
+            (stamps,), table, end, width, accepted, checkpoint, length, flush, ok
         )
 
     stream = torch.cuda.Stream()
@@ -168,7 +168,9 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
         max_window=4,
     )
     assert ok.tolist() == [False, True, True, True]
-    commit_positions(stamps, table, end, width, accepted, checkpoint, length, flush, ok)
+    commit_positions(
+        (stamps,), table, end, width, accepted, checkpoint, length, flush, ok
+    )
     assert ok.tolist() == [False, False, False, True]
     initial[7, 5] = 6
     torch.testing.assert_close(stamps, initial, rtol=0, atol=0)
@@ -202,5 +204,5 @@ def test_invalid_rows_do_not_write_and_zeroed_page_reseeds():
         )
     with pytest.raises(ValueError, match="accepted"):
         commit_positions(
-            stamps, table, end, width, accepted.long(), checkpoint, length, flush, ok
+            (stamps,), table, end, width, accepted.long(), checkpoint, length, flush, ok
         )

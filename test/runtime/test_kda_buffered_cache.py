@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import replace
 from test.runtime.cache_pool_test_utils import make_pool
 from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_recipe
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -252,7 +252,10 @@ def test_incomplete_replay_layout_and_serving_dispatch_are_rejected():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
-    from tokenspeed_kernel.ops.attention.kda._triton.buffered import buffered_recurrent
+    from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
+        buffered_recurrent,
+        validate_recurrent_blocks,
+    )
     from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
         commit_positions,
         prepare_positions,
@@ -305,6 +308,22 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
     decay = torch.full_like(q, 0.9)
     beta = torch.full((1, 1, heads), 0.5, device="cuda")
     out = torch.empty_like(v)
+    validate_recurrent_blocks(
+        table,
+        state_table,
+        end,
+        checkpoint,
+        length,
+        width,
+        flush,
+        ok,
+        history_blocks=replay.key.shape[0],
+        state_blocks=state.shape[0],
+        history_block_tokens=replay.layout.block_tokens,
+        state_block_tokens=128,
+        capacity=replay.layout.capacity,
+        max_window=replay.layout.max_window,
+    )
     buffered_recurrent(
         q,
         q,
@@ -345,7 +364,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         replay.correction[1, 3], correction, atol=2e-5, rtol=2e-4
     )
     commit_positions(
-        replay.checkpoint, table, end, width, width, checkpoint, length, flush, ok
+        (replay.checkpoint,), table, end, width, width, checkpoint, length, flush, ok
     )
     assert replay.checkpoint[1, 3] == 4 and ok.item()
     # Continue through a history-block boundary and a capacity flush using
@@ -364,6 +383,22 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             length,
             flush,
             ok,
+            capacity=replay.layout.capacity,
+            max_window=replay.layout.max_window,
+        )
+        validate_recurrent_blocks(
+            table,
+            state_table,
+            end,
+            checkpoint,
+            length,
+            width,
+            flush,
+            ok,
+            history_blocks=replay.key.shape[0],
+            state_blocks=state.shape[0],
+            history_block_tokens=replay.layout.block_tokens,
+            state_block_tokens=128,
             capacity=replay.layout.capacity,
             max_window=replay.layout.max_window,
         )
@@ -409,7 +444,173 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             rtol=2e-4,
         )
         commit_positions(
-            replay.checkpoint, table, end, width, width, checkpoint, length, flush, ok
+            (replay.checkpoint,),
+            table,
+            end,
+            width,
+            width,
+            checkpoint,
+            length,
+            flush,
+            ok,
         )
         end.add_(1)
     assert saw_flush
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("width", [1, 4])
+@pytest.mark.parametrize("captured", [False, True])
+def test_shared_replay_metadata_refresh_commit_and_rebind(width, captured):
+    """Exercise the real group fields; this test does not execute model/conv work."""
+    from tokenspeed.runtime.layers.attention.backends.state import kda_buffered
+
+    recipe = _recipe(2 * width, decode_input_tokens=width, max_bs=5)
+    plan = _layout(recipe).bind(12)
+    arena, pool = _pool(recipe, plan, "cuda", 0, 93)
+    metadata = kda_buffered.KDAReplayMetadata(pool, max_bs=5, max_context_len=32)
+    layers = tuple(pool.state_group_by_layer)
+    groups = metadata._groups
+    assert len(groups) == 3 and all(len(group) == 23 for group in groups.values())
+    assert metadata.end.shape == (5,)  # Capture only B=2, not the runtime limit.
+    tables = {}
+    # A history parent gives six child pages (two per request). The following
+    # three parents hold distinct request states; no groups alias LCM parents.
+    for index, (gid, group) in enumerate(groups.items()):
+        first = group[0]
+        parent = index * 4 + 1
+        history_start = (parent - 1) * 6 + 1
+        tables[gid] = torch.tensor(
+            [
+                [history_start + 2 * req, history_start + 2 * req + 1]
+                for req in range(3)
+            ],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        tables[first.checkpoint_group_id] = torch.tensor(
+            [[parent + req + 1] for req in range(3)], dtype=torch.int32, device="cuda"
+        )
+        pool.zero_new_blocks({gid: list(range(history_start, history_start + 6))})
+    seq_lens = torch.zeros(5, dtype=torch.int32, device="cuda")
+    accepted = torch.zeros_like(seq_lens)
+    metadata.refresh(2, 0, seq_lens, tables)
+
+    def run(bs, live):
+        metadata.prepare(bs)
+        # There are no numerical payloads in this metadata-only fixture.
+        # Serving must put all layer stores between these two operations.
+        metadata.commit(bs, accepted[:live])
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run(2, 2)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    if captured:
+        with torch.cuda.graph(graph):
+            run(2, 2)
+    first_view = metadata.layer(layers[0], 2)
+    pointers = [t.data_ptr() for t in vars(first_view).values()]
+    for actual_bs in (2, 1, 0, 3, 2):
+        bs = 5 if actual_bs == 3 else 2
+        order = [2, 0, 1][:actual_bs]
+        current = {gid: table[order] for gid, table in tables.items()}
+        # Each iteration is a fresh exact-state/history fixture, independent of
+        # the previous one. Committed history lengths differ across groups.
+        ends = [7, 8, 9]
+        expected = {}
+        # Group views overlay the same arena planes. Zero only each group's
+        # owned child pages, as the allocator does, never its whole field view.
+        for index, (gid, group) in enumerate(groups.items()):
+            parent = index * 4 + 1
+            history_start = (parent - 1) * 6 + 1
+            pool.zero_new_blocks({gid: list(range(history_start, history_start + 6))})
+            checkpoints = [
+                e - (width if (req + index) % 2 else 0) for req, e in enumerate(ends)
+            ]
+            expected[gid] = [checkpoints[req] for req in order]
+            for req, e in enumerate(ends):
+                page = tables[gid][req, (e - 1) // 8].item()
+                for stamp in metadata._stamps[gid]:
+                    stamp[page, (e - 1) % 8] = checkpoints[req] + 1
+        seq_lens.fill_(2**31 - 1)  # Poison padding; it must not be read.
+        if actual_bs:
+            seq_lens[:actual_bs].copy_(torch.tensor([ends[r] + width for r in order]))
+        accepted.zero_()
+        accepted[:actual_bs].fill_(1)
+        metadata.refresh(bs, actual_bs, seq_lens, current)
+        if captured and bs == 2:
+            graph.replay()
+        else:
+            with patch.object(
+                kda_buffered, "prepare_positions", wraps=kda_buffered.prepare_positions
+            ) as prepare:
+                run(bs, actual_bs)
+                assert prepare.call_count == 3
+        for gid, group in groups.items():
+            layer_ids = [
+                layer for layer in layers if metadata._group_by_layer[layer] == gid
+            ]
+            view = metadata.layer(layer_ids[0], bs)
+            assert all(metadata.layer(layer, bs) is view for layer in layer_ids)
+            assert view.end.tolist() == [ends[r] for r in order] + [0] * (
+                bs - actual_bs
+            )
+            assert view.width.tolist() == [width] * actual_bs + [0] * (bs - actual_bs)
+            assert view.checkpoint.tolist() == expected[gid] + [0] * (bs - actual_bs)
+            assert view.ok.all()
+            assert not view.history_table[actual_bs:].count_nonzero()
+            assert not view.history_table[:, 2:].count_nonzero()
+            for row, req in enumerate(order):
+                e, c = ends[req], expected[gid][row]
+                page = current[gid][row, e // 8].item()
+                stamp_value = e + 1 if e - c == width else c + 1
+                for stamp in metadata._stamps[gid]:
+                    assert stamp[page, e % 8] == stamp_value
+        assert metadata.layer(layers[0], 2) is first_view
+        assert [t.data_ptr() for t in vars(first_view).values()] == pointers
+    # Live acceptance may be shorter than padded B; no copy/padding allocation
+    # is needed by the group commit. Invalid live counts suppress their stamps.
+    accepted[:2].fill_(width + 1)
+    before = {gid: stamps[0].clone() for gid, stamps in metadata._stamps.items()}
+    metadata.commit(2, accepted[:2])
+    for gid, stamps in metadata._stamps.items():
+        assert not metadata._batch(2)[gid].ok.any()
+        for stamp in stamps:
+            torch.testing.assert_close(stamp, before[gid], atol=0, rtol=0)
+    with pytest.raises(ValueError, match="missing"):
+        metadata.refresh(2, 2, seq_lens, {})
+    gid = next(iter(groups))
+    malformed = dict(tables)
+    malformed[gid] = tables[gid][:, ::2]
+    with pytest.raises(ValueError, match="invalid"):
+        metadata.refresh(2, 2, seq_lens, malformed)
+    with pytest.raises(ValueError, match="capacity"):
+        metadata.layer(layers[0], 6)
+    # Rebinding builds a new owner; old graph addresses and old cache fields
+    # cannot leak into it. The ordinary pool is still rejected, never a fallback.
+    _, replacement = _pool(recipe, plan, "cuda", 0, 93)
+    rebound = kda_buffered.KDAReplayMetadata(replacement, max_bs=5, max_context_len=32)
+    assert (
+        rebound.layer(layers[0], 2).checkpoint.data_ptr()
+        != first_view.checkpoint.data_ptr()
+    )
+    assert (
+        rebound._stamps[next(iter(groups))][0].data_ptr()
+        != metadata._stamps[next(iter(groups))][0].data_ptr()
+    )
+    assert rebound.tables.tables.data_ptr() != metadata.tables.tables.data_ptr()
+    narrowed = plan.narrow_to_layers(4, 12)
+    _, pp = _pool(recipe, narrowed, "cuda", 4, 12)
+    pp_metadata = kda_buffered.KDAReplayMetadata(pp, max_bs=5, max_context_len=32)
+    assert sum(len(stamps) for stamps in pp_metadata._stamps.values()) == len(
+        pp.state_group_by_layer
+    )
+    for layer in pp.state_group_by_layer:
+        replay = pp.get_replay_buffers(layer)
+        assert pp_metadata._group_by_layer[layer] == replay.group_id
+        assert any(
+            stamp is replay.checkpoint for stamp in pp_metadata._stamps[replay.group_id]
+        )

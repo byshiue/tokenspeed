@@ -100,6 +100,113 @@ def _check_recurrent_blocks(
     tl.store(OK + row, ok)
 
 
+def validate_recurrent_blocks(
+    history_block_table,
+    state_block_table,
+    end,
+    checkpoint,
+    length,
+    valid,
+    flushed,
+    ok,
+    *,
+    history_blocks,
+    state_blocks,
+    history_block_tokens,
+    state_block_tokens,
+    capacity,
+    max_window,
+) -> None:
+    """Validate a group's entire recurrent read/write range before any layer runs.
+
+    Tables are int32 [B, columns] raw block IDs. Position vectors are the
+    outputs of ``prepare_positions``: end/length/valid int32, checkpoint int64,
+    flushed/ok bool. All tensors share one GPU. Invalid rows clear ``ok``;
+    this never restores a row rejected by position preparation.
+
+    The required geometry describes the group's cache-owned fields and fixed
+    capacity/window, not one layer's activations. Layers in the same group
+    share these positions, tables and page counts, so one validation launch
+    covers them all. Tables/positions must not change between validation and
+    the last recurrence consumer. This check does not grant publication or
+    request-writable ownership of a checkpoint.
+    """
+    geometry = (
+        history_blocks,
+        state_blocks,
+        history_block_tokens,
+        state_block_tokens,
+        capacity,
+        max_window,
+    )
+    if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in geometry):
+        raise ValueError("recurrent block geometry must be positive integers")
+    if capacity < 2 * max_window:
+        raise ValueError("capacity must cover two maximum windows")
+    batch = end.numel()
+    for tensor, dtype in (
+        (end, torch.int32),
+        (checkpoint, torch.int64),
+        (length, torch.int32),
+        (valid, torch.int32),
+        (flushed, torch.bool),
+        (ok, torch.bool),
+    ):
+        if (
+            tensor.shape != (batch,)
+            or tensor.dtype != dtype
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                "positions require contiguous batch vectors of declared dtype"
+            )
+    for table in (history_block_table, state_block_table):
+        if (
+            table.ndim != 2
+            or table.shape[0] != batch
+            or table.shape[1] < 1
+            or table.dtype != torch.int32
+            or table.stride(1) != 1
+        ):
+            raise ValueError(
+                "raw block tables require int32 batch rows and contiguous columns"
+            )
+    tensors = (
+        history_block_table,
+        state_block_table,
+        end,
+        checkpoint,
+        length,
+        valid,
+        flushed,
+        ok,
+    )
+    if any(not t.is_cuda or t.device != end.device for t in tensors):
+        raise ValueError("recurrent block metadata must share a GPU")
+    if batch:
+        _check_recurrent_blocks[(batch,)](
+            history_block_table,
+            state_block_table,
+            end,
+            checkpoint,
+            length,
+            valid,
+            flushed,
+            ok,
+            history_block_table.shape[1],
+            state_block_table.shape[1],
+            history_block_table.stride(0),
+            state_block_table.stride(0),
+            history_blocks,
+            state_blocks,
+            history_block_tokens,
+            state_block_tokens,
+            max_window,
+            capacity,
+            triton.next_power_of_2(triton.cdiv(capacity, history_block_tokens) + 1),
+        )
+
+
 @triton.jit
 def _history_offset(TABLE, row, token, table_stride: tl.constexpr, rows: tl.constexpr):
     block = tl.load(TABLE + row * table_stride + token // rows).to(tl.int64)
@@ -369,7 +476,12 @@ def buffered_recurrent(
     dt_bias,
     lower_bound,
 ) -> None:
-    """Compute paged candidate history/outputs and optionally flush accepted state.
+    """Compute paged candidates using already-validated per-group positions.
+
+    ``prepare_positions`` and ``validate_recurrent_blocks`` must precede every
+    round, once per group rather than once per layer. All participating layers
+    must share the validated geometry and unchanged tables/positions. This
+    function issues only the recurrence launch; invalid rows skip all stores.
 
     Args:
         query/key/decay: [B,T,H,K] inputs; T is the fixed maximum execution
@@ -535,27 +647,6 @@ def buffered_recurrent(
         raise ValueError("all buffered recurrence tensors must share a GPU")
     if batch == 0:
         return
-    _check_recurrent_blocks[(batch,)](
-        history_block_table,
-        state_block_table,
-        end,
-        checkpoint,
-        length,
-        valid,
-        flushed,
-        ok,
-        history_block_table.shape[1],
-        state_block_table.shape[1],
-        history_block_table.stride(0),
-        state_block_table.stride(0),
-        blocks,
-        state_pool.shape[0],
-        rows,
-        state_block_tokens,
-        width,
-        capacity,
-        triton.next_power_of_2(triton.cdiv(capacity, rows) + 1),
-    )
     # The measured minimum-capacity native-input cases favor more, smaller
     # programs. Longer histories retain the wider FP32 reconstruction tile.
     narrow_tile = (

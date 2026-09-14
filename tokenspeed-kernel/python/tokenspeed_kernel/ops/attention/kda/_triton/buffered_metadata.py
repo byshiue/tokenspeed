@@ -126,11 +126,14 @@ def _commit_positions(
     page = tl.load(TABLE + table_offset, in_table, 0).to(tl.int64)
     backed = in_table & (page > 0) & (page < PAGES)
     ok = ok & ((~write) | backed)
-    tl.store(
-        STAMPS + page * PAGE_STRIDE + (token % ROWS) * ROW_STRIDE,
-        tl.where(flush, end, checkpoint) + 1,
-        write & backed,
-    )
+    # Position/acceptance and block ownership are shared by the group's layers.
+    # Store their stamps in one launch, after every layer's data stores finish.
+    for layer in tl.static_range(len(STAMPS)):
+        tl.store(
+            STAMPS[layer] + page * PAGE_STRIDE + (token % ROWS) * ROW_STRIDE,
+            tl.where(flush, end, checkpoint) + 1,
+            write & backed,
+        )
     tl.store(OK + row, ok, live)
 
 
@@ -239,9 +242,13 @@ def prepare_positions(
 def commit_positions(
     stamps, block_table, end, width, accepted, checkpoint, length, flush, ok
 ):
-    """Stamp the last accepted input row after state/history stores complete.
+    """Stamp all layers' last accepted input rows after data stores complete.
 
-    Arguments are the same buffers used by prepare_positions, plus int32
+    ``stamps`` is a nonempty tuple of layer fields with identical shape, strides
+    and device, all belonging to the same history group. The group's layers
+    share positions; preparing from any one of these stamps is sufficient only
+    when every layer completes before this common commit. Remaining arguments
+    are the same buffers used by prepare_positions, plus int32
     [batch] accepted input counts (including the target input, no added one).
     A capacity flush must already have materialized state at e. With zero
     acceptance it restamps the previous committed row; otherwise only the last
@@ -251,11 +258,24 @@ def commit_positions(
     corresponding ok output and suppresses its store. The caller must consume
     ok before publication. This primitive is not an endpoint-publication gate.
     """
-    _validate_positions(stamps, block_table, end, width, checkpoint, length, flush, ok)
+    if not isinstance(stamps, tuple) or not stamps:
+        raise ValueError("commit requires a nonempty tuple of group stamp fields")
+    first = stamps[0]
+    _validate_positions(first, block_table, end, width, checkpoint, length, flush, ok)
+    if any(
+        t.shape != first.shape
+        or t.stride() != first.stride()
+        or t.dtype != first.dtype
+        or t.device != first.device
+        for t in stamps
+    ):
+        raise ValueError(
+            "group stamp fields must share shape, strides, dtype and device"
+        )
     if (
         accepted.shape != width.shape
         or accepted.dtype != torch.int32
-        or accepted.device != stamps.device
+        or accepted.device != first.device
         or not accepted.is_contiguous()
     ):
         raise ValueError(
@@ -274,9 +294,62 @@ def commit_positions(
             ok,
             batch,
             block_table.shape[1],
-            stamps.shape[0],
-            stamps.shape[1],
-            *stamps.stride(),
+            first.shape[0],
+            first.shape[1],
+            *first.stride(),
             block_table.stride(0),
+            128,
+        )
+
+
+@triton.jit
+def _refresh_decode_inputs(
+    SEQ_LENS,
+    END,
+    WIDTH,
+    B: tl.constexpr,
+    LIVE,
+    WINDOW: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    active = (row < B) & (row < LIVE)
+    seq_len = tl.load(SEQ_LENS + row, active, WINDOW)
+    tl.store(END + row, tl.where(active, seq_len - WINDOW, 0), row < B)
+    tl.store(WIDTH + row, tl.where(active, WINDOW, 0), row < B)
+
+
+def refresh_decode_inputs(seq_lens, end, width, *, actual_bs, max_window):
+    """Refresh fixed-address int32 endpoint/width vectors for one decode batch.
+
+    ``seq_lens`` includes the fixed target input window. Live rows therefore
+    start at ``seq_lens - max_window``; padding is (end=0, width=0). Width one
+    uses the same operation. All vectors are on one GPU; no allocation/readback.
+    ``end``/``width`` have the padded batch shape and contiguous storage;
+    ``seq_lens`` need only contain the live rows. Negative live endpoints remain
+    invalid for position preparation rather than being silently clamped.
+    """
+    batch = end.numel()
+    if not 0 <= actual_bs <= batch or max_window <= 0:
+        raise ValueError("invalid live batch or maximum window")
+    for tensor in (seq_lens, end, width):
+        if (
+            tensor.ndim != 1
+            or tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or not tensor.is_cuda
+            or tensor.device != end.device
+        ):
+            raise ValueError("decode positions require contiguous int32 GPU vectors")
+    if width.shape != end.shape or seq_lens.numel() < actual_bs:
+        raise ValueError("decode position vectors do not cover the batch")
+    if batch:
+        _refresh_decode_inputs[(triton.cdiv(batch, 128),)](
+            seq_lens,
+            end,
+            width,
+            batch,
+            actual_bs,
+            max_window,
             128,
         )

@@ -32,6 +32,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
     buffered_recurrent,
+    validate_recurrent_blocks,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
     commit_positions,
@@ -185,6 +186,22 @@ def main():
                             capacity=capacity,
                             max_window=width,
                         )
+                        validate_recurrent_blocks(
+                            table,
+                            state_table,
+                            endpoint,
+                            checkpoint,
+                            length,
+                            valid,
+                            flushed,
+                            ok,
+                            history_blocks=history_k.shape[0],
+                            state_blocks=checkpoint_pool.shape[0],
+                            history_block_tokens=rows,
+                            state_block_tokens=1,
+                            capacity=capacity,
+                            max_window=width,
+                        )
                         buffered_recurrent(
                             q,
                             k,
@@ -212,7 +229,7 @@ def main():
                             lower_bound=lower_bound,
                         )
                         commit_positions(
-                            stamps,
+                            (stamps,),
                             table,
                             endpoint,
                             valid,

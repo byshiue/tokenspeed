@@ -37,6 +37,7 @@ from tokenspeed_kernel._triton import tl, triton  # noqa: E402
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (  # noqa: E402
     _input_offset,
     buffered_recurrent,
+    validate_recurrent_blocks,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # noqa: E402
     commit_positions,
@@ -162,6 +163,22 @@ def test_buffered_rounds_and_graph_match_sequential(
             capacity=capacity,
             max_window=width,
         )
+        validate_recurrent_blocks(
+            ht,
+            st,
+            end,
+            cp,
+            length,
+            valid,
+            flush,
+            ok,
+            history_blocks=hk.shape[0],
+            state_blocks=pool.shape[0],
+            history_block_tokens=hk.shape[1],
+            state_block_tokens=grain,
+            capacity=capacity,
+            max_window=width,
+        )
         buffered_recurrent(
             q,
             k,
@@ -188,7 +205,7 @@ def test_buffered_rounds_and_graph_match_sequential(
             dt_bias=dt_bias if native else None,
             lower_bound=lower_bound,
         )
-        commit_positions(stamps, ht, end, valid, accepted, cp, length, flush, ok)
+        commit_positions((stamps,), ht, end, valid, accepted, cp, length, flush, ok)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -425,6 +442,22 @@ def test_invalid_backing_rejects_entire_row_before_stores(graph_mode):
     before = [t.clone() for t in (pool, hk, hu, hd)]
 
     def run():
+        validate_recurrent_blocks(
+            ht,
+            st,
+            end,
+            cp,
+            length,
+            valid,
+            flush,
+            ok,
+            history_blocks=hk.shape[0],
+            state_blocks=pool.shape[0],
+            history_block_tokens=hk.shape[1],
+            state_block_tokens=1,
+            capacity=8,
+            max_window=width,
+        )
         buffered_recurrent(
             q,
             q,

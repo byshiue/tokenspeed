@@ -483,6 +483,28 @@ backends inherit a no-op.
 Transient verify storage belongs to these consumers; LCM remains the owner
 of the persistent request caches.
 
+The experimental `KDAReplayMetadata` follows the same ownership split. It
+allocates raw table stacks and position scratch once at full runtime batch
+capacity, with cached per-bs views; all layers in a state/history group share
+one position record. The shared `GroupTableStacks` fill runs at ratio one,
+preserving raw block IDs, clearing padding and column tails. This assigns no
+row layout to recurrent state. Live refresh rejects missing, oversized or
+non-unit-column-stride tables instead of allocating a contiguous replacement.
+Refresh writes one endpoint/width pair for all groups; width one and verify
+use the same operation. Position preparation and full-range backing validation
+run once per group before any recurrence reads or stores, not once per layer.
+The tables and positions must remain unchanged through all layer consumers.
+
+All local layers in a group commit the same checkpoint stamp in one launch,
+after every layer's data stores. Only under this ordering invariant may the
+next prepare read one representative local layer's stamp. A PP view enumerates
+its own local layers; a pool replacement creates a new metadata owner and
+requires recapture. Access to transferred layer fields must be fenced before
+preparation. A false validity flag suppresses GPU stores but does not itself
+reject a scheduler result or grant checkpoint provenance. Buffered KDA serving
+is still gated until conv commit and exact-endpoint handoff enforce those
+remaining obligations; this owner is not an alternate serving path.
+
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
 before sizing the arena. The Qwen4-Exp root's `preallocate_verify_workspace`

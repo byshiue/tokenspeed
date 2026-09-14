@@ -22,6 +22,8 @@ M6 source commit: `bb330bf0a86152388254af7263a59cff0b191098`
 (`feat(kda): run buffered recurrence through cache block tables`).
 M7 source commit: `5a7bb231617d4c5e3feab467d444ad7cf5009523`
 (`perf(kda): tile accepted history reconstruction`).
+M8 source commit: `f7e780f15c595eec34501644e612ef55b6eddf7e`
+(`feat(kda): unify commit entry and fuse native recurrence inputs`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -30,9 +32,9 @@ against the frozen baseline before the work meets its completion gate.
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
-| B. LCM ownership, retention and lifecycle contract | M2–M4 cache contracts verified; M5 fields, pool views and isolated GPU positions verified | Runtime position refresh, endpoint materialization and handoff still pending |
-| C. Unified GPU forward and commit | M7 tiles paged history; M8 adds the shared runner commit hook and native-input transforms; recurrence not registered | Shared refresh, conv production/commit, endpoint materialization and serving dispatch remain pending |
-| D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
+| B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Live endpoint materialization and handoff still pending |
+| C. Unified GPU forward and commit | M7 tiles history; M8 adds the runner commit hook and native inputs; M9 adds shared metadata and group stamp commit | Conv production/commit, endpoint materialization and serving dispatch remain pending; recurrence not registered |
+| D. Graphs, overlap and lifecycle integration | M9 isolated metadata graph tests pass; serving integration pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
 ## Recording a result
@@ -763,3 +765,64 @@ Prepared-input timings range from roughly unchanged to 7.8% slower than M7
 over the 48 cases. These results do not establish a no-regression result or a
 default capacity. Shared per-group metadata must remove repeated per-layer
 work, and the actual native pipeline must be measured after integration.
+
+### M9: shared group metadata and multi-layer stamp commit
+
+Based on `b47041e823e25252e8d94f60b658db318d413fad` (M8 validation record).
+No serving or full-model result yet.
+
+`KDAReplayMetadata` binds local replay groups from the cache pool and allocates
+only execution scratch: raw table stacks, common endpoint/width vectors and
+per-group positions. History and checkpoint stamps remain LCM-owned. All
+layers in a group reuse one cached metadata view. Runtime capacity sizes the
+buffers, independent of which smaller batches have graphs. Table refresh uses
+the existing ratio-one fill and rejects malformed live delivery without making
+temporary contiguous tables. Pool replacement requires a new owner/recapture.
+
+Range validation is now an explicit preparation operation before recurrence;
+it checks the entire group's read/write span before any layer stores. The
+recurrence consumes the validated positions in one launch. One commit launch
+stamps every local layer in that group after all data stores complete. Reading
+one representative layer at the next prepare relies on this shared-commit
+invariant, not on assuming independent layer states happen to agree. This
+changes launch placement, not recurrence arithmetic or tolerance.
+
+The new parameterized runtime fixture covers all 69 KDA layers in three groups,
+width one/four, request reordering, padding/idle, group-specific flush decisions,
+invalid acceptance, graph capture at batch two with eager batch five, stable
+addresses, and a replacement pool. Distinct LCM parents back different groups;
+zeroing uses owned child pages, not a whole overlaid field view. An initial
+fixture incorrectly cleared other groups' stamps; it was corrected without
+changing the implementation or weakening assertions. This fixture checks
+metadata, not recurrent/conv payload execution or checkpoint publication.
+
+Buffered serving remains disabled. Conv producer/commit wiring, exact endpoint
+materialization, failure feedback and publication ordering still gate dispatch.
+The original Eagle3 full-model performance, AIME and trace requirements remain
+unchanged. Validation results follow when complete.
+
+Initial checks on a new persistent GB300 allocation, one GPU, no weights:
+**13 cache/metadata tests passed** (22 warnings, 13.76s), **64 reference/GPU
+tests passed** (15 warnings, 136.04s), and **505 runtime tests plus 317 subtests
+passed** (31 warnings, 53.46s). The software environment remains Python 3.12.3,
+PyTorch 2.13.0+cu130, CUDA 13.0, driver 580.167.08,
+tokenspeed-triton 3.8.10.post20260906, pytest 9.1.1, aarch64. C++ sources and
+the staged scheduler extension are unchanged. The final fixture also checks
+non-unit table strides, shorter live acceptance and PP-local field binding.
+
+Isolated position preparation, backing validation and stamp commit for 69
+layers in three groups take **13.82 us at batch 1** and **14.60 us at batch 8**,
+down from **308.94 / 321.78 us** when repeating the prototype protocol per
+layer. This reduces 207 metadata launches to nine. Timing excludes raw-table
+refresh, recurrence, conv/gate producers and model execution; the per-layer
+control is **not the original Eagle3 implementation**.
+
+The unchanged four-launch recurrence timer also compares archived M8 kernels
+against M9 on the same GPU, sequentially and without a profiler. Across 48
+cases per input representation, current/M8 median ratios are 0.99965–1.00058
+for prepared inputs and 0.99902–1.00109 for native inputs: no material isolated
+recurrence regression observed. Both use five samples of 50 graph replays,
+32 calls per graph after warmup. This does not establish the full Eagle3
+no-regression gate or justify a default capacity. The native T=4/L=8 flush
+case is 11.197 us at batch 1 and 13.905 us at batch 8, including all four
+prototype launches, not just the recurrence kernel.
