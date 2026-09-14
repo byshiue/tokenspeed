@@ -20,6 +20,8 @@ M5 source commit: `f4312f1ce25a0ff95c78a97fc70bada0013ce8af`
 (`feat(kda): bind cache-owned replay history and positions`).
 M6 source commit: `bb330bf0a86152388254af7263a59cff0b191098`
 (`feat(kda): run buffered recurrence through cache block tables`).
+M7 source commit: `5a7bb231617d4c5e3feab467d444ad7cf5009523`
+(`perf(kda): tile accepted history reconstruction`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -637,8 +639,9 @@ pytest 9.1.1, aarch64. The M4 scheduler binary/extension is unchanged.
 The final capacity-bounded source passed **40 reference/GPU tests** (15 warnings,
 44.74s) and **501 runtime tests and 317 subtests** (28 warnings, 18.53s), with
 unchanged tolerances. Its T=4/L=64 compiled kernel uses 128 registers, zero
-spills and 5,120 bytes shared memory. Repository hooks passed before the
-capacity-bound refinement and are repeated before committing the final source.
+spills and 5,120 bytes shared memory. The exact `pre-commit run --all-files`
+passed before the signed-off M7 source commit. The local runbook retains its
+source patch, environment, commands, complete samples and artifact hashes.
 
 The isolated before/after sweep reloads M6's exact archived kernel and uses
 the unchanged fixed-round benchmark on the same GPU, sequentially and without
