@@ -27,6 +27,7 @@ from types import MappingProxyType
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
+    validate_replay_dependencies,
 )
 
 
@@ -75,8 +76,7 @@ class CacheRuntimeContract:
         if any(not isinstance(spec, CacheGroupSpec) for spec in self.group_specs):
             raise ValueError("group_specs must contain CacheGroupSpec values")
         group_ids = tuple(spec.group_id for spec in self.group_specs)
-        if len(group_ids) != len(set(group_ids)):
-            raise ValueError("group_specs contain duplicate group IDs")
+        validate_replay_dependencies(self.group_specs)
         counts = dict(self.group_page_counts)
         actual_group_ids = set(counts)
         expected_group_ids = set(group_ids)

@@ -56,6 +56,9 @@ struct CacheGroupConfig {
     // state may still be read. This extends request retention, not prefix
     // matching or publication. Zero is the eager-state contract.
     std::int32_t max_state_lag_tokens{0};
+    // Sliding replay rows belong only to the live request. An exact snapshot
+    // in this group seeds empty history on resume; history is never published.
+    std::optional<std::string> replay_checkpoint_group{};
 
     // A State group keeps one recurrent-state checkpoint per block instead of
     // a token history: the mamba-style group (GDN linear attention, conv

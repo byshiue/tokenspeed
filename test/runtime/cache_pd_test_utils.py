@@ -141,6 +141,7 @@ def layout(
     specs = tuple(
         (
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id=entry.group_id,
                 retention=entry.retention,
@@ -151,6 +152,7 @@ def layout(
             )
             if entry.family == "state" and entry.retention == "full_history"
             else CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id=entry.group_id,
                 retention=entry.retention,

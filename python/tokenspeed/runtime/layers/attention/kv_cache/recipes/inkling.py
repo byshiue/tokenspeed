@@ -130,6 +130,7 @@ class InklingRecipe(CacheRecipe):
         conv = tuple(
             (
                 CacheGroupSpec(
+                    replay_checkpoint_group=None,
                     max_state_lag_tokens=0,
                     group_id=group_id,
                     retention="full_history",

@@ -119,6 +119,9 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     std::int32_t cached = 0;
     std::int32_t total = 0;
     for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+        if (groups_[group_index].Spec().replay_checkpoint_group) {
+            continue;  // The matched checkpoint seeds empty request-local history.
+        }
         const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
         for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
             const CacheKey key{
@@ -472,6 +475,9 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
         return;  // hot decode rounds usually fill no page
     }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (groups_[i].Spec().replay_checkpoint_group) {
+            continue;
+        }
         std::vector<CacheKey> keys = keysForGroup(content_hashes, groups_[i].Id());
         const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[i].BlockGranularity();
         cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * pages_per_prefix_hash,
@@ -484,7 +490,7 @@ void CacheCoordinator::QueueCachedBlocksForStore(std::span<const std::string> pr
         return;
     }
     for (const CacheGroup& group : groups_) {
-        if (group.Spec().kind == AttnKind::kMambaState) {
+        if (group.Spec().kind == AttnKind::kMambaState || group.Spec().replay_checkpoint_group) {
             continue;
         }
         for (CacheKey& key : keysForGroup(prefix_hashes, group.Id())) {
@@ -540,6 +546,9 @@ void CacheCoordinator::cacheFullBlocksForGroup(std::size_t group_index, BlockTab
                                                std::span<const CacheKey> keys, std::int32_t first_cache_block,
                                                std::uint64_t access_epoch, CacheBoundaryKind boundary_kind,
                                                bool stream_completed_to_host) {
+    if (groups_[group_index].Spec().replay_checkpoint_group) {
+        return;
+    }
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
     const bool automatically_streams_to_host =
         stream_device_cache_to_host_ &&
@@ -738,6 +747,9 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
 template <CacheTier Tier>
 void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, const GroupDemand& demand,
                                                     std::uint64_t access_epoch) {
+    if (groups_[group_index].Spec().replay_checkpoint_group) {
+        return;  // Allocated replay rows are not reusable prefix data.
+    }
     const std::int32_t pages_per_prefix_hash = prefix_granularity_ / geometry_[group_index].BlockGranularity();
     if (groups_[group_index].Matcher().IsPrefixClosed()) {
         std::vector<CacheKey> keys =
@@ -843,6 +855,8 @@ std::int32_t CacheCoordinator::NumPinnedHostCachedBlocks() const {
 void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key) {
     _assert(host_pool_ != nullptr, "CacheHostBlock requires a host pool");
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
+    _assert(!groups_[key.group_id].Spec().replay_checkpoint_group,
+            "request-local replay history cannot be published to Host");
     groups_[key.group_id].Index().Register(*host_pool_, block_ref, key, ++next_access_epoch_,
                                            /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
                                            /*newly_cached=*/nullptr);
@@ -863,6 +877,14 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         _assert(
             spec.max_state_lag_tokens >= 0 && (spec.kind == AttnKind::kMambaState || spec.max_state_lag_tokens == 0),
             "max_state_lag_tokens must be non-negative and zero for non-state groups");
+        if (spec.replay_checkpoint_group) {
+            const std::uint32_t checkpoint = *spec.replay_checkpoint_group;
+            _assert(spec.kind == AttnKind::kSlidingWindow && checkpoint < specs.size() && checkpoint != i &&
+                        specs[checkpoint].kind == AttnKind::kMambaState,
+                    "replay history must be sliding and depend on a declared state group");
+            _assert(spec.sliding_window > specs[checkpoint].max_state_lag_tokens,
+                    "replay history window must exceed its checkpoint's max_state_lag_tokens");
+        }
         const std::int32_t group_block_granularity = spec.block_granularity;
         _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
                 "group block_granularity must be a positive divisor of the prefix granularity");
@@ -877,7 +899,11 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
                 break;
             case AttnKind::kSlidingWindow:
                 _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
-                matcher = std::make_unique<SwaMatcher>(group_block_granularity, spec.sliding_window);
+                // Live retention keeps the declared window. Resume instead
+                // starts empty from the dependency's exact snapshot: window
+                // one matches no rows and preserves absolute slots as holes.
+                matcher = std::make_unique<SwaMatcher>(group_block_granularity,
+                                                       spec.replay_checkpoint_group ? 1 : spec.sliding_window);
                 break;
             default:
                 FatalCheck(false, "unknown AttnKind in coordinator group spec");

@@ -303,6 +303,43 @@ carry it too; peers missing the field fail contract decoding rather than
 silently guessing eager-state retention. Rebuild the scheduler extension
 together with runtime updates to this contract.
 
+#### Request-local replay history
+
+A sliding, per-token history group may declare `replay_checkpoint_group`, the
+ID of a state group in the same cache plan. This says that an exact checkpoint
+can seed an empty history on resume. It does not say that the old request's
+history is reusable. Ordinary groups explicitly declare `None`.
+
+The dependency is validated before recipe packing, in the runtime contract,
+and at scheduler construction. It must name a state group, regardless of
+declaration order. The history window `W` must exceed that state's maximum lag
+`d`: the ordinary sliding-retention rule then keeps every input in `[p-d, p)`.
+The scheduler still reserves the current candidate window and overlap horizon
+through its normal token demand. No backend-private allocator or request table
+is introduced.
+
+Reuse and retention deliberately differ here. Prefix matching uses the existing
+zero-lookback window matcher, so history contributes absolute-position null
+holes up to the boundary established by reusable groups. Its state dependency
+must still match an exact checkpoint. Device hits and Host extensions both
+start with no history entries; subsequent suffix blocks are allocated for the
+new request, even when another live request has the same prefix. Live retention
+continues to use the declared `W`, not matching's zero lookback.
+
+These rows are excluded from prefix publication, canonicalization, boundary
+residency events and Host writeback. Direct Host publication is rejected. They
+are freed with the request or reclaimed through the ordinary sliding policy.
+History ownership grants no materialization provenance to its checkpoint.
+
+This is an integration foundation, not a serving option. Current recipes name
+no replay dependency. GPU position metadata, KDA field binding and endpoint
+materialization are still pending. Prefill allocation still follows ordinary
+sliding-group demand; reserving only its empty endpoint tail is future work.
+PD rejects replay-history declarations and wire contracts until materialized
+handoff is implemented. This explicit gate must not be removed by giving the
+history a `full_suffix` transfer policy: there may be no initialized prefill
+rows to transfer, and a lagging checkpoint is not the accepted endpoint.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables

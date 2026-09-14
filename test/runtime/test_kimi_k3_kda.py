@@ -179,6 +179,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
     specs = tuple(
         (
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id=group_id,
                 retention="full_history",
@@ -188,6 +189,7 @@ def _stub_contract(*, prefix_granularity: int, usable_pages: int):
             )
             if group_id == "full_attention"
             else CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id=group_id,
                 retention="full_history",

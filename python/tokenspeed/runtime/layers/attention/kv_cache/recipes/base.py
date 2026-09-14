@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     compute_cache_group_page_counts,
     group,
+    validate_replay_dependencies,
 )
 
 if TYPE_CHECKING:
@@ -103,6 +104,7 @@ class CacheRecipe(ABC):
         )
 
         groups = self.groups()
+        validate_replay_dependencies(tuple(spec for spec, _ in groups))
         layout = pack(
             groups,
             prefix_granularity=self.prefix_granularity,

@@ -584,6 +584,66 @@ TEST(SchedulerConfigValidateTest, StateLagIsNonNegativeAndStateOnly) {
     }
 }
 
+TEST(SchedulerConfigValidateTest, ReplayHistoryRequiresAStateDependencyAndSafeHandoff) {
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 4;
+    cfg.max_scheduled_tokens = 8;
+    cfg.device_allocator.total_pages = 32;
+    // Declare the dependency after its consumer to rule out an order-based
+    // interpretation of the string ID at the Python/C++ boundary.
+    cfg.cache_groups = {
+        {.group_id = "replay",
+         .block_granularity = 2,
+         .total_pages = 32,
+         .retention = CacheGroupConfig::Retention::SlidingWindow,
+         .sliding_window_tokens = 5,
+         .replay_checkpoint_group = "state"},
+        {.group_id = "state",
+         .block_granularity = 4,
+         .total_pages = 32,
+         .family = CacheGroupFamily::State,
+         .max_state_lag_tokens = 4},
+    };
+    EXPECT_NO_THROW(cfg.Validate());
+    const auto specs = MakeSpecsFromConfig(cfg);
+    EXPECT_EQ(specs[0].replay_checkpoint_group, 1U);
+    BlockPool pool(32, {1, 1});
+    EXPECT_NO_THROW(MakeCoordinator(specs, 4, pool));
+    for (const std::string& dependency : {"", "replay", "missing"}) {
+        auto invalid = cfg;
+        invalid.cache_groups[0].replay_checkpoint_group = dependency;
+        EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    }
+    for (std::int32_t window : {0, 4}) {
+        auto invalid = cfg;
+        invalid.cache_groups[0].sliding_window_tokens = window;
+        EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    }
+    auto invalid = cfg;
+    invalid.cache_groups[1].family = CacheGroupFamily::History;
+    invalid.cache_groups[1].max_state_lag_tokens = 0;
+    EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    invalid = cfg;
+    invalid.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+    EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    invalid = cfg;
+    invalid.cache_groups.push_back(cfg.cache_groups[1]);
+    EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    for (Role role : {Role::kP, Role::kD}) {
+        invalid = cfg;
+        invalid.role = role;
+        EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    }
+    for (std::uint32_t dependency : {0U, 2U}) {
+        auto invalid_specs = specs;
+        invalid_specs[0].replay_checkpoint_group = dependency;
+        EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool), std::runtime_error);
+    }
+    auto invalid_specs = specs;
+    invalid_specs[0].sliding_window = 4;
+    EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool), std::runtime_error);
+}
+
 TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {
     // A State group holds checkpoints, never a token window that could slide
     // out; the same window declared as History is an ordinary SWA group.

@@ -18,7 +18,7 @@ an unregistered prototype, not the complete serving feature.
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
-| B. LCM ownership, retention and lifecycle contract | M2 retention/capacity foundation implemented | History ownership, metadata, publication and handoff still pending |
+| B. LCM ownership, retention and lifecycle contract | M2 retention/capacity and M3 request-local history foundation verified | GPU field/metadata binding, endpoint materialization and handoff still pending |
 | C. Unified GPU forward and commit | Isolated recurrence prototype; not registered or integrated | LCM, conv/gate integration and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
@@ -282,11 +282,63 @@ Local ignored artifacts hold the commands, environment, successful logs and
 the failed container log. The mandatory `pre-commit run --all-files` passed;
 formatter changes are included in this milestone.
 
+### M3: request-local history ownership and reuse
+
+Source: M3 work on `fcca5cabca832b42267db5e01a84e8b03264924d`, the M2
+validation record; tested before committing. The follow-up record identifies
+the source commit.
+
+Added `replay_checkpoint_group`: a sliding, per-token history group names the
+state group that seeds it on resume. The Python declaration and scheduler
+binding require the argument, with `None` preserving every current recipe.
+Recipe/runtime and C++ validation reject missing or non-state dependencies,
+ambiguous IDs and windows too short to cover the checkpoint's declared lag.
+
+Prefix resume uses the existing zero-lookback matcher for this group, without
+changing live retention. Device and Host hits install absolute-position holes;
+the normal allocator supplies fresh suffix blocks owned by the resumed
+request. Two requests sharing a prefix never share mutable replay entries.
+History cannot constrain an otherwise valid exact-checkpoint hit, enter the
+prefix index, participate in canonicalization or boundary residency, or be
+queued for Host writeback. Direct Host publication is rejected as well.
+
+This does not yet allocate KDA history fields or GPU request-position metadata.
+Prefill uses ordinary sliding-group allocation; an empty-tail-only reservation
+is not implemented. The new group contract is exercised with synthetic cache
+consumers, not enabled by a model recipe. PD startup and wire decoding reject
+these groups until endpoint materialization and handoff ordering are connected.
+Ordinary PD and reusable groups keep their existing behavior.
+
+Validation results:
+
+- Complete C++ scheduler suite: **485 passed**, repeated after formatting and
+  rebuilding. New cases cover Device/Host resume, both dependency orders,
+  private suffix ownership, publication/canonicalization exclusion, retention,
+  release, invalid dependencies and the explicit PD gate.
+- Runtime and scheduler bindings: **391 passed, 297 subtests**, repeated with
+  the final rebuilt extension. The final run took 18.20 seconds and reported
+  27 dependency warnings. Existing GDN GPU, Kimi layout, prefill, ordinary PD
+  and Qwen cache checks passed alongside the new contract cases.
+- Buffered reference/GPU: **27 passed**, including eager/CUDA-graph execution,
+  in 7.95 seconds. Numerical tolerances are unchanged.
+- Minimal CPU spec suite: **40 passed, 2 skipped**. The two bridge imports are
+  unavailable in that small venv; both cases passed in the runtime suite.
+
+The environment and portable build/runtime commands are the same as M2.
+A fresh persistent four-GB300 allocation was used under the same binding;
+submit/srun reused the cached image and read-only serving venv. Tests ran on
+one GPU, with no target/draft model or TP8 model execution. The initial runtime
+run also passed; its extra warnings came from first-use compilation. The first
+repository-hook run formatted the new edits; those changes are included.
+Exact commands, versions, source patch and raw logs are retained in ignored
+local artifacts. No weights, packages or image were downloaded. No M3
+performance, AIME or full-model NSYS result is claimed.
+
 Required before runtime dispatch:
 
-1. Represent history as LCM-owned token rows with a checkpoint dependency.
-   A materialized prefix hit initializes an empty history; history must neither
-   demand nonexistent prefill entries nor be published as ordinary reusable KV.
+1. Bind KDA's history fields to the request-local LCM declaration. Initialize
+   empty history on materialized resume and budget the actual field layout,
+   candidates, overlap and prefill working set before choosing a capacity.
 2. Own request-position metadata through the cache contract, with stable GPU
    views and reset/rebind rules. Runtime batch position is not request identity.
 3. Separate accepted progress from materialized checkpoint progress. Resolve
@@ -297,5 +349,5 @@ Required before runtime dispatch:
 5. Generalize target commit to ordinary decode while preserving GDN/PLE/QSA;
    integrate conv commit and prepared gate inputs into that same operation.
 
-**Serving remains unchanged.** Capacity CLI, LCM integration, lifecycle tests,
+**Serving remains unchanged.** Capacity CLI, GPU cache binding, lifecycle tests,
 real-weight TP8 performance, AIME 2026 and full-model NSYS are still pending.

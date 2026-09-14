@@ -84,6 +84,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             raw_per_page = rows_per_page * entry_stride_tokens
             specs = [
                 CacheGroupSpec(
+                    replay_checkpoint_group=None,
                     max_state_lag_tokens=0,
                     group_id="full",
                     retention="full_history",
@@ -92,6 +93,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
                     sliding_window_tokens=None,
                 ),
                 CacheGroupSpec(
+                    replay_checkpoint_group=None,
                     max_state_lag_tokens=0,
                     group_id="sliding",
                     retention="sliding_window",
@@ -138,6 +140,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
         for rows_per_page, entry_stride_tokens in _PAGE_SHAPES:
             raw_per_page = rows_per_page * entry_stride_tokens
             full = CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="full",
                 retention="full_history",
@@ -147,6 +150,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             )
             window = 3 * raw_per_page + 1
             sliding = CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="sliding",
                 retention="sliding_window",
@@ -199,6 +203,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             # window and the physical page stride.
             for window in (3 * raw_per_page, 3 * raw_per_page + 1):
                 spec = CacheGroupSpec(
+                    replay_checkpoint_group=None,
                     max_state_lag_tokens=0,
                     group_id="sliding",
                     retention="sliding_window",
@@ -237,6 +242,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
 
     def test_overlap_sizing_rejects_invalid_runtime_parameters(self):
         spec = CacheGroupSpec(
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
             group_id="full",
             retention="full_history",
@@ -288,19 +294,37 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "rows_per_page"),
         ):
             CacheGroupSpec(
-                "bad-rows", "full_history", 0, 1, None, max_state_lag_tokens=0
+                "bad-rows",
+                "full_history",
+                0,
+                1,
+                None,
+                replay_checkpoint_group=None,
+                max_state_lag_tokens=0,
             )
 
         invalid_specs = (
             (
                 CacheGroupSpec(
-                    "bad-window", "sliding_window", 4, 1, 0, max_state_lag_tokens=0
+                    "bad-window",
+                    "sliding_window",
+                    4,
+                    1,
+                    0,
+                    replay_checkpoint_group=None,
+                    max_state_lag_tokens=0,
                 ),
                 "sliding_window_tokens",
             ),
             (
                 CacheGroupSpec(
-                    "bad-retention", "unknown", 4, 1, None, max_state_lag_tokens=0
+                    "bad-retention",
+                    "unknown",
+                    4,
+                    1,
+                    None,
+                    replay_checkpoint_group=None,
+                    max_state_lag_tokens=0,
                 ),
                 "unsupported retention",
             ),
@@ -340,6 +364,7 @@ class TestV4SlidingWindowGroupsSmoke(unittest.TestCase):
     def test_sliding_window_scheduled_tokens_are_global_and_capped(self):
         specs = [
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="sliding",
                 retention="sliding_window",

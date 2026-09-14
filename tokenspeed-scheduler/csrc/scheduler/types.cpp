@@ -20,8 +20,10 @@
 
 #include "scheduler/types.h"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace tokenspeed {
 
@@ -32,6 +34,22 @@ void validateGroup(const SchedulerConfig& config, const CacheGroupConfig& group)
     const std::string where = "Cache group '" + group.group_id + "': ";
     if (config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
+    }
+    if (group.replay_checkpoint_group) {
+        const auto checkpoint =
+            std::ranges::find(config.cache_groups, *group.replay_checkpoint_group, &CacheGroupConfig::group_id);
+        if (checkpoint == config.cache_groups.end() || !checkpoint->IsSnapshotStateGroup()) {
+            throw std::invalid_argument(where + "replay_checkpoint_group must name a declared State group");
+        }
+        if (*group.sliding_window_tokens <= checkpoint->max_state_lag_tokens) {
+            throw std::invalid_argument(where +
+                                        "replay history window must exceed its checkpoint's max_state_lag_tokens");
+        }
+        if (config.role != Role::kFused) {
+            throw std::invalid_argument(where +
+                                        "request-local replay history requires materialized handoff; "
+                                        "PD integration is not available yet");
+        }
     }
     if (config.role == Role::kFused) {
         return;
@@ -78,7 +96,11 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage) {
         throw std::invalid_argument("Scheduler: L3 storage is not supported by the cache coordinator");
     }
+    std::unordered_set<std::string> group_ids;
     for (const CacheGroupConfig& group : cache_groups) {
+        if (!group_ids.insert(group.group_id).second) {
+            throw std::invalid_argument("Scheduler: duplicate cache group ID '" + group.group_id + "'");
+        }
         validateGroup(*this, group);
         // A recurrent state advances one whole checkpoint at a time, so a chunk
         // must be able to cover one cache block.

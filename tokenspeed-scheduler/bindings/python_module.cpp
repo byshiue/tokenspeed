@@ -112,7 +112,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
                std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy,
-               std::int32_t max_state_lag_tokens) {
+               std::int32_t max_state_lag_tokens, std::optional<std::string> replay_checkpoint_group) {
                 new (self) tokenspeed::CacheGroupConfig{
                     std::move(group_id),
                     block_granularity,
@@ -123,6 +123,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                     family,
                     transfer_policy,
                     max_state_lag_tokens,
+                    std::move(replay_checkpoint_group),
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
@@ -130,7 +131,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
             nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::kw_only(),
-            nb::arg("max_state_lag_tokens"))
+            nb::arg("max_state_lag_tokens"), nb::arg("replay_checkpoint_group"))
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -140,6 +141,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("family", &tokenspeed::CacheGroupConfig::family)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
         .def_rw("max_state_lag_tokens", &tokenspeed::CacheGroupConfig::max_state_lag_tokens)
+        .def_rw("replay_checkpoint_group", &tokenspeed::CacheGroupConfig::replay_checkpoint_group)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
     scheduler_config.def(nb::init<>())

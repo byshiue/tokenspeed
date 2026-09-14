@@ -20,6 +20,8 @@
 
 #include "scheduler/operations/cache.h"
 
+#include <algorithm>
+
 #include "scheduler/types.h"
 
 namespace tokenspeed {
@@ -71,12 +73,19 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             continue;
         }
         const bool is_swa = group.retention == CacheGroupConfig::Retention::SlidingWindow;
+        std::optional<std::uint32_t> replay_checkpoint_group;
+        if (group.replay_checkpoint_group) {
+            const auto checkpoint =
+                std::ranges::find(config.cache_groups, *group.replay_checkpoint_group, &CacheGroupConfig::group_id);
+            replay_checkpoint_group = static_cast<std::uint32_t>(checkpoint - config.cache_groups.begin());
+        }
         specs.push_back(CacheGroupSpec{
             .kind = is_swa ? AttnKind::kSlidingWindow : AttnKind::kFull,
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             .block_granularity = group.block_granularity,
             .max_state_lag_tokens = group.max_state_lag_tokens,
+            .replay_checkpoint_group = replay_checkpoint_group,
         });
     }
     return specs;

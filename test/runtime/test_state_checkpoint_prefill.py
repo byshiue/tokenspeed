@@ -43,6 +43,7 @@ def test_final_extent_and_decode_through_runtime_config(
     """
     groups = [
         ts.CacheGroupConfig(
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
             group_id="history",
             block_granularity=128,
@@ -54,6 +55,7 @@ def test_final_extent_and_decode_through_runtime_config(
     if with_state:
         groups.append(
             ts.CacheGroupConfig(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="state",
                 block_granularity=128,

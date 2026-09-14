@@ -3784,6 +3784,94 @@ TEST(MambaStateKindTest, LaggedStateIsNeitherAdmissionCreditNorReclaimed) {
     }
 }
 
+TEST(ReplayHistoryTest, ResumeOwnsFreshHistoryAndNeverPublishesIt) {
+    for (bool host_extension : {false, true}) {
+        for (bool history_first : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "host=" << host_extension << " history_first=" << history_first);
+            const std::uint32_t state_id = history_first ? 2 : 0;
+            const std::uint32_t replay_id = history_first ? 0 : 2;
+            std::vector<CacheGroupSpec> specs(3);
+            specs[state_id] = {.kind = AttnKind::kMambaState, .block_granularity = 4, .max_state_lag_tokens = 4};
+            specs[1] = {.kind = AttnKind::kFull, .block_granularity = 4};
+            specs[replay_id] = {.kind = AttnKind::kSlidingWindow,
+                                .sliding_window = 5,
+                                .block_granularity = 2,
+                                .replay_checkpoint_group = state_id};
+            BlockPool pool(64, {1, 1, 1});
+            BlockPool host(64, {1, 1, 1});
+            CacheCoordinator coord = MakeCoordinator(specs, 4, pool, &host, true);
+            const std::vector<std::string> hashes{"a", "b"};
+            // Empty replay history cannot manufacture a hit without its
+            // dependency. Both the full prefix and exact state must exist.
+            EXPECT_EQ(coord.ProbePrefix(hashes).device.num_common_tokens, 0);
+            CacheForGroup(coord, pool, "a", 1);
+            CacheForGroup(coord, pool, "a", state_id);
+            BlockPool& final_tier = host_extension ? host : pool;
+            for (std::uint32_t group : {1U, state_id}) {
+                CacheBlockRef ref = final_tier.AcquireBlock(group);
+                if (host_extension) {
+                    coord.CacheHostBlock(ref, Key("b", group));
+                } else {
+                    coord.GroupPrefixIndex(group).Register(pool, ref, Key("b", group), NextTestAccessEpoch());
+                }
+            }
+            EXPECT_EQ(coord.GroupBoundaryLookbackPages(replay_id), 0);
+            EXPECT_EQ(coord.DeviceBoundaryResidency(Key("a", 1)), CacheCoordinator::BoundaryResidency::kComplete);
+
+            std::vector<BlockTable> first(3), second(3);
+            auto first_admission = AdmitForTest(coord, first, coord.ProbePrefix(hashes), GroupDemand{.num_tokens = 4});
+            ASSERT_TRUE(first_admission);
+            EXPECT_EQ(first_admission->device_prefix_tokens, host_extension ? 4 : 8);
+            EXPECT_EQ(first_admission->host_prefix_tokens, 8);
+            for (const BlockTransfer& transfer : first_admission->load_pairs) {
+                EXPECT_NE(transfer.group_id, replay_id);
+            }
+            first_admission->load_pairs.clear();  // Model the completed load's ownership release.
+            ASSERT_TRUE(AdmitForTest(coord, second, coord.ProbePrefix(hashes), GroupDemand{.num_tokens = 4}));
+            ASSERT_EQ(first[replay_id].NumBlocks(), 6);
+            for (std::int32_t slot = 0; slot < 4; ++slot) {
+                EXPECT_FALSE(first[replay_id].Blocks()[slot]);
+                EXPECT_FALSE(second[replay_id].Blocks()[slot]);
+            }
+            const CacheBlockLocation history = first[replay_id].Blocks()[4]->Location();
+            EXPECT_NE(history, second[replay_id].Blocks()[4]->Location());
+            // Publication must not canonicalize one request's mutable replay
+            // entries into another's, even at an identical token prefix.
+            const std::vector<std::string> completed{"a", "b", "c"};
+            coord.CacheCompletedBlocks(first, completed, first_admission->access_epoch, 2, 12,
+                                       CacheBoundaryKind::kEndpoint, true, 12);
+            CacheFullBlocksForTest(coord, first, completed);
+            CacheFullBlocksForTest(coord, second, completed);
+            EXPECT_EQ(first[replay_id].Blocks()[4]->Location(), history);
+            EXPECT_NE(history, second[replay_id].Blocks()[4]->Location());
+            EXPECT_EQ(coord.GroupPrefixIndex(replay_id).NumEntries(pool), 0);
+            EXPECT_EQ(coord.GroupPrefixIndex(replay_id).NumEntries(host), 0);
+            coord.QueueCachedBlocksForStore(completed);
+            coord.QueueLatestSnapshotBlocksForStore(completed);
+            for (const auto& candidate : coord.TakePendingStores()) {
+                EXPECT_NE(candidate.key.group_id, replay_id);
+            }
+            CacheBlockRef invalid_host = host.AcquireBlock(replay_id);
+            EXPECT_THROW(coord.CacheHostBlock(invalid_host, Key("c", replay_id)), std::runtime_error);
+            invalid_host.reset();
+
+            // Matching's zero lookback does not weaken live retention. At
+            // p=12 the checkpoint may still be at 8; history [8,12) survives.
+            coord.ReclaimExpired(first, 12);
+            ASSERT_TRUE(first[replay_id].Blocks()[4]);
+            EXPECT_EQ(first[replay_id].Blocks()[4]->Location(), history);
+            coord.ReclaimExpired(first, 14);
+            EXPECT_FALSE(first[replay_id].Blocks()[4]);
+            EXPECT_TRUE(first[replay_id].Blocks()[5]);
+            coord.Free(first);
+            coord.Free(second);
+            EXPECT_EQ(coord.NumAvailableLcmBlocks(), 64);
+            EXPECT_TRUE(coord.ClearCache());
+            EXPECT_EQ(pool.NumEmptyLcmBlocks(), 64);
+        }
+    }
+}
+
 TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
     BlockPool pool(8, {1});
     std::vector<CacheGroupSpec> specs = {

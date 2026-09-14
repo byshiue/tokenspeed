@@ -40,6 +40,7 @@ def make_scheduler() -> Scheduler:
     cfg.num_device_pages = 1024
     cfg.cache_groups = [
         CacheGroupConfig(
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
             group_id="full_attention",
             block_granularity=cfg.prefix_granularity,

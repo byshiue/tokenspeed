@@ -83,6 +83,9 @@ struct CacheGroupSpec {
     // State-only retention lookback beyond the eager-state endpoint. Prefix
     // reuse still requires one exactly materialized boundary snapshot.
     std::int32_t max_state_lag_tokens{0};
+    // Dense group index of the state that seeds request-local replay history.
+    // Not a retention/geometry override; absent for reusable cache groups.
+    std::optional<std::uint32_t> replay_checkpoint_group{};
 };
 
 // Per-group input for one admission. prefix_hashes is the request's cumulative

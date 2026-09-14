@@ -445,6 +445,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_row_geometry_shape(self):
         spec = CacheGroupSpec(
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
             group_id="kv",
             retention="full_history",
@@ -458,6 +459,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_checkpoint_shape(self):
         spec = CacheGroupSpec(
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
             group_id="state",
             retention="full_history",
@@ -475,6 +477,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             retention="full_history",
             family="state",
             checkpoint_granularity=128,
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
         )
         for lag, extra_blocks in [(0, 0), (1, 1), (60, 1), (128, 1), (257, 3)]:
@@ -500,6 +503,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             retention="full_history",
             rows_per_page=128,
             entry_stride_tokens=1,
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
         )
         with self.assertRaisesRegex(ValueError, "zero for history"):
@@ -509,9 +513,59 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "max_state_lag_tokens"):
             CacheGroupSpec(**missing_lag)
 
+    def test_replay_history_dependency_and_retention_contract(self):
+        checkpoint = CacheGroupSpec(
+            group_id="state",
+            retention="full_history",
+            family="state",
+            checkpoint_granularity=128,
+            max_state_lag_tokens=60,
+            replay_checkpoint_group=None,
+        )
+        history = CacheGroupSpec(
+            group_id="replay",
+            retention="sliding_window",
+            rows_per_page=4,
+            entry_stride_tokens=1,
+            sliding_window_tokens=61,
+            max_state_lag_tokens=0,
+            replay_checkpoint_group="state",
+        )
+        # Declaration order is not dependency order. The serialized spec must
+        # preserve the relationship; it is not a backend-side association.
+        for specs in [(history, checkpoint), (checkpoint, history)]:
+            _spec.validate_replay_dependencies(specs)
+        self.assertEqual(CacheGroupSpec(**asdict(history)), history)
+        for changes in [
+            {"replay_checkpoint_group": ""},
+            {"replay_checkpoint_group": "replay"},
+            {"replay_checkpoint_group": 1},
+            {"retention": "full_history"},
+            {"entry_stride_tokens": 2},
+            {"sliding_window_tokens": True},
+            {"sliding_window_tokens": 2**31},
+            {"transfer_policy": "full_suffix"},
+        ]:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                replace(history, **changes)
+        for specs in [
+            (history,),
+            (history, checkpoint, checkpoint),
+            (replace(history, sliding_window_tokens=60), checkpoint),
+            (replace(history, replay_checkpoint_group="missing"), checkpoint),
+            (history, replace(history, group_id="state", replay_checkpoint_group=None)),
+        ]:
+            with self.subTest(specs=specs), self.assertRaises(ValueError):
+                _spec.validate_replay_dependencies(specs)
+        missing = asdict(history)
+        del missing["replay_checkpoint_group"]
+        with self.assertRaises(TypeError):
+            CacheGroupSpec(**missing)
+
     def test_shapes_are_mutually_exclusive(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="state",
                 retention="full_history",
@@ -525,6 +579,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_missing_shape_raises(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
@@ -534,6 +589,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_partial_row_geometry_raises(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
@@ -544,6 +600,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_checkpoint_requires_state_family(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
@@ -555,6 +612,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_nonpositive_geometry_raises(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
@@ -564,6 +622,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="state",
                 retention="full_history",
@@ -578,6 +637,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         # checkpoint shape and nothing else.
         with self.assertRaisesRegex(ValueError, "checkpoint_granularity"):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="v4.compressor",
                 retention="sliding_window",
@@ -587,6 +647,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 family="state",
             )
         spec = CacheGroupSpec(
+            replay_checkpoint_group=None,
             max_state_lag_tokens=0,
             group_id="v4.compressor",
             retention="sliding_window",
@@ -603,6 +664,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         # group ever slides out.
         with self.assertRaisesRegex(ValueError, "full_history"):
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="state",
                 retention="sliding_window",
@@ -679,6 +741,17 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
             replace(spec, max_state_lag_tokens=60) if spec.family == "state" else spec
             for spec in specs
         )
+        specs += (
+            CacheGroupSpec(
+                group_id="replay",
+                retention="sliding_window",
+                rows_per_page=4,
+                entry_stride_tokens=1,
+                sliding_window_tokens=61,
+                max_state_lag_tokens=0,
+                replay_checkpoint_group="linear_attention",
+            ),
+        )
         fake_pool = _fake_pool(specs)
 
         groups = {g.group_id: g for g in pool_to_cache_groups(fake_pool)}
@@ -694,6 +767,11 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
         self.assertEqual(full.block_granularity, 16)
         self.assertEqual(full.max_state_lag_tokens, 0)
         full.validate()
+        self.assertIsNone(full.replay_checkpoint_group)
+        replay = groups["replay"]
+        self.assertEqual(replay.replay_checkpoint_group, "linear_attention")
+        self.assertEqual(replay.block_granularity, 4)
+        replay.validate()
 
 
 if __name__ == "__main__":

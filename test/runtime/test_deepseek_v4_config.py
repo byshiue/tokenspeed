@@ -2998,6 +2998,7 @@ class TestDeepseekV4Config(unittest.TestCase):
         )
         specs = (
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="fine",
                 retention="full_history",
@@ -3006,6 +3007,7 @@ class TestDeepseekV4Config(unittest.TestCase):
                 sliding_window_tokens=None,
             ),
             CacheGroupSpec(
+                replay_checkpoint_group=None,
                 max_state_lag_tokens=0,
                 group_id="coarse",
                 retention="full_history",
@@ -3837,6 +3839,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             2,
             cache_group_specs=(
                 CacheGroupSpec(
+                    replay_checkpoint_group=None,
                     max_state_lag_tokens=0,
                     group_id="v4.swa_kv",
                     retention="sliding_window",
@@ -5184,6 +5187,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             max_bs=4,
             cache_group_specs=(
                 CacheGroupSpec(
+                    replay_checkpoint_group=None,
                     max_state_lag_tokens=0,
                     group_id=group_id,
                     retention="full_history",
