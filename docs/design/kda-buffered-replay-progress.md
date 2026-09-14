@@ -16,8 +16,8 @@ M3 source commit: `24c69bf25ca09ab4417b7134593c6f8bebbaf60b`
 (`feat(cache): keep replay history request-local`).
 M4 source commit: `ac74d6785ee921efcd2b4c061e74a562b82ac47f`
 (`feat(cache): reserve only replay history decode tails`).
-M5 source: uncommitted during validation; exact commit will be recorded after
-the repository hooks pass.
+M5 source commit: `f4312f1ce25a0ff95c78a97fc70bada0013ce8af`
+(`feat(kda): bind cache-owned replay history and positions`).
 No default capacity or performance benefit has been established. M1 adds
 an unregistered prototype, not the complete serving feature.
 
@@ -480,12 +480,14 @@ CUDA 13.0, driver 580.167.08, tokenspeed-triton 3.8.10.post20260906 and pytest
 unchanged M4 build, staged separately; there are no C++ edits in M5.
 
 - Cache/runtime/scheduler regression selection: **501 passed, 317 subtests**,
-  28 dependency warnings, 19.57 seconds. The nine new cases cover TP1/2/4/8/16,
+  28 dependency warnings, 19.57 seconds initially and 18.45 seconds on the final
+  source. The nine new cases cover TP1/2/4/8/16,
   L=8/37/64, T=1/4, budget inversion, unchanged prefill independence, actual
   arena aliasing/zeroing, PP/draft windows, fences, invalid layouts and the
   serving guard. Existing Kimi, GDN/Qwen, GLM, PD, pool and router checks pass.
 - Buffered reference/GPU selection: **34 passed**, 15 dependency warnings,
-  7.18 seconds. Seven new cases check strided paged metadata, 64 reordered
+  7.18 seconds initially and 7.75 seconds on the final source. Seven new cases
+  check strided paged metadata, 64 reordered
   rounds, eager/CUDA graphs, idle/padding, acceptance, flush and invalid stores.
   An initial test pattern did not produce zero acceptance at a flush; the test
   now forces that case. Recurrence tolerances and kernels are unchanged.
@@ -495,8 +497,11 @@ These durations describe test execution, not a performance comparison. M1's
 serial recurrence regression is unresolved. No M5 serving throughput, TP8
 real-weight accuracy, AIME score or NSYS result is claimed. Full commands,
 planner estimates, environment, source patch and logs are retained in ignored
-`outputs/kda-buffered-replay/m5/`; repository-hook and final-source results will
-be recorded with the source commit.
+`outputs/kda-buffered-replay/m5/`. The first repository-hook run formatted seven
+files; those edits are included. The final `pre-commit run --all-files` passed
+before the signed-off source commit, and both GPU/runtime selections passed
+on that final source. Address arithmetic widens raw table offsets before
+multiplication. The local runbook records the source patch and artifact hashes.
 
 Next: integrate paged recurrence and shared runtime position refresh, then
 materialization/publication ordering and ordinary/speculative commit. Capacity
