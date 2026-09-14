@@ -80,6 +80,9 @@ struct CacheGroupSpec {
     // Tokens represented by one CacheBlock in this group. Required: must be
     // a positive divisor of the coordinator-wide prefix granularity.
     std::int32_t block_granularity{0};
+    // State-only retention lookback beyond the eager-state endpoint. Prefix
+    // reuse still requires one exactly materialized boundary snapshot.
+    std::int32_t max_state_lag_tokens{0};
 };
 
 // Per-group input for one admission. prefix_hashes is the request's cumulative

@@ -198,6 +198,12 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
         } else {
             child_pages = local_prefill_peak();
         }
+        if (group.IsSnapshotStateGroup() && token_limit > 0) {
+            // Extend the existing eager-state working-set bound by the
+            // maximum whole-block growth of its retention interval. This is
+            // independent of prefix matching's single-snapshot lookback.
+            child_pages += ceilDiv(static_cast<std::int64_t>(group.max_state_lag_tokens), block_granularity);
+        }
         group_pages[static_cast<std::size_t>(i)] = child_pages;
     }
     return coordinator_.LcmBlocksNeededFor(group_pages);

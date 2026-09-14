@@ -860,6 +860,9 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         const CacheGroupSpec& spec = specs[i];
         const std::uint32_t group_id = static_cast<std::uint32_t>(i);
         _assert(spec.cache_blocks_per_lcm_block > 0, "cache_blocks_per_lcm_block must be > 0");
+        _assert(
+            spec.max_state_lag_tokens >= 0 && (spec.kind == AttnKind::kMambaState || spec.max_state_lag_tokens == 0),
+            "max_state_lag_tokens must be non-negative and zero for non-state groups");
         const std::int32_t group_block_granularity = spec.block_granularity;
         _assert(group_block_granularity > 0 && prefix_granularity % group_block_granularity == 0,
                 "group block_granularity must be a positive divisor of the prefix granularity");

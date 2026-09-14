@@ -66,6 +66,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
                 .sliding_window = 0,
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
                 .block_granularity = group.block_granularity,
+                .max_state_lag_tokens = group.max_state_lag_tokens,
             });
             continue;
         }
@@ -75,6 +76,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .sliding_window = is_swa ? *group.sliding_window_tokens : 0,
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             .block_granularity = group.block_granularity,
+            .max_state_lag_tokens = group.max_state_lag_tokens,
         });
     }
     return specs;

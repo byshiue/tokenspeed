@@ -3712,6 +3712,78 @@ TEST(MambaStateKindTest, StateGroupRetentionKeepsOnlyLastPage) {
     coord.Free(tables);
 }
 
+TEST(MambaStateKindTest, LaggedRetentionPreservesTheEndpointBlock) {
+    for (std::int32_t grain : {1, 4, 128}) {
+        GroupGeometry geometry{grain};
+        for (std::int32_t lag : {0, 1, 12, 128, 257, std::numeric_limits<std::int32_t>::max()}) {
+            SCOPED_TRACE(::testing::Message() << "grain=" << grain << " lag=" << lag);
+            const CacheGroupSpec spec{
+                .kind = AttnKind::kMambaState, .block_granularity = grain, .max_state_lag_tokens = lag};
+            BlockPool pool(1, {1});
+            CacheCoordinator coord = MakeCoordinator(std::array{spec}, grain, pool);
+            CacheForGroup(coord, pool, "boundary", 0);
+            EXPECT_EQ(coord.GroupBoundaryLookbackPages(0), 1);
+            EXPECT_EQ(coord.ProbePrefix(std::vector<std::string>{"boundary"}).device.num_common_tokens, grain);
+            for (std::int32_t progress : {0, 1, grain, grain + 1, 140, 512}) {
+                // A state at c occupies the block containing token c - 1.
+                // Every c in [max(1, progress - lag), progress] stays live.
+                const std::int32_t expired = geometry.ExpiredBlocksAt(spec, progress);
+                for (std::int32_t c = std::max(1, progress - lag); c <= progress; ++c) {
+                    EXPECT_LE(expired, (c - 1) / grain);
+                }
+            }
+            EXPECT_EQ(geometry.ExpiredBlocksAt(spec, std::numeric_limits<std::int32_t>::max()),
+                      (static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) - lag - 1 <= 0)
+                          ? 0
+                          : (static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) - lag - 1) / grain);
+        }
+    }
+}
+
+TEST(MambaStateKindTest, LaggedStateIsNeitherAdmissionCreditNorReclaimed) {
+    for (std::int32_t lag : {0, 12}) {
+        for (bool cached : {false, true}) {
+            SCOPED_TRACE(::testing::Message() << "lag=" << lag << " cached=" << cached);
+            BlockPool pool(2, {1});
+            const std::array specs{
+                CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 128, .max_state_lag_tokens = lag}};
+            CacheCoordinator coord = MakeCoordinator(specs, 128, pool);
+            std::vector<BlockTable> tables(1);
+            ASSERT_TRUE(AdmitForTest(coord, tables, 140));
+            const auto checkpoint_id = tables[0].Blocks()[0]->Location();
+            if (cached) {
+                // The temporary ref lives only through registration; leaving
+                // it alive during admission would independently pin the block.
+                CacheBlockRef checkpoint = tables[0].Blocks()[0];
+                coord.GroupPrefixIndex(0).Register(pool, checkpoint, Key("checkpoint", 0), NextTestAccessEpoch());
+                // A resumed request needs only the materialized snapshot,
+                // even when the live request's retention extends further.
+                EXPECT_EQ(coord.GroupBoundaryLookbackPages(0), 1);
+                EXPECT_EQ(coord.ProbePrefix(std::vector<std::string>{"checkpoint"}).device.num_common_tokens, 128);
+            }
+            EXPECT_EQ(coord.GroupBlocksReclaimableAt(0, tables[0], 140, true), lag == 0 ? 1 : 0);
+            EXPECT_EQ(coord.GroupHasReclaimableBlocksAt(0, tables[0], 140), lag == 0);
+            // Two occupied blocks leave no room for this reserve. The
+            // lagging checkpoint must not finance its own replacement.
+            GroupDemand growth{.num_computed_tokens = 140, .reserve_tokens = 117};
+            EXPECT_EQ(AdmitForTest(coord, tables, growth).has_value(), lag == 0);
+            if (lag != 0) {
+                coord.ReclaimExpired(tables, 140);
+                ASSERT_TRUE(tables[0].Blocks()[0]);
+                EXPECT_EQ(tables[0].Blocks()[0]->Location(), checkpoint_id);
+                EXPECT_EQ(tables[0].NumBlocks(), 2);
+                // Progress 141 promises the checkpoint is now >=129: slot
+                // zero can retire, and the same admission can reuse it.
+                growth.num_computed_tokens = 141;
+                EXPECT_TRUE(AdmitForTest(coord, tables, growth));
+            }
+            EXPECT_FALSE(tables[0].Blocks()[0]);
+            EXPECT_EQ(tables[0].NumBlocks(), 3);
+            coord.Free(tables);
+        }
+    }
+}
+
 TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
     BlockPool pool(8, {1});
     std::vector<CacheGroupSpec> specs = {

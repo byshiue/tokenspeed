@@ -52,6 +52,10 @@ struct CacheGroupConfig {
     std::optional<std::int32_t> sliding_window_tokens{};
     CacheGroupFamily family{CacheGroupFamily::History};
     CacheTransferPolicy transfer_policy{CacheTransferPolicy::Unspecified};
+    // Maximum accepted-token distance behind the endpoint at which a live
+    // state may still be read. This extends request retention, not prefix
+    // matching or publication. Zero is the eager-state contract.
+    std::int32_t max_state_lag_tokens{0};
 
     // A State group keeps one recurrent-state checkpoint per block instead of
     // a token history: the mamba-style group (GDN linear attention, conv

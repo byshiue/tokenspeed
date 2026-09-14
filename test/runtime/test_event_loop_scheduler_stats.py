@@ -51,6 +51,7 @@ def test_scheduler_stats_partition_lcm_blocks(packing, active_parents, cached_pa
     config.disable_prefix_cache = False
     config.cache_groups = [
         ts.CacheGroupConfig(
+            max_state_lag_tokens=0,
             group_id="history",
             block_granularity=2,
             total_pages=16 * packing + 1,

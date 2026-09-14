@@ -1,6 +1,8 @@
 # Kimi-K3 Buffered Replay：统一 Decode 实现计划
 
-状态：待实现。本文件是方案与验收计划，不代表当前运行时已支持这些能力。
+状态：实现中。Reference 和未注册的 GPU 原型已完成，cache contract 正在接入；
+当前服务端尚未启用 buffered replay。验证与剩余工作见
+[implementation record](kda-buffered-replay-progress.md)。本文件仍是完整方案与验收计划。
 
 ## 1. 目标与范围
 

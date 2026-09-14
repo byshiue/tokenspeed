@@ -43,6 +43,7 @@ def test_final_extent_and_decode_through_runtime_config(
     """
     groups = [
         ts.CacheGroupConfig(
+            max_state_lag_tokens=0,
             group_id="history",
             block_granularity=128,
             total_pages=64,
@@ -53,6 +54,7 @@ def test_final_extent_and_decode_through_runtime_config(
     if with_state:
         groups.append(
             ts.CacheGroupConfig(
+                max_state_lag_tokens=0,
                 group_id="state",
                 block_granularity=128,
                 total_pages=64,

@@ -195,6 +195,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
         return groups + (
             (
                 CacheGroupSpec(
+                    max_state_lag_tokens=0,
                     group_id=self._extra_state_group,
                     retention="full_history",
                     sliding_window_tokens=None,

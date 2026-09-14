@@ -16,7 +16,7 @@ an unregistered prototype, not the complete serving feature.
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
-| B. LCM ownership, retention and lifecycle contract | In progress: audit | Protect the lagging checkpoint and history; accurate capacity accounting; safe publication and handoff |
+| B. LCM ownership, retention and lifecycle contract | M2 retention/capacity foundation implemented | History ownership, metadata, publication and handoff still pending |
 | C. Unified GPU forward and commit | Isolated recurrence prototype; not registered or integrated | LCM, conv/gate integration and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
@@ -187,6 +187,98 @@ must retain a state block covering that lag in addition to ordinary overlap
 protection, or hold an explicit checkpoint reference until flush retirement.
 The same bound must inform admission and victim/reclaim accounting; changing
 only the final reclamation call leaves admission able to reclaim the source.
+
+### M2: bounded live-state retention
+
+Source: the M2 retention milestone on M1; validated before committing. The
+follow-up validation record identifies the source commit.
+
+Added the explicit `max_state_lag_tokens` cache contract. The Python spec,
+scheduler binding and C++ translation carry the same non-negative token bound;
+history groups must pass zero. All current recipes explicitly pass zero, so
+this milestone does not activate buffered replay or change serving state math.
+
+Admission credit, eviction planning, in-place reserve checks and reclamation
+share the updated expiry calculation. Prefix matching still needs one exact
+snapshot, regardless of live-state lag. Capacity bounds add conservative
+whole-block lag headroom before packing, retaining Kimi-K3's existing prefill
+working-set allowance. Required-argument changes in other recipes and test
+fixtures merely state their existing zero-lag policy.
+
+For the proposed buffer policy, `L - T_max` is the maximum accepted history
+length to declare at integration. This milestone adds only the retention
+mechanism; no capacity CLI or history group has been connected yet.
+
+The C++ build environment is Linux aarch64, GCC 13.3.0, CMake 4.4.3,
+nanobind 3.0.1, tokenspeed-spdlog 1.15.1 and GoogleTest 1.14.0, Release build.
+Runtime and GPU checks use the same GB300/CUDA 13.0/PyTorch 2.13.0 serving
+environment as A2, with the newly built scheduler extension staged separately.
+The existing persistent allocation and cached image/venv were reused; no
+downloads or real target/draft weights were needed.
+
+Validation results:
+
+- Clean rebuild and complete C++ scheduler suite: **483 passed**. New cases cover retention at
+  aligned/unaligned endpoints, large and int32-limit lags, unchanged snapshot
+  matching, tight-pool admission with cached/uncached checkpoints, retirement
+  after progress, invalid configurations and per-role capacity accounting.
+- Scheduler bindings and runtime cache suites: **389 passed, 284 subtests**,
+  repeated with the final clean-built extension.
+  These include Kimi-K3 layout/budget/bridge tests, PD wire round trips and
+  missing-field rejection, existing GDN GPU state-paging/oracle/continuation
+  checks, Qwen cache groups and one-forward prefill scheduling.
+- Buffered reference and GPU prototype: **27 passed**, including eager and
+  CUDA-graph forward/commit. No numerical tolerances changed.
+
+Build from the repository root in an activated build venv:
+
+```bash
+cmake -S tokenspeed-scheduler -B build/kda-buffered-replay-m2 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
+  -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=ON
+cmake --build build/kda-buffered-replay-m2 -j 8
+build/kda-buffered-replay-m2/tokenspeed_scheduler_tests --gtest_color=no
+```
+
+For runtime checks, import that freshly built extension with the current
+`tokenspeed_scheduler` Python wrapper; do not use an older installed binding.
+With its staging directory first on `PYTHONPATH`, append `python`,
+`tokenspeed-kernel/python` and `test/runtime`, then run:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 python -m pytest \
+  tokenspeed-scheduler/python/tests \
+  test/runtime/test_group_specs_from_layer_types.py \
+  test/runtime/test_multi_window_page_counts.py \
+  test/runtime/test_kimi_k3_cache_spec.py \
+  test/runtime/test_kimi_k3_integration.py \
+  test/runtime/test_cache_setup.py \
+  test/runtime/test_cache_memory_plan.py \
+  test/runtime/distributed/test_cache_pd_manifest.py \
+  test/runtime/test_aligned_max_scheduled_tokens.py \
+  test/runtime/test_state_checkpoint_prefill.py \
+  test/runtime/test_event_loop_scheduler_stats.py \
+  test/runtime/test_v4_sliding_window_groups_smoke.py \
+  test/runtime/test_gdn_state_paging.py \
+  test/runtime/models/test_qwen3_cache_groups.py -q --tb=short
+```
+
+The prototype command is unchanged from A2. Inputs are synthetic test cases
+and the existing GDN oracle; these results are not an AIME or TP8 full-model
+accuracy score. No performance comparison was run for M2, and the M1 serial
+prototype regression remains unresolved. Current recipes still declare zero
+lag, and no serving kernel or attention arithmetic changed.
+
+Failures retained in the record: the first C++ build exposed two new test-code
+errors (a const reference at registration and initializer order), both fixed.
+The small CPU venv passed 200 tests but could not run Kimi recipe tests with
+its missing runtime packages or a mixed PyTorch/torchvision installation.
+The first container run passed 385 tests and failed four shared test-helper
+imports; adding `test/runtime` to `PYTHONPATH` produced the passing run above.
+Local ignored artifacts hold the commands, environment, successful logs and
+the failed container log. The mandatory `pre-commit run --all-files` passed;
+formatter changes are included in this milestone.
 
 Required before runtime dispatch:
 

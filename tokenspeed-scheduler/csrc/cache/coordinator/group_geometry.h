@@ -84,7 +84,7 @@ public:
         };
     }
 
-    // Pages [0, result) of the table have fully expired under the group's
+    // Blocks [0, result) of the table have fully expired under the group's
     // retention policy at this progress; kFull never expires. This is where
     // the sliding-window/state token policy meets page arithmetic, so it
     // lives here and not in the (token-free) allocator.
@@ -97,16 +97,21 @@ public:
                 window = spec.sliding_window;
                 break;
             case AttnKind::kMambaState:
-                // Keep exactly the live state page plus its snapshot.
+                // Matching still needs one boundary snapshot. A live request
+                // can additionally depend on a lagging materialized state.
                 window = kMambaStateWindow;
                 break;
             default:
                 FatalCheck(false, "unknown AttnKind in retention policy");
         }
         _assert(window > 0, "retention window must be > 0");
-        const std::int32_t skipped = num_computed_tokens - window + 1;
+        const std::int64_t lag = spec.kind == AttnKind::kMambaState ? spec.max_state_lag_tokens : 0;
+        // State at endpoint c occupies (c - 1) / grain, including when c is
+        // aligned. Widen before subtraction: the configured lag may be int32
+        // max, and early request progress can be smaller than that lag.
+        const std::int64_t skipped = static_cast<std::int64_t>(num_computed_tokens) - window + 1 - lag;
         // Only fully-slid-out pages expire.
-        return skipped <= 0 ? 0 : skipped / block_granularity_;
+        return skipped <= 0 ? 0 : static_cast<std::int32_t>(skipped / block_granularity_);
     }
 
     static constexpr std::int32_t kMambaStateWindow = 2;

@@ -86,6 +86,7 @@ def v4_c4_state_window(decode_input_tokens: int) -> int:
 def v4_swa_kv_spec(hf_config) -> CacheGroupSpec:
     """SWA kv: per-token KV rows retained over a sliding window."""
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=V4_SWA_KV_GROUP_ID,
         retention="sliding_window",
         rows_per_page=V4_KERNEL_BLOCK_ROWS,
@@ -100,6 +101,7 @@ def v4_compressor_state_spec(ratio: int, *, c4_state_window: int) -> CacheGroupS
     the compressor folds, retained as a sliding window."""
     _check_ratio(ratio)
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=v4_compressor_state_group_id(ratio),
         retention="sliding_window",
         rows_per_page=V4_COMPRESSOR_STATE_ROWS_PER_PAGE[ratio],
@@ -115,6 +117,7 @@ def v4_compressed_kv_spec(ratio: int) -> CacheGroupSpec:
     """Compressed kv for one ratio: full-history chain (indexer K shares it)."""
     _check_ratio(ratio)
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=v4_compressed_kv_group_id(ratio),
         retention="full_history",
         rows_per_page=v4_compressed_rows_per_page(ratio),
@@ -127,6 +130,7 @@ def v4_compressed_kv_spec(ratio: int) -> CacheGroupSpec:
 def v4_indexer_state_spec(*, c4_state_window: int) -> CacheGroupSpec:
     """Indexer compressor input tail: raw-token rows over a sliding window."""
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=V4_INDEXER_COMPRESSOR_STATE_GROUP_ID,
         retention="sliding_window",
         rows_per_page=V4_COMPRESSOR_STATE_ROWS_PER_PAGE[4],

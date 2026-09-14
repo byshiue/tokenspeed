@@ -49,6 +49,9 @@ void CacheGroupConfig::Validate() const {
                                     "a State group keeps recurrent-state checkpoints and rides FullHistory "
                                     "retention; a sliding token window is a History group");
     }
+    if (max_state_lag_tokens < 0 || (family != CacheGroupFamily::State && max_state_lag_tokens != 0)) {
+        throw std::invalid_argument(where + "max_state_lag_tokens must be non-negative and zero for History groups");
+    }
 }
 
 }  // namespace tokenspeed
