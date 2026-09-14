@@ -46,9 +46,9 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Last aligned state boundary produced by scheduled local prefill. The
-    // ordered forward stream materializes it before subsequent publication.
-    // Decode must not advance this: verify commits only its accepted endpoint.
+    // Last exact aligned state boundary produced by local prefill or accepted
+    // decode. Preserve it while conservative hash publication catches up.
+    // A verify window crossing a boundary does not prove that state was written.
     std::int32_t materialized_state_boundary_tokens{0};
 };
 

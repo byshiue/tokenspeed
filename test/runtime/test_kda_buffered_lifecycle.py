@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     [
         (1, 8, 124, 1, 4, False, 128),
         (4, 8, 124, 4, 1, False, 128),
+        (4, 8, 124, 4, 3, False, 128),
         (4, 37, 124, 3, 2, False, 0),
         (4, 8, 140, 4, 6, False, 128),
         (4, 37, 140, 4, 6, True, 128),

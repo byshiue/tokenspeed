@@ -49,7 +49,7 @@ against the frozen baseline before the work meets its completion gate.
 | B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
 | C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
 | D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
-| E. Real-model correctness and performance | Baseline smoke and first timing run complete; buffered model validation in progress | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces remain acceptance gates |
+| E. Real-model correctness and performance | First baseline/L8/L16 runs complete; both capacities miss the no-regression gate and exact output parity | Publication fix rerun, AIME 2026, remaining capacities, restart repeats and traces are pending |
 
 ## Recording a result
 
@@ -1094,8 +1094,10 @@ group specs and a capture call missing placeholder tables; both fixtures now
 honor the real interface. No test was removed and no tolerance was widened.
 The invalid-acceptance check refreshes the actual next endpoint and first
 asserts valid backing, so an unrelated metadata failure cannot hide a missed
-acceptance check. The full TP8 tensor workspace is **11,211,756 bytes per rank**
-at context 65,536, batch four and width four, four bytes above M11.
+acceptance check. The static TP8 tensor budget is **11,211,756 bytes per rank**
+at physical context extent 65,536, batch four and width four, four bytes above
+M11. Serving adds speculative overshoot headroom to the logical context limit;
+the real-model validation below records its actual allocation separately.
 
 ### M13: quiescent endpoint materialization
 
@@ -1318,3 +1320,71 @@ The local runbook records the corrected audit assumptions and initial failed
 audit attempts. No failed model request was replaced or filtered. Buffered
 timings, independent restart repeats, the capacity sweep, AIME and fresh NSYS
 remain pending.
+
+### First buffered model measurements and publication follow-up
+
+The M15 L8 server completed its real-weight smoke, graph capture and all
+75 measured requests with the same eight-GPU setup and protocol as the baseline
+above. Each rank selected `triton_kda_buffered_recurrent`, width four, capacity
+eight. Actual tensor workspace was **11,211,852 bytes per rank**: the 65,536
+logical context includes 12 speculative overshoot tokens in physical metadata,
+adding one raw-table column (96 bytes) to the static M12 example.
+
+The 16-token smoke matches baseline through the first 11 tokens, then diverges.
+Exact token parity therefore fails; successful execution and passing kernel
+references do not by themselves establish full-model accuracy. AIME is pending.
+
+The first L8 timing run has median client latency **1,168.941 ms at C1**,
+**9.18% slower** than the first baseline run, and **1,623.153 ms at C4**, about
+**0.52% faster**. Median acceptance length changes from 3.59 to 3.27 at C1;
+it is 3.67 in both C4 runs. C1 median decode throughput is 259.1 tokens/s,
+C4 221.25 tokens/s. All samples have the expected token/cache counts and no
+preemption; C1 has one exact output sequence and C4 two. These are first-run
+observations, not a restart-controlled performance pass. The completion gate
+has not passed, and no default capacity is recommended.
+
+The frozen M15 L16 server also completed all 75 measured requests. Median
+client latency was **1,082.545 ms at C1** and **1,830.034 ms at C4**, respectively
+**1.11%** and **12.16% slower** than baseline. Median decode throughput was
+283.5 and 185.0 tokens/s; acceptance length was 3.64 and 3.10. Its 16-token
+smoke matched L8, including the difference from baseline. No request failed or
+was preempted. Neither tested capacity passes the end-to-end no-regression
+gate. The remaining capacity sweep, independent restart repeats, AIME and
+fresh NSYS are still open.
+
+A separate raw-token lifecycle diagnostic generated 1,024 tokens, then reused
+that generated prefix. It hit only the original prefill snapshot at 51,840,
+so its assertion requiring a decode-produced checkpoint failed. The original
+responses and failure are retained; the test was not weakened or retried.
+This is not an AIME or rendered agent task-resolution test.
+
+The follow-up scheduler test deterministically reproduces a missing publication
+watermark: accepted progress reaches 128, but four-token verify's conservative
+frontier is 125. After accepted progress moves to 129/133, the old scheduler
+forgets that state 128 was materialized before the hash frontier can publish it.
+The test fails for exact-boundary cases with and without replay history, at
+overlap depths zero/one; skipped-boundary cases remain correctly unhittable.
+The fix preserves only known exact materialization evidence across admission
+rounds. This fix is being validated on top of `de69d598`; both capacity
+experiments above used frozen M15, not the fix.
+
+### M16: preserve exact decode checkpoints until publication
+
+The scheduler now retains the last known exact materialization boundary in
+`CacheProgress` when scheduling decode. It still rejects a boundary merely
+crossed by a verify window. There is no new state allocation, GPU work or
+kernel arithmetic change.
+
+The new C++ scenario fails all four exact-boundary combinations with the old
+implementation. With the fix, the full scheduler suite passes **488 tests in
+134 suites**, including after all-files formatting and rebuilding. A matching
+real-scheduler/GPU lifecycle case also fails against the preserved old binary:
+**one failed, five passed**. It continues decoding beyond an aligned endpoint
+before finish and prefix reuse, covering the gap in the earlier lifecycle
+tests. With the fixed binary, GPU integration passed **201 tests plus
+77 subtests** (three optional/vendor-specific skips, 23 warnings, 47.48s).
+The shared scheduler/cache/runtime suite passed **527 tests plus 317 subtests**
+(28 warnings, 38.44s), including GDN paging coverage. The test launch initially
+waited for Slurm step creation after communication timeouts, then proceeded
+without resubmission. No numerical tolerance was changed. No fixed-source
+full-model result or performance improvement is claimed yet.

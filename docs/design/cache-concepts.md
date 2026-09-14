@@ -354,6 +354,13 @@ endpoint; this guard costs storage even without overlap. Both the Python group
 budget and C++ startup bound include it, plus partial-block rounding. Logical
 table width remains absolute and is not reduced to the resident window.
 
+Exact state publication has a separate watermark. An accepted endpoint can
+reach an aligned boundary before the conservative hash frontier reaches it.
+Decode admission must retain that materialization evidence in `CacheProgress`
+until publication catches up; examining only the latest endpoint loses it once
+decode advances past the boundary. Update the watermark only for a known exact
+endpoint, never by rounding a crossed or merely allocated position down.
+
 The experimental Kimi-K3 startup capacity adds the fields below to the recipe
 before memory planning; omitting it preserves the existing layout. Its KDA
 backend consumes them through unified

@@ -514,6 +514,10 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
+    // Verify's conservative publication frontier trails the accepted endpoint.
+    // Remember an exact state boundary until that frontier can publish it;
+    // inspecting only the next round's endpoint would lose this evidence.
+    cache_progress.materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens();
     std::int32_t num_computed_tokens = 0;
     if (request->Is<fsm::PrefillDone>()) {
         const PrefillInfo previous = request->CurrentPrefillInfo();
@@ -538,7 +542,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 .completed_boundary_kind = completed.boundary_kind,
                 .num_computed_tokens = num_computed_tokens,
                 .stream_completed_to_host = config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(),
-                .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
+                .materialized_state_boundary_tokens = cache_progress.materialized_state_boundary_tokens,
             });
         if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page,
                                       demands)) {

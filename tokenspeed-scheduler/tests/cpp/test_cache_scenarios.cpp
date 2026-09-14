@@ -410,6 +410,71 @@ TEST(ReplayHistoryPrefillTest, BoundsEmptyPrefillAndDecodeAcrossChunkingAndReuse
     }
 }
 
+TEST(ReplayHistoryPrefillTest, RetainsExactDecodeBoundaryUntilConservativePublication) {
+    for (const bool buffered : {false, true}) {
+        for (const std::int32_t depth : {0, 1}) {
+            for (const bool lands_on_boundary : {false, true}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "buffered=" << buffered << " depth=" << depth << " aligned=" << lands_on_boundary);
+                SchedulerConfig cfg{};
+                cfg.prefix_granularity = 128;
+                cfg.max_scheduled_tokens = 256;
+                cfg.max_batch_size = 1;
+                cfg.decode_input_tokens = 4;
+                cfg.overlap_schedule_depth = depth;
+                cfg.disable_l2_cache = true;
+                cfg.disable_prefix_cache = false;
+                cfg.device_allocator.total_pages = 64;
+                auto state =
+                    MakeGroup("state", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0);
+                state.max_state_lag_tokens = buffered ? 12 : 0;
+                cfg.cache_groups = {
+                    MakeGroup("full", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
+                    state};
+                if (buffered) {
+                    auto replay = MakeGroup("replay", 8, 64, CacheGroupConfig::Retention::SlidingWindow,
+                                            CacheGroupFamily::History, 13);
+                    replay.replay_checkpoint_group = "state";
+                    cfg.cache_groups.push_back(replay);
+                }
+                Scheduler scheduler{cfg};
+                std::vector<std::int32_t> tokens(124, 1);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 64}});
+                auto feedback = [&](std::vector<std::int32_t> output, bool decode) {
+                    tokens.insert(tokens.end(), output.begin(), output.end());
+                    ExecutionEvent done;
+                    done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                    if (decode) {
+                        done.With(forward::UpdateReserveNumTokens{
+                            .request_id = "parent",
+                            .reserve_num_tokens_in_next_schedule_event = static_cast<std::int32_t>(output.size())});
+                    }
+                    scheduler.Advance(std::move(done));
+                };
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback({2}, false);
+                // Both routes end at 133, but only one actually writes S_128.
+                // The conservative frontier is endpoint-3, so publication of
+                // that boundary happens after its exact endpoint has passed.
+                for (const auto count : {lands_on_boundary ? 4 : 3, lands_on_boundary ? 1 : 2, 4}) {
+                    ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                    feedback(std::vector<std::int32_t>(count, 3), true);
+                }
+                ExecutionEvent finish;
+                finish.With(forward::Finish{.request_id = "parent"});
+                scheduler.Advance(std::move(finish));
+                scheduler.NextExecutionPlan();
+                tokens.insert(tokens.end(), 11, 4);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+                const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+                const ForwardBatch* batch = FindForwardBatch(resumed);
+                ASSERT_NE(batch, nullptr);
+                EXPECT_EQ(batch->extend_prefix_lens.at(0), lands_on_boundary ? 128 : 0);
+            }
+        }
+    }
+}
+
 TEST(MambaStateCheckpointCapacityTest, BudgetsDeclaredLagOnEveryRole) {
     for (Role role : {Role::kFused, Role::kD, Role::kP}) {
         for (std::int32_t lag : {0, 1, 4, 5, 12}) {
