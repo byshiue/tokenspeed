@@ -7,13 +7,15 @@ Passing a reference test does not mean buffered replay is available in serving.
 ## Source and milestones
 
 Baseline: `2e4b540743878959eb51793ce01d74b5898b0e38` (upstream main).
-Implementation branch: `kda-buffered-replay`. Implementation changes are
-uncommitted until a milestone explicitly records its commit below. No default
-capacity or performance benefit has been established.
+Implementation branch: `kda-buffered-replay`.
+M1 source commit: `2619669e51d7eeb438069964d042fd21a5bc0736`
+(`test(kda): establish buffered replay reference and GPU prototype`).
+No default capacity or performance benefit has been established. M1 adds
+an unregistered prototype, not the complete serving feature.
 
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
-| A. Recurrence, history representation, conv and acceptance reference | CPU gates passed; GPU numerical prototype in progress | 19 CPU cases passed; GPU and serving equivalence are separate gates |
+| A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
 | B. LCM ownership, retention and lifecycle contract | In progress: audit | Protect the lagging checkpoint and history; accurate capacity accounting; safe publication and handoff |
 | C. Unified GPU forward and commit | Isolated recurrence prototype; not registered or integrated | LCM, conv/gate integration and serving dispatch remain pending |
 | D. Graphs, overlap and lifecycle integration | Not started | Fixed addresses, padding, request reuse, prefill transitions, prefix reuse and recovery |
@@ -58,7 +60,7 @@ records portable commands and summaries.
 
 ### A1: CPU recurrence and ring reference
 
-Source: uncommitted milestone on the baseline above. Python 3.12.13,
+Source: M1 commit above (tested before committing). Python 3.12.13,
 PyTorch 2.8.0+cpu, pytest 8.4.2, Linux aarch64, one OpenMP/BLAS thread.
 No weights or GPU are used. Command, from the repository root after activating
 the test venv:
@@ -110,7 +112,7 @@ LCM field binding are not implemented by this prototype.
 
 ### A2: GPU recurrence and captured commit
 
-Source: uncommitted milestone on the baseline above. One NVIDIA GB300,
+Source: M1 commit above (tested before committing). One NVIDIA GB300,
 driver 580.167.08, Python 3.12.3, PyTorch 2.13.0+cu130, CUDA 13.0,
 tokenspeed-triton 3.8.10.post20260906, pytest 9.1.1. Cached container and
 serving venv were reused, with a fresh persistent allocation and submit/srun.
@@ -153,19 +155,25 @@ replays per sample, 5 samples; report median CUDA-event time per call. Seed 93.
 Compilation and capture are excluded. Steady-state runs include capacity
 flushes; they are not separate flush/no-flush latency measurements.
 
-Initial measurements (microseconds; serial prototype, before formatting):
+Repeated measurements on the final M1 source (microseconds; serial prototype):
 
 | Batch / T | Existing recurrence | L=16 buffered | L=64 buffered |
 | --- | ---: | ---: | ---: |
 | 1 / 1 | 2.24 | 5.86 | 12.16 |
 | 1 / 4 | 4.42 | 8.63 | 14.63 |
-| 8 / 1 | 3.59 | 7.08 | 14.05 |
-| 8 / 4 | 6.25 | 10.66 | 17.80 |
+| 8 / 1 | 3.59 | 7.08 | 14.06 |
+| 8 / 4 | 6.25 | 10.66 | 17.81 |
 
 This prototype does not establish a useful default capacity. Serial history
 reconstruction and commit overhead outweigh the avoided state stores in this
 microbenchmark. A batched/fused commit and faster reconstruction must be
 measured before serving activation; no full-model speedup is claimed.
+
+The final formatted source repeated all **27 passing tests**. The mandatory
+`pre-commit run --all-files` passed before the signed-off M1 commit. Earlier
+hook runs reformatted only the new prototype/reference/test/benchmark files;
+no existing serving source changed. Local artifacts retain both benchmark
+runs, raw test logs, the environment, submit scripts and the source patch.
 
 ## B: cache integration work that remains
 
