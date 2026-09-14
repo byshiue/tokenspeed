@@ -19,17 +19,20 @@
 # SOFTWARE.
 
 
-"""Unregistered paged KDA recurrence, consuming LCM-owned field views.
+"""Paged KDA recurrence, consuming LCM-owned field views.
 
-This replaces the dense-ring prototype, not the serving kernels. Position
-refresh/commit use buffered_metadata; endpoint publication and runtime dispatch
-remain gated. No buffers are allocated here, and T=1/T>1 use the same operation.
+Position refresh/commit use buffered_metadata. Cache ownership and endpoint
+publication belong to the caller. No buffers are allocated here, and T=1/T>1
+use the same operation.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
+from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.signature import format_signatures
 
 
 @triton.jit
@@ -497,7 +500,22 @@ def _buffered_recurrent(
         tl.store(OUT + _input_offset(row, token, head, vv, OUT_STRIDES), out, vv < DV)
 
 
-def buffered_recurrent(
+@register_kernel(
+    "attention",
+    "kda_buffered_recurrent",
+    name="triton_kda_buffered_recurrent",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 99),
+    ),
+    signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+    priority=Priority.SPECIALIZED,
+    traits={"head_dim": frozenset({128}), "recurrent_layout": frozenset({"v_major"})},
+    tags={"nvidia", "cuda_graph", "buffered_replay"},
+)
+def triton_kda_buffered_recurrent(
     query,
     key,
     value,
@@ -568,8 +586,9 @@ def buffered_recurrent(
         full state is stored only for a flush, at the pre-candidate endpoint e.
         Follow with commit_positions after acceptance, before metadata reuse.
         This primitive neither grants publication provenance nor commits conv.
-        Its two launches are backing validation then recurrence, in the same
-        order for eager and CUDA graphs. They are not registered for serving.
+        Backing validation precedes recurrence in the same order for eager
+        and CUDA graphs. Registration covers native BF16 Blackwell inputs;
+        direct prepared-FP32 calls remain the independent test contract.
     """
     if query.ndim != 4 or value.ndim != 4 or history_key.ndim != 4:
         raise ValueError("query, value and history must be rank-four tensors")

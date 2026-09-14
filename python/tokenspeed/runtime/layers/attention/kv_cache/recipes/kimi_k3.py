@@ -98,8 +98,8 @@ class KimiK3Recipe(CacheRecipe):
 
     def __init__(self, *, replay_buffer_capacity: int | None, **kwargs) -> None:
         super().__init__(**kwargs)
-        # An explicit planning input, not a serving switch. The production
-        # factory passes None until materialization/commit integration is ready.
+        # Startup-fixed and explicit: None preserves the current recipe while
+        # positive capacity adds LCM-owned fields before memory planning.
         self.buffered_replay = (
             None
             if replay_buffer_capacity is None

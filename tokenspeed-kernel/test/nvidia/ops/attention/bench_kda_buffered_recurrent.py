@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
-    buffered_recurrent,
+    triton_kda_buffered_recurrent,
     validate_recurrent_blocks,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
@@ -205,7 +205,7 @@ def main():
                             max_window=width,
                             for_handoff=False,
                         )
-                        buffered_recurrent(
+                        triton_kda_buffered_recurrent(
                             q,
                             k,
                             v,

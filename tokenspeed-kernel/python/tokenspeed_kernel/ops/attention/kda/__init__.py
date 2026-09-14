@@ -757,6 +757,51 @@ def resolve_kda_batched_replay_commit(
         return None
 
 
+def resolve_kda_buffered_recurrent(
+    dtype: torch.dtype,
+    *,
+    head_dim: int,
+    value_dim: int,
+    max_window: int,
+    capacity: int,
+):
+    """Resolve buffered recurrence once at pool binding; never fall back.
+
+    Args:
+        dtype: Native convolution output dtype (BF16 in the initial solution).
+        head_dim/value_dim: Key/value dimensions of the V-major state slab.
+        max_window: Fixed target width, one for decode or four for EAGLE3.
+        capacity: Logical history entries, including candidate space. Initial
+            dispatch limits capacities to 64, with
+            enough space for two maximum windows; no alignment is required.
+
+    Returns:
+        A selected callable consuming caller-owned inputs, state/history,
+        validated metadata and output buffers. Unsupported geometry or hardware
+        raises at startup instead of silently selecting eager replay.
+    """
+    if (
+        any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for value in (head_dim, value_dim, max_window, capacity)
+        )
+        or not 2 * max_window <= capacity <= 64
+        or max_window not in (1, 4)
+        or head_dim != value_dim
+    ):
+        raise ValueError(
+            "buffered KDA requires equal head dimensions, width 1/4 and "
+            "2 * width <= capacity <= 64"
+        )
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    return select_kernel(
+        "attention",
+        "kda_buffered_recurrent",
+        _attention_format_signature(q=probe, k=probe, v=probe),
+        traits={"head_dim": head_dim, "recurrent_layout": "v_major"},
+    )
+
+
 def kda_batched_replay_uses_raw_gate(
     dtype: torch.dtype = torch.bfloat16,
     *,
@@ -866,6 +911,7 @@ __all__ = [
     "kda_verify_conv_update",
     "try_kda_replay_commit",
     "resolve_kda_batched_replay_commit",
+    "resolve_kda_buffered_recurrent",
     "kda_batched_replay_uses_raw_gate",
     "kda_replay_commit_supported",
 ]

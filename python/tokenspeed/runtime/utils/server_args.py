@@ -140,6 +140,8 @@ class ServerArgs:
     prefix_granularity: int = 64
     # special kv cache
     mamba_ssm_dtype: str = "float32"
+    # Explicit experimental rollout; no capacity is selected until TP8 validation.
+    ssm_replay_buffer_capacity: int | None = None
 
     # Other runtime options
     stream_interval: int = 1
@@ -854,6 +856,32 @@ class ServerArgs:
             self.enable_kvstore = True
 
     def validate_cache_options(self):
+        capacity = self.ssm_replay_buffer_capacity
+        if capacity is not None:
+            width = (
+                self.speculative_num_draft_tokens
+                if self.speculative_algorithm is not None
+                else 1
+            )
+            if (
+                isinstance(capacity, bool)
+                or not isinstance(capacity, int)
+                or width not in (1, 4)
+                or not 2 * width <= capacity <= 64
+            ):
+                raise ValueError(
+                    "--ssm-replay-buffer-capacity requires width 1/4 and "
+                    "2 * width <= capacity <= 64; zero is not a disable value."
+                )
+            if (
+                self.device != "cuda"
+                or self.mamba_ssm_dtype != "float32"
+                or self.disaggregation_mode != "null"
+            ):
+                raise ValueError(
+                    "Buffered KDA requires CUDA, FP32 recurrent state and a fused "
+                    "engine; materialized PD handoff is not integrated."
+                )
         speculative_algorithm = getattr(self, "speculative_algorithm", None)
         draft_model_path_use_base = getattr(self, "draft_model_path_use_base", False)
         speculative_draft_model_path = getattr(
@@ -1801,6 +1829,15 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_replay_ssm,
             help="Enable ReplaySSM for supported Qwen GDN target verification.",
+        )
+        parser.add_argument(
+            "--ssm-replay-buffer-capacity",
+            type=int,
+            default=ServerArgs.ssm_replay_buffer_capacity,
+            help="Experimental Kimi-K3 buffered decode on NVIDIA Blackwell. "
+            "Fixed history entries per request/layer, including candidates; "
+            "requires 2 * target width <= capacity <= 64 (width 1 or 4). "
+            "Omit to keep current execution; zero is invalid. Fused engine only.",
         )
         parser.add_argument(
             "--enable-output-logprobs",

@@ -1,10 +1,11 @@
 # Kimi-K3 Buffered Replay：统一 Decode 实现计划
 
-状态：实现中，服务端尚未启用 buffered replay。已实现 LCM-owned history、
+状态：实现中，buffered replay 尚未通过完整模型验收，默认不启用。已实现 LCM-owned history、
 固定地址 metadata、统一 decode/accepted commit、跨 rank 失败检查，以及
 accepted/quiescent endpoint 物化。M14 接通 mixed batch 中的 buffered decode
 部分，复用同一个 forward/commit；prefill 仍要求 cache owner 提供精确输入状态。
-Scheduler 生命周期交接、公开 kernel 注册、配置启用和真实 TP8 Eagle3/AIME/NSYS
+M15 接入实验性容量参数与 kernel 注册，正在验证现有 prefix 恢复和槽位回收路径。
+PD/任意 live endpoint 交接仍受限，真实 TP8 Eagle3/AIME/NSYS
 验收仍待完成，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 
@@ -139,6 +140,11 @@ checkpoint。完成后通过 ring 指针推进回收历史空间，不搬移剩�
 首阶段不定义 `0` 为关闭模式；默认容量在基准验证后决定。容量不足或硬件/kernel
 不支持时启动报错，不静默退回另一套 decode 路径。
 
+实验性接入阶段必须显式传入正容量；省略参数维持现有部署行为，并非用 `0`
+切换实现。目前注册限定 NVIDIA Blackwell、BF16 输入、FP32 state、128 维
+head、`T_max=1/4`、`2*T_max <= L <= 64`，并拒绝 PD。这个范围是初始验证
+边界，不是性能推荐；扩大范围需要补充对应验证。
+
 显存预算按最终布局计算：
 
 ```text
@@ -154,12 +160,19 @@ history bytes ≈ live requests × local KDA layers × L × bytes per entry
 遵循 [unified_path.md](unified_path.md) 与 [scheduler.md](scheduler.md)：
 
 - **Prefill → decode**：以 prefill final state 建立 checkpoint，history 清空。
-- **Decode → incremental prefill**：先物化精确 accepted endpoint，复用现有
-  prefill 输入协议；首阶段不要求 prefill kernel 直接读取 replay history。
+- **Decode → incremental prefill**：prefill 输入必须是精确 checkpoint，
+  不直接读取 replay history。当前 agentic 下一轮是新 request，通过 prefix
+  cache 匹配已物化边界；FSM 没有 live `Decoding → Prefilling` 转换。
+  若后续增加直接消费 live accepted endpoint 的接口，必须先物化该 endpoint，
+  确认完成后才能重塑或回收 history，不能在 prefill metadata 阶段补做。
 - **Prefix cache**：只发布确实物化且位置匹配的 checkpoint。Flush 不自动赋予
   prefix 边界 provenance，不能发布候选 state 或落后的 checkpoint。
 - **Retraction/恢复/迁移**：交付 checkpoint + history + metadata 的完整表示，
   或在交付边界统一物化 endpoint；首阶段优先采用后者，明确同步完成后再释放。
+  当前 retraction 的交付边界是可复用 prefix checkpoint，不是任意 live endpoint：
+  沿用原有 best-effort L2 store 和尾部重算，history 不参与传输或 prefix 匹配。
+  不增加重算范围，也不新增丢弃 live state 后冒充精确 endpoint 的恢复方式。
+  任意 endpoint 迁移仍待集成，PD 配置继续明确拒绝。
 - **结束/取消/槽位复用**：不需要交付 state 时直接回收，不做无用 flush；在
   in-flight readers 完成前不能复用 buffer。Prefix 发布另按其精确位置处理。
 - **Pool rebind**：清除旧 descriptors/views，重建存储绑定并按现有协议重新捕获。

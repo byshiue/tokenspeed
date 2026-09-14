@@ -256,6 +256,15 @@ class KdaAttnBackend(MambaAttnBackend):
             self._buffered_replay = KDAReplayWorkspace(
                 cache_pool, max_bs=self.max_bs, max_context_len=self._context_len
             )
+            layout = self._buffered_replay.metadata.layout
+            logger.info(
+                "KDA buffered replay: capacity=%d, target_width=%d, kernel=%s, "
+                "workspace_bytes=%d (experimental)",
+                layout.capacity,
+                layout.max_window,
+                self._buffered_replay.recurrent_kernel.__name__,
+                self._buffered_replay.nbytes,
+            )
             return
         shape = self._replay_shape(cache_pool)
         self._replay_active = kda_replay_commit_supported(

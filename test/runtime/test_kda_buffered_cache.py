@@ -174,9 +174,41 @@ def test_replay_geometry_and_capacity_budget(tp, mla_packing):
 
 
 def test_planning_input_and_serving_factory_are_explicit():
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import _RECIPES
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
+        prepare_cache_setup,
+    )
 
-    assert _RECIPES["kimi_k3"].keywords == {"replay_buffer_capacity": None}
+    for capacity in (None, 8, 37, 64):
+        base = kimi_recipe(decode_input_tokens=4)
+        base.server_args.ssm_replay_buffer_capacity = capacity
+        inputs = {
+            name: getattr(base, name)
+            for name in (
+                "server_args",
+                "model_config",
+                "attn_config",
+                "draft_model_config",
+                "draft_attn_config",
+                "cache_budget_bytes",
+                "decode_input_tokens",
+                "overlap_schedule_depth",
+            )
+        }
+        setup = prepare_cache_setup(family="kimi_k3", **inputs)
+        replay_groups = [
+            spec
+            for spec in setup.spec.cache_group_specs
+            if spec.replay_checkpoint_group
+        ]
+        assert len(replay_groups) == (0 if capacity is None else 3)
+        assert all(spec.sliding_window_tokens == capacity for spec in replay_groups)
+        assert (
+            setup.fixed_workspace_bytes
+            == _recipe(capacity, decode_input_tokens=4).workspace_bytes()
+        )
+        if capacity is not None:
+            with pytest.raises(ValueError, match="only by Kimi-K3"):
+                prepare_cache_setup(family="qwen_gdn", **inputs)
     for capacity, width, block in (
         (True, 1, 16),
         (0, 1, 16),
@@ -269,7 +301,7 @@ def test_incomplete_replay_layout_and_unsupported_dispatch_are_rejected():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
     from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
-        buffered_recurrent,
+        triton_kda_buffered_recurrent,
         validate_recurrent_blocks,
     )
     from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
@@ -343,7 +375,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         max_window=replay.layout.max_window,
         for_handoff=False,
     )
-    buffered_recurrent(
+    triton_kda_buffered_recurrent(
         q,
         q,
         v,
@@ -433,7 +465,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             max_window=replay.layout.max_window,
             for_handoff=False,
         )
-        buffered_recurrent(
+        triton_kda_buffered_recurrent(
             q,
             q,
             v,

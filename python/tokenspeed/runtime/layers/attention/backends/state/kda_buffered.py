@@ -22,8 +22,8 @@
 
 This is execution scratch, not a request-state pool: stamps and history remain
 in LCM fields. The KDA backend consumes this workspace for explicitly planned
-replay pools; the serving factory remains gated on lifecycle integration and
-validation. No ordinary/speculative or eager/graph fork.
+replay pools selected by the experimental startup capacity. No
+ordinary/speculative or eager/graph fork.
 """
 
 from __future__ import annotations
@@ -32,23 +32,19 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.ops.attention.kda._triton.buffered import (
-    buffered_recurrent,
-    validate_recurrent_blocks,
+from tokenspeed_kernel.ops.attention.kda import (
+    resolve_kda_buffered_recurrent,
 )
-from tokenspeed_kernel.ops.attention.kda._triton.buffered_conv import (
+from tokenspeed_kernel.ops.attention.kda.triton import (
     buffered_conv,
     commit_conv_windows,
-    prepare_conv_blocks,
-)
-from tokenspeed_kernel.ops.attention.kda._triton.buffered_endpoint import (
-    materialize_endpoints,
-    prepare_endpoint_commit,
-)
-from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
     commit_positions,
+    materialize_endpoints,
+    prepare_conv_blocks,
+    prepare_endpoint_commit,
     prepare_positions,
     refresh_decode_inputs,
+    validate_recurrent_blocks,
 )
 
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
@@ -365,7 +361,7 @@ class KDAReplayWorkspace:
     per-round raw candidates, shared output scratch, descriptors and metadata.
     Call refresh/prepare once, forward for every local layer, then commit once.
     Outputs alias shared scratch and must be consumed before the next layer.
-    Serving dispatch remains gated on endpoint materialization/publication.
+    Registered recurrence is resolved once at binding, before graph capture.
     """
 
     def __init__(
@@ -385,6 +381,15 @@ class KDAReplayWorkspace:
         if not conv.is_cuda or conv.dtype != torch.bfloat16:
             raise ValueError("buffered workspace requires BF16 GPU convolution state")
         self.heads, self.value_dim, self.key_dim = recurrent.shape[1:]
+        # Resolve once, before workspace allocation/capture. The inner loop
+        # calls the selected implementation directly, without per-layer search.
+        self.recurrent_kernel = resolve_kda_buffered_recurrent(
+            conv.dtype,
+            head_dim=self.key_dim,
+            value_dim=self.value_dim,
+            max_window=self.metadata.layout.max_window,
+            capacity=self.metadata.layout.capacity,
+        ).impl
         self.channels = self.heads * (2 * self.key_dim + self.value_dim)
         if conv.shape[1:] != (self.channels, 3):
             raise ValueError("buffered KDA requires a four-tap convolution")
@@ -583,7 +588,7 @@ class KDAReplayWorkspace:
                 payload,
             )
         history = self._history[layer_id]
-        buffered_recurrent(
+        self.recurrent_kernel(
             q,
             k,
             v,

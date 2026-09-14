@@ -354,15 +354,17 @@ endpoint; this guard costs storage even without overlap. Both the Python group
 budget and C++ startup bound include it, plus partial-block rounding. Logical
 table width remains absolute and is not reduced to the resident window.
 
-This is an integration foundation, not a serving option. The production recipe
-factory names no replay dependency. An explicit, internal Kimi-K3 planning input
-can bind the fields below. Its KDA backend now consumes them through unified
+The experimental Kimi-K3 startup capacity adds the fields below to the recipe
+before memory planning; omitting it preserves the existing layout. Its KDA
+backend consumes them through unified
 buffered decode and accepted-endpoint commit, with rank-agreed failure feedback.
 Mixed batches compose exact-state prefill with the same buffered decode suffix.
-Lifecycle handoffs remain gated; the recipe factory still enables no replay
-layout. A prefill consumer must receive an exact snapshot before cache admission
+Direct live-endpoint handoffs remain gated. A prefill consumer must receive an exact snapshot before cache admission
 can discard its history; runtime dispatch cannot recover already-recycled rows.
-PD rejects replay-history declarations and wire contracts until materialized
+Current agentic continuations are new requests matched against immutable prefix
+snapshots, not in-place decode-to-prefill transitions. Retraction retains its
+existing prefix-checkpoint writeback and suffix recomputation; it does not export
+live replay state. PD rejects replay-history declarations and wire contracts until materialized
 handoff is implemented. This explicit gate must not be removed by giving the
 history a `full_suffix` transfer policy: there may be no initialized prefill
 rows to transfer, and a lagging checkpoint is not the accepted endpoint.
@@ -405,7 +407,7 @@ batch outputs and paged recurrence dispatch, and order materialization before pu
 incremental prefill, transfer and retraction. A capacity-flush decision alone
 does not establish prefix-publication provenance.
 
-The unregistered recurrence prototype now consumes the arena's strided fields
+The registered recurrence consumes the arena's strided fields
 and current raw history/state tables. It reads `S_c` from slot `(c-1)/G` (or
 implicit zero state at `c=0`), reconstructs `[c,e)`, and writes candidates at
 absolute positions `[e,e+width)`. LCM owns physical reuse: there is no dense
@@ -419,7 +421,9 @@ recurrence stores. Failure clears per-row validity and suppresses that row's
 state, history and output writes. Position prepare, backing check, recurrence
 and stamp commit run in the same order in eager execution and CUDA graphs.
 The extra launch is deliberate correctness groundwork, not a tuned dispatch
-decision. This replaces the earlier unregistered dense-ring GPU prototype;
+decision. Startup resolves the native-BF16 Blackwell implementation once, with
+no legacy fallback; the per-layer loop calls that implementation directly.
+This replaces the earlier unregistered dense-ring GPU prototype;
 the CPU recurrence reference remains independent.
 
 The caller must preserve the allocator's exclusive ownership across all live

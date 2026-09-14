@@ -505,8 +505,8 @@ requires recapture. Preparation reads only request-local stamps, which are
 zeroed on fresh allocation and excluded from transfer. State payload access is
 fenced at each layer's first consumption, before the workspace's cached views
 are used. A false validity flag suppresses GPU stores but does not itself
-reject a scheduler result or grant checkpoint provenance. Buffered KDA serving
-is still gated on lifecycle handoff and full-model validation. The executor's
+reject a scheduler result or grant checkpoint provenance. Buffered KDA is an
+explicit experimental startup option, pending full-model validation. The executor's
 rank-agreed result check supplies failure feedback; this metadata owner is not
 an alternate serving path.
 
@@ -585,9 +585,14 @@ Prefill's exact-input contract still belongs to the cache owner. In particular,
 inserting quiescent materialization after admission has reshaped or zeroed
 history pages is too late. No such lifecycle shortcut is installed here, and
 an eventual handoff must preserve its failure flags before another metadata
-refresh can overwrite them. The recipe factory still enables no replay layout. Explicit
-lifecycle handoff, registration, configuration and full-model validation remain
-required before serving is enabled.
+refresh can overwrite them. Current agentic requests resume through immutable
+prefix checkpoints, and retraction restores reusable checkpoints then recomputes
+the suffix, as before; neither path consumes a lagging live endpoint directly.
+The experimental capacity option binds replay fields before allocation and
+resolves the registered native-BF16 Blackwell recurrence once. Unsupported
+capacity, width, geometry or hardware fails startup rather than falling back.
+No default capacity is chosen. PD and direct live-endpoint transfer remain
+gated; full-model correctness and Eagle3 no-regression are still required.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes

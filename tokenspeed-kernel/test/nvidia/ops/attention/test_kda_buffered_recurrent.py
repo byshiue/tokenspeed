@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import replace
 
 import pytest
 import torch
@@ -36,7 +37,7 @@ if not torch.cuda.is_available():
 from tokenspeed_kernel._triton import tl, triton  # noqa: E402
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (  # noqa: E402
     _input_offset,
-    buffered_recurrent,
+    triton_kda_buffered_recurrent,
     validate_recurrent_blocks,
 )
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # noqa: E402
@@ -46,6 +47,40 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # n
 from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E402
     fused_recurrent_kda_pool,
 )
+
+
+def test_buffered_dispatch_is_resolved_once_and_fails_closed(monkeypatch):
+    from tokenspeed_kernel.ops.attention.kda import resolve_kda_buffered_recurrent
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    inputs = dict(head_dim=128, value_dim=128, max_window=4, capacity=37)
+    selected = resolve_kda_buffered_recurrent(torch.bfloat16, **inputs)
+    assert selected.name == "triton_kda_buffered_recurrent"
+    assert selected.impl is triton_kda_buffered_recurrent
+    for changes in (
+        {"capacity": 0},
+        {"capacity": 7},
+        {"capacity": 65},
+        {"max_window": True},
+        {"max_window": 8},
+        {"value_dim": 64},
+    ):
+        with pytest.raises(ValueError):
+            resolve_kda_buffered_recurrent(torch.bfloat16, **{**inputs, **changes})
+    for dtype in (torch.float16, torch.float32):
+        with pytest.raises(NoKernelFoundError):
+            resolve_kda_buffered_recurrent(dtype, **inputs)
+    actual = current_platform()
+    for platform in (
+        replace(actual, vendor="amd", arch_version=ArchVersion(9, 5)),
+        replace(actual, vendor="nvidia", arch_version=ArchVersion(9, 0)),
+    ):
+        monkeypatch.setattr(
+            "tokenspeed_kernel.selection.current_platform", lambda: platform
+        )
+        with pytest.raises(NoKernelFoundError):
+            resolve_kda_buffered_recurrent(torch.bfloat16, **inputs)
 
 
 def direct(state, query, key, value, decay, beta):
@@ -182,7 +217,7 @@ def test_buffered_rounds_and_graph_match_sequential(
             max_window=width,
             for_handoff=False,
         )
-        buffered_recurrent(
+        triton_kda_buffered_recurrent(
             q,
             k,
             v,
@@ -474,7 +509,7 @@ def test_invalid_backing_rejects_entire_row_before_stores(graph_mode):
             max_window=width,
             for_handoff=False,
         )
-        buffered_recurrent(
+        triton_kda_buffered_recurrent(
             q,
             q,
             v,

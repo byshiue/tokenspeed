@@ -37,16 +37,16 @@ M13 source commit: `265ca5b97b8c9776e1c9a4989e84311a3c7c8df1`
 M14 source commit: `fd31239aa518c75a3dc7dcd0172d49313d6bc03a`
 (`feat(kda): compose mixed prefill and buffered decode`).
 No default capacity or serving performance benefit has been established.
-The GPU implementation remains an unregistered prototype, not the complete
-serving feature. Eagle3 must run the new path without a performance regression
+M15 registers the GPU recurrence and adds an explicit experimental capacity;
+it is not a production-validated default. Eagle3 must run the new path without a performance regression
 against the frozen baseline before the work meets its completion gate.
 
 | Milestone | Status | Evidence / exit condition |
 | --- | --- | --- |
 | A. Recurrence, history representation, conv and acceptance reference | M1 CPU/GPU numerical gates passed | 19 CPU + 8 GPU cases; serving equivalence is a separate gate |
-| B. LCM ownership, retention and lifecycle contract | M2–M5 cache foundations verified; M9 adds the metadata owner | Owner-triggered handoff and recovery integration still pending |
-| C. Unified GPU forward and commit | M14 adds mixed-batch decode composition to M12's backend/commit integration | Lifecycle handoff pending; recurrence not registered and factory still gated |
-| D. Graphs, overlap and lifecycle integration | M10–M14 pipeline, endpoint and mixed-to-graph checks pass; owner lifecycle still pending | Full-path prefill transitions, prefix reuse, overlap and recovery |
+| B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
+| C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
+| D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
 | E. Real-model correctness and performance | Not started | Matched TP8 NVFP4 comparisons, AIME 2026, capacity sweep and traces |
 
 ## Recording a result
@@ -1211,3 +1211,54 @@ passed **527 cases plus 317 subtests** (28 warnings, 37.68s). All applicable
 all-files hooks passed before the signed-off source commit. Native prefill used
 `tokenspeed-cutedsl-kda 0.1.0.post20260830`; binary hashes, exact commands,
 environment, raw logs and the source patch are retained in the local M14 runbook.
+
+### M15: experimental serving configuration and cache-owner resume
+
+Source: based on `f54c642d` (M14 record), not yet committed.
+
+`--ssm-replay-buffer-capacity` now reaches the Kimi-K3 recipe before memory
+planning. A positive value selects buffered fields and the common backend path;
+omitting it preserves the existing deployment. Zero is invalid, not an off
+mode. Startup rejects other model families, non-FP32 recurrent state and PD.
+The first registered recurrence covers Blackwell BF16, 128-dimensional heads,
+width one/four and capacities through 64 with `L >= 2*T`. This is a bounded
+experimental dispatch contract, not a recommended capacity. Selection happens
+once at pool binding; the per-layer loop calls the resolved implementation
+directly. Runtime imports now use the public kernel solution module. The
+recurrence arithmetic, GPU launch sequence and workspace tensor budget are
+unchanged. Startup logs identify capacity, width, kernel and workspace bytes.
+
+The lifecycle audit resolves a previously ambiguous part of the plan. The
+existing FSM has no live `Decoding -> Prefilling` transition: agentic turns
+submit new requests and match immutable, materialized prefix checkpoints.
+Retraction already exports reusable checkpoints and recomputes the suffix;
+it does not transfer an arbitrary current endpoint. M15 preserves those
+boundaries rather than adding a late materialization after sparse admission
+has discarded history. A future direct live-endpoint consumer still requires
+ordered materialization and checked completion before reuse. PD remains
+explicitly rejected, and end-to-end L2 recovery/transfer validation is open.
+
+On a fresh persistent eight-GB300 allocation (two nodes, same resource binding),
+the startup/cache/backend suite passed **61 cases plus 15 subtests** (22 warnings,
+102.61s), and the kernel/reference suite passed **77 cases** (15 warnings,
+141.16s). Software and cached dependencies match M14; no weights or image were
+downloaded. These tests use one GPU and are not TP8 model execution.
+
+Five new real-scheduler/GPU lifecycle cases passed (22 warnings, 13.46s).
+They use six local KDA layers, actual allocator-produced block tables, page
+zeroing, native prefill, registered buffered decode and accepted feedback.
+Coverage includes an aligned accepted endpoint, a skipped/unwritten boundary,
+lagging live state behind an existing prefill checkpoint, capacity flush,
+finish/cancel and reuse of the request slot. Resumed prefill reads the exact
+saved checkpoint; its first decode starts empty, and published snapshots stay
+bitwise unchanged. The initial fixture incorrectly expected an empty operation
+list instead of an explicit idle batch. Its next run exposed a legitimate
+prefix-promotion chunk when no state checkpoint matched; the fixture now sends
+empty feedback for that intermediate chunk and executes its remaining tail.
+Neither correction changes scheduling, arithmetic, tolerance or the expected
+cache-hit boundary.
+
+The model recipe now documents the experimental option and removes an obsolete
+claim that K3 prefix granularity depends on the memory budget. Full-model
+EAGLE3 performance, capacity choice, AIME and NSYS remain pending; this milestone
+does not establish an end-to-end speedup or accuracy score.
