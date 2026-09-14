@@ -680,7 +680,10 @@ Real NVFP4 TP8 Eagle3 performance, AIME 2026 and full-model traces are pending.
 
 ### M8: shared commit hook and native recurrence inputs
 
-Based on `96921c09c9cb0efb9cee7d3ded6e8b4c85df7339` (M7 validation record).
+Source commit: `f7e780f15c595eec34501644e612ef55b6eddf7e` (signed off), based on
+`96921c09c9cb0efb9cee7d3ded6e8b4c85df7339` (M7 validation record). Tests and
+timing below used this source before committing. The exact
+`pre-commit run --all-files` command passed after formatter changes.
 The runner now calls `commit_state_after_verify` after successful decode/mixed
 execution with or without a drafter. Graph outputs are sliced to live requests
 before this call. Ordinary decode supplies acceptance one through the same
