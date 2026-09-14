@@ -32,6 +32,8 @@ M11 source commit: `c86d483db192b4bb72c01dbe0c305ff6c2d19d11`
 (`feat(kda): materialize accepted replay endpoints`).
 M12 source commit: `931eeaf21110265593e38e6563b0c1981003f361`
 (`feat(kda): wire buffered decode and validate state commits`).
+M13 source commit: `265ca5b97b8c9776e1c9a4989e84311a3c7c8df1`
+(`feat(kda): materialize quiescent replay endpoints`).
 No default capacity or serving performance benefit has been established.
 The GPU implementation remains an unregistered prototype, not the complete
 serving feature. Eagle3 must run the new path without a performance regression
@@ -1093,7 +1095,8 @@ at context 65,536, batch four and width four, four bytes above M11.
 
 ### M13: quiescent endpoint materialization
 
-Source: based on `7f4ee451` (M12 record), not yet committed.
+Source: `265ca5b97b8c9776e1c9a4989e84311a3c7c8df1`, based on `7f4ee451`
+(M12 record).
 
 `KDAReplayWorkspace.materialize_current` accepts fresh request tables and exact
 accepted endpoints without running a candidate forward. It reuses the shared
@@ -1129,7 +1132,8 @@ Final results: **76 kernel/reference cases passed** (15 warnings, 134.51s);
 the same three optional/vendor-specific skips as M12; **523 scheduler/cache/GDN
 cases plus 317 subtests passed** (28 warnings, 36.74s). The final integration
 also covers smaller and empty handoff batches. Counts overlap across suites.
-All-files hooks formatted eight files; final hooks are required before commit.
+All-files hooks formatted eight files; the final all-files run passed before
+the signed-off source commit.
 
 A same-GPU native-input microbenchmark compares the normal buffered decode
 operations against frozen M12 `931eeaf2`, not the original Eagle3 implementation.
