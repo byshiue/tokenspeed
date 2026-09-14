@@ -641,6 +641,7 @@ class CaptureFailureIsLoudTest(unittest.TestCase):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
         pg.capture_buckets = [4]
+        pg._inline_captures = {}
         pg.attn_backend = SimpleNamespace(
             init_prefill_graph_state=lambda **kwargs: None
         )

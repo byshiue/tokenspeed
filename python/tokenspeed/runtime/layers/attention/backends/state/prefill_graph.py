@@ -21,6 +21,7 @@
 """Opt-in capacity-based KDA graph cache for breakable-prefill experiments."""
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, is_dataclass, replace
 
 import torch
@@ -49,6 +50,8 @@ class KdaPrefillGraphMetadata(MambaForwardMetadata):
 
 
 def _capacity_metadata(source, bucket):
+    if source.prefill_checkpoint_batch is not None:
+        raise ValueError("internal checkpoint scans require eager prefill metadata")
     capacity = KdaPrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
     capacity.validate(source.cu_extend_seq_lens_cpu, bucket)
     cloned = _clone_metadata(source)
@@ -101,16 +104,86 @@ def _argument_key(value):
     return value
 
 
+class KdaOuterGraphBinding:
+    """Own a bucket's stable KDA metadata for capture in the outer graph.
+
+    Args:
+        backend: KDA leaf whose metadata is temporarily bound.
+        bucket: Packed token capacity selected by the outer graph.
+    """
+
+    def __init__(self, backend, bucket):
+        self.backend = backend
+        self.pool = backend.cache_pool
+        self.metadata = _capacity_metadata(backend.forward_metadata, bucket)
+
+    def compatible(self, ctx):
+        """Return whether the live context matches this captured request geometry."""
+        source = self.backend.forward_metadata
+        return (
+            self.backend.cache_pool is self.pool
+            and self.backend.step_counter is None
+            and ctx.forward_mode.is_extend()
+            and ctx.num_extends == ctx.bs == self.metadata.capacity.num_sequences
+            and source.prefill_checkpoint_batch is None
+            and source.extend_seq_lens_cpu is not None
+            and source.extend_seq_lens_cpu.numel()
+            == self.metadata.capacity.num_sequences
+        )
+
+    @contextmanager
+    def bind(self, refresh: bool):
+        """Bind stable metadata, optionally refreshing it before live replay."""
+        backend = self.backend
+        source = backend.forward_metadata
+        previous_inline = backend.prefill_graph_inline
+        if refresh:
+            _refresh_capacity_metadata(self.metadata, source)
+        backend.forward_metadata = self.metadata
+        backend.prefill_graph_inline = True
+        try:
+            yield
+        finally:
+            backend.forward_metadata = source
+            backend.prefill_graph_inline = previous_inline
+
+
+def _refresh_capacity_metadata(target, source):
+    target.capacity.validate(
+        source.cu_extend_seq_lens_cpu, target.capacity.token_capacity
+    )
+    for name in (
+        "query_start_loc",
+        "scan_query_start_loc",
+        "query_start_loc_int64",
+        "extend_seq_lens_cpu",
+        "cu_extend_seq_lens_cpu",
+    ):
+        getattr(target, name).copy_(getattr(source, name))
+    refresh_causal_conv1d_capacity_metadata(
+        target.query_start_loc,
+        target.conv_prefill_metadata,
+        target.capacity.token_capacity,
+    )
+    for name in ("state_in_blocks_by_group", "state_out_blocks_by_group"):
+        old, new = getattr(target, name), getattr(source, name)
+        if old.keys() != new.keys():
+            raise RuntimeError("KDA graph state groups changed without pool rebind")
+        for group, indices in old.items():
+            if indices.shape != new[group].shape or indices.dtype != new[group].dtype:
+                raise RuntimeError("KDA graph state index geometry changed")
+            indices.copy_(new[group])
+
+
 class KdaPrefillGraphCache:
-    """Capture extend; retain max_shapes schedules per live sequence count.
+    """Capture extend using the outer prefill graph's selected token buckets.
 
     Caller supplies only pure EXTEND work inside breakable graph replay.
     Outputs have the usual break-output lifetime: consume before the next call.
     The cache owns execution metadata, not scheduler state or cache pages.
     """
 
-    def __init__(self, max_shapes):
-        self.max_shapes = max_shapes
+    def __init__(self):
         self.schedules = {}
         self.last_source = None
         self.last_key = None
@@ -120,6 +193,10 @@ class KdaPrefillGraphCache:
 
     def run(self, backend, layer_id, bucket, arguments, forward):
         source = backend.forward_metadata
+        # Body/tail scans have different packed extents and checkpoint indices.
+        # A full-batch capacity graph cannot replay that metadata contract.
+        if source.prefill_checkpoint_batch is not None:
+            return forward()
         stream = torch.cuda.current_stream()
         if source is not self.last_source:
             self.last_key = (
@@ -133,8 +210,6 @@ class KdaPrefillGraphCache:
         key = (self.last_key[0], bucket, stream.cuda_stream, pdl_enabled())
         schedule = self.schedules.get(key)
         if schedule is None:
-            if sum(item[0] == key[0] for item in self.schedules) >= self.max_shapes:
-                return forward()
             schedule = {
                 "metadata": _capacity_metadata(source, bucket),
                 "source": source,
@@ -142,33 +217,8 @@ class KdaPrefillGraphCache:
             }
             self.schedules[key] = schedule
         elif schedule["source"] is not source:
-            target = schedule["metadata"]
-            target.capacity.validate(source.cu_extend_seq_lens_cpu, bucket)
-            for name in (
-                "query_start_loc",
-                "query_start_loc_int64",
-                "extend_seq_lens_cpu",
-                "cu_extend_seq_lens_cpu",
-            ):
-                getattr(target, name).copy_(getattr(source, name))
-            refresh_causal_conv1d_capacity_metadata(
-                target.query_start_loc, target.conv_prefill_metadata, bucket
-            )
             # Refresh once on the consumer stream; all layers reuse the maps.
-            for name in ("state_in_blocks_by_group", "state_out_blocks_by_group"):
-                old = getattr(schedule["metadata"], name)
-                new = getattr(source, name)
-                if old.keys() != new.keys():
-                    raise RuntimeError(
-                        "KDA graph state groups changed without pool rebind"
-                    )
-                for group, indices in old.items():
-                    if (
-                        indices.shape != new[group].shape
-                        or indices.dtype != new[group].dtype
-                    ):
-                        raise RuntimeError("KDA graph state index geometry changed")
-                    indices.copy_(new[group])
+            _refresh_capacity_metadata(schedule["metadata"], source)
             schedule["source"] = source
 
         signature = tuple(

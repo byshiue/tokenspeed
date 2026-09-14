@@ -6,10 +6,39 @@ overhead while keeping the existing extend implementation.
 
 ## Implementation
 
+### Merged outer capture
+
+Eligible KDA layers now capture directly inside the outer prefill graph,
+alongside their projections and post-attention operations. MLA remains an
+eager break. This removes the separate per-layer KDA graph launch and its
+output handoff copy. Padding is cleared inside the merged graph.
+
+The backend prepares stable capacity metadata before capture and refreshes
+live boundaries, convolution maps and state-page indices once before replay.
+The merged capture accepts any positive live length within its token bucket,
+with the same request count used at capture. The original outer graph remains
+available for mixed batches and other request counts. Layerwise PD transfer
+and data parallelism retain that original route.
+
+Forwards that materialize an internal checkpoint also use the original
+attention break. Their body/tail scans have separate packed extents and
+checkpoint destinations, so neither the merged capture nor the separate KDA
+capacity cache admits them. Their checkpoint computation remains unchanged.
+
+Both capture variants belong to the outer graph owner and share its pool;
+they are never replayed concurrently. This adds capture work and retained
+metadata. Its memory cost and full-model speedup have not yet been measured.
+
+### Separate KDA graphs for the original outer capture
+
 Set `TOKENSPEED_KDA_PREFILL_GRAPH=1` with the `cutedsl_kda` backend and
 prefill CUDA graphs enabled. The default is off. The cache uses the padded
-token extent chosen by the outer prefill graph; it retains up to eight
-schedules per sequence count, including stream and PDL variants.
+token extent chosen by the outer prefill graph, following
+`--prefill-graph-capture-sizes` or the default outer bucket ladder.
+There is no separate KDA size list or schedule-count limit. Schedules are
+created lazily for each encountered bucket, sequence count, stream and PDL
+setting. Configuring more buckets can increase capture time and memory use;
+the eight-bucket measurements below do not quantify larger configurations.
 
 The first call warms native plans. The second captures the same callable and
 replays it once. Later calls refresh stable metadata buffers and replay.
@@ -35,6 +64,9 @@ its intermediates remain live across the attention break. See
 [the execution invariants](unified_path.md#experimental-kda-prefill-subgraphs).
 
 ## Measured performance
+
+These measurements describe the earlier separate-KDA-graph implementation,
+not the merged outer capture described above.
 
 The comparison used the same source with the KDA graph switch OFF and ON:
 real 93-layer Kimi-K3 NVFP4 weights, TP8 on eight Blackwell GPUs in one NVLink
@@ -72,9 +104,21 @@ or streams can consume more memory.
 
 ## Validation
 
+For the merged capture, GPU regressions check that state-attention breaks
+disappear while full-attention breaks remain. They also check changing live
+lengths and page IDs, exactly-once state writes, metadata restoration, and
+fallback selection. A saved-real-activation check covered 18 complete KDA
+regions at live lengths 58, 76, 94, 1536, 3584 and 6656. Each region captured
+as one graph; 54 shared-pool replays in forward and reverse order matched
+eager outputs and convolution/recurrent states bit-for-bit on each of two
+GPUs. This is operator-level validation, not a new full-model benchmark.
+
+The following larger validation runs were performed on the earlier separate
+subgraphs:
+
 Regression tests cover capacity admission, inactive convolution programs,
 metadata isolation, exactly-once cache writes, changed input addresses,
-schedule limits, metadata restoration on failure, stream-local pool sharing
+replay across more than eight buckets, metadata restoration on failure, stream-local pool sharing
 and cache reinitialization.
 
 GPU validation exercised 1,920 capacity cases across eight buckets and

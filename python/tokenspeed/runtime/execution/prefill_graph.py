@@ -45,7 +45,7 @@ finished with the model's eager logits tail.
 from __future__ import annotations
 
 import bisect
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -232,6 +232,7 @@ class PrefillGraph:
         self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
+        self._inline_captures = {}
         self.token_to_kv_pool = token_to_kv_pool
         self.input_buffers = input_buffers
         self.config = config
@@ -310,6 +311,7 @@ class PrefillGraph:
             max_bs=int(self.config.max_num_seqs)
             // max(int(self.config.data_parallel_size), 1),
         )
+        self._inline_captures.clear()
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper)
 
@@ -334,6 +336,25 @@ class PrefillGraph:
             try:
                 with active_forward(self._ctx):
                     self._capture_bucket(bucket, decode_wrapper)
+                    # Retain the ordinary graph for mixed/different-count batches.
+                    # DP admission must be rank-uniform; keep its existing route.
+                    bindings = (
+                        self.attn_backend.prepare_prefill_graph_bindings(bucket)
+                        if self.dp_size == 1
+                        else []
+                    )
+                    if bindings:
+                        ordinary = self._captures[bucket], self._outputs[bucket]
+                        with ExitStack() as stack:
+                            for binding in bindings:
+                                stack.enter_context(binding.bind(refresh=False))
+                            self._capture_bucket(bucket, decode_wrapper)
+                        self._inline_captures[bucket] = (
+                            self._captures[bucket],
+                            self._outputs[bucket],
+                            bindings,
+                        )
+                        self._captures[bucket], self._outputs[bucket] = ordinary
             finally:
                 self._ctx = None
         if self.config.global_rank == 0:
@@ -344,6 +365,13 @@ class PrefillGraph:
                 sorted(self._captures),
                 sample.num_segments if sample is not None else 0,
             )
+            if self._inline_captures:
+                logger.info(
+                    "prefill inline attention: captured buckets %s "
+                    "(segments=%d, ordinary captures retained for fallback)",
+                    sorted(self._inline_captures),
+                    next(iter(self._inline_captures.values()))[0].num_segments,
+                )
 
     def _capture_bucket(
         self, bucket: int, decode_wrapper: ForwardStepRunner | None
@@ -612,9 +640,20 @@ class PrefillGraph:
                 ib.mrope_positions_buf[:, num_tokens:bucket].zero_()
             else:
                 ib.positions_buf[num_tokens:bucket].zero_()
-        with self._padded_to(ctx, bucket):
-            self._captures[bucket].replay(valid_rows=num_tokens)
-        hidden_states, aux_hidden_states = self._outputs[bucket].sliced(num_tokens)
+        cap, output = self._captures[bucket], self._outputs[bucket]
+        inline = self._inline_captures.get(bucket)
+        with ExitStack() as stack:
+            if (
+                inline is not None
+                and self.attn_backend.step_counter is None
+                and all(binding.compatible(ctx) for binding in inline[2])
+            ):
+                cap, output, bindings = inline
+                for binding in bindings:
+                    stack.enter_context(binding.bind(refresh=True))
+            with self._padded_to(ctx, bucket):
+                cap.replay(valid_rows=num_tokens)
+        hidden_states, aux_hidden_states = output.sliced(num_tokens)
         # The eager logits tail of BaseCausalLM.forward, on the replayed hidden states.
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.text_model.logits_processor(

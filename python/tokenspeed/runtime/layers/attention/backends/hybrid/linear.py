@@ -179,7 +179,11 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     # ---- Forward dispatch ----
 
-    @break_point
+    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+        if self.step_counter is not None:
+            return []
+        return self.linear_attn_backend.prepare_prefill_graph_bindings(bucket)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -193,9 +197,46 @@ class HybridLinearAttnBackend(AttentionBackend):
         record_kv_cache: bool | None = None,
         **kwargs,
     ):
+        layer_id = layer.layer_id if layer else kwargs["layer_id"]
+        backend = self._backend_for_layer(layer_id)
+        forward = (
+            self._forward
+            if backend.prefill_graph_inline and self.step_counter is None
+            else self._forward_break
+        )
+        return forward(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            forward_mode,
+            bs,
+            save_kv_cache,
+            record_kv_cache,
+            **kwargs,
+        )
+
+    @break_point
+    def _forward_break(self, *args, **kwargs):
+        return self._forward(*args, **kwargs)
+
+    def _forward(
+        self,
+        q,
+        k,
+        v,
+        layer,
+        token_to_kv_pool,
+        forward_mode,
+        bs,
+        save_kv_cache,
+        record_kv_cache,
+        **kwargs,
+    ):
         """Dispatch one layer to its full-attention or GDN backend (the break point).
 
-        Overrides the base forward, so it carries its own ``@break_point``;
+        The ordinary route carries its own ``@break_point``;
         the frozen capture-time scalars (forward_mode/bs) are re-read from the
         ambient ctx (semantics: see breakable_cuda_graph). The GDN scan's
         batched [1, T, Hv, D] output is collapsed to z-shaped [T, Hv, D].

@@ -62,6 +62,7 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     logger,
 )
 from tokenspeed.runtime.layers.attention.backends.state.prefill_graph import (
+    KdaOuterGraphBinding,
     KdaPrefillGraphCache,
     KdaPrefillGraphMetadata,
 )
@@ -148,6 +149,16 @@ class KdaAttnBackend(MambaAttnBackend):
         self._prefill_graph_cache = None
         super().init_prefill_graph_state(max_num_tokens, max_bs)
 
+    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+        if (
+            self._prefill_graph_enabled
+            and self.kda_backend == "cutedsl_kda"
+            and self.step_counter is None
+            and self.forward_metadata.prefill_checkpoint_batch is None
+        ):
+            return [KdaOuterGraphBinding(self, bucket)]
+        return []
+
     def forward_extend(
         self,
         q,
@@ -174,6 +185,12 @@ class KdaAttnBackend(MambaAttnBackend):
                 **kwargs,
             )
 
+        if self.prefill_graph_inline:
+            output = forward()
+            # No eager handoff remains to scrub undefined native output padding.
+            rows = torch.arange(output.shape[0], device=output.device)
+            padding = rows >= self.forward_metadata.query_start_loc[-1]
+            return output.masked_fill_(padding.view(-1, *([1] * (output.ndim - 1))), 0)
         if not (
             self._prefill_graph_enabled
             and self.kda_backend == "cutedsl_kda"
@@ -184,7 +201,7 @@ class KdaAttnBackend(MambaAttnBackend):
         ):
             return forward()
         if self._prefill_graph_cache is None:
-            self._prefill_graph_cache = KdaPrefillGraphCache(max_shapes=8)
+            self._prefill_graph_cache = KdaPrefillGraphCache()
         arguments = dict(kwargs, q=q, k=k, v=v, bs=bs, save_kv_cache=save_kv_cache)
         return self._prefill_graph_cache.run(
             self,

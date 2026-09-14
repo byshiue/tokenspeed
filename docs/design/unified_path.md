@@ -682,18 +682,51 @@ GEMM arithmetic.
 
 ## Experimental KDA prefill subgraphs
 
+### Capturing KDA in the outer graph
+
+For pure extend with the captured request count, KDA stays inside the outer
+prefill graph. Before warmup, the backend creates a capacity metadata binding
+for the selected bucket. The hybrid wrapper bypasses its attention break
+while this binding is active, capturing neighboring projections, KDA kernels
+and post-attention compute together. Full-attention layers keep their breaks.
+
+Before replay, the binding validates live lengths and refreshes boundaries,
+convolution maps and state-page indices on the consumer stream. All KDA
+layers read this same stable storage. Token lengths may vary within the
+bucket; request counts must match capture. Native output padding is cleared
+inside the graph, replacing the KDA break's handoff copy and tail scrub.
+The outer graph owns these allocations and their pool.
+
+The ordinary outer capture is retained for mixed batches and other request
+counts. Both variants share the outer pool and execute serially, as existing
+bucket captures do. Layerwise PD transfer and data parallelism retain the
+ordinary route: host cache-step callbacks must remain live, and DP admission
+must stay rank-uniform. A binding rejects a replacement cache pool; graph
+release and recapture remain the orchestrator's responsibility.
+
+Internal-checkpoint forwards retain the ordinary attention break as well.
+Their body/tail scans carry distinct token extents and destination indices;
+the full-batch capacity contract does not cover them. Both capture admission
+and separate-subgraph admission reject this metadata. Replay refresh includes
+`scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
+the convolution boundary and existing int64 mirror.
+
+### Separate subgraphs in the ordinary outer capture
+
 `TOKENSPEED_KDA_PREFILL_GRAPH=1` opts into capacity-based subgraphs within
 the existing breakable-prefill attention break. The default remains off.
 The cache calls the same extend implementation for warmup and capture;
-capture failures propagate. Decode, outer graph capture and ordinary eager
+capture failures propagate. Decode and ordinary eager
 forwards retain their existing behavior. PD cache-step recording and the
 break-output copy/padding stay outside the subgraph in their original order.
 
-Each backend retains at most eight schedules per sequence count, keyed by
-sequence count, padded token count, CUDA stream and PDL setting. Layer entries also
+Each backend lazily retains schedules for the outer prefill graph's selected
+token buckets, keyed by sequence count, padded token count, CUDA stream and
+PDL setting. There is no separate KDA bucket list or schedule-count limit.
+Layer entries also
 require identical input addresses, shapes, strides, dtypes and scalar
 arguments, and retain input references against allocator address recycling.
-Incompatible inputs or schedules beyond capacity run the same eager callable.
+Incompatible inputs run the same eager callable.
 The first execution warms native plans normally; the second records a graph
 and replays once, so in-place cache state is never advanced by extra warmups.
 

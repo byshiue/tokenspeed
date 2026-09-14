@@ -177,6 +177,17 @@ class AttentionBackend(CachePoolBinding, ABC):
         """Allocate static buffers the breakable prefill graphs bake.
         Default: no-op — attention stays eager at the break points."""
 
+    prefill_graph_inline: bool = False
+
+    def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+        """Return stable metadata bindings for inline capture at `bucket`.
+
+        A binding owns capture metadata, checks replay compatibility and
+        refreshes device buffers before replay. Leaves default to eager breaks.
+        Layerwise transfer keeps its host callbacks at those breaks.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Metadata (docs/design/unified_path.md)
     # ------------------------------------------------------------------
