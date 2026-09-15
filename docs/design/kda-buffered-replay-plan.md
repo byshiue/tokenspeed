@@ -9,7 +9,8 @@ M15 接入实验性容量参数与 kernel 注册；真实 TP8 的首轮 L8/L16 �
 延迟发布修复，并完成新旧实现的短 NSYS 对照。M17 验证 L16 的静态 kernel
 tile 调整，并完成同条件 AIME：baseline 26/30，L16 官方 28/30、完整最终答案
 27/30。匹配的端到端延迟在 C1/C4 分别增加 1.49%/13.69%，性能验收仍未通过；
-重启复测及其余容量验证仍未完成。
+新一组 GPU 上，前后两次 baseline 对照确认 L32/L64 在 C1、C4 都仍有回退；
+独立 kernel 调优、候选重启复测及更广的工作负载验证继续进行。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 

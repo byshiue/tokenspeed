@@ -53,7 +53,7 @@ against the frozen baseline before the work meets its completion gate.
 | B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
 | C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
 | D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
-| E. Real-model correctness and performance | Matched traces and full AIME complete: baseline 26/30; M17 L16 official 28/30, completed final answers 27/30; M16 generated-prefix reuse passes | M17 L16 latency regresses 1.49% at C1 and 13.69% at C4; remaining capacities and restart repeats are pending |
+| E. Real-model correctness and performance | Matched traces and full AIME complete: baseline 26/30; M17 L16 official 28/30, completed final answers 27/30; M16 generated-prefix reuse passes; M18 L32/L64 complete between two baseline restarts | All measured capacities still regress; candidate restart repeats and broader workload validation remain open |
 
 ## Recording a result
 
@@ -1614,4 +1614,52 @@ Each case must complete smoke, source/worker ownership checks and all timing
 samples before the controller stops its exact owned server step. Both GPU
 nodes must be idle before the next model starts. Failures stop the sequence
 and retain partial artifacts; no retry or sample replacement is automatic.
-Those full-model capacity results and restart comparisons remain pending.
+L32 and L64 have now completed on this cohort. Each finishes the same 75
+measured requests and six warmup batches, with no request errors or preemption.
+All ranks select the buffered recurrence at the requested capacity. Each run
+has one exact output sequence at C1 and two at C4; neither capacity has a
+full-model AIME result. The L16 score above must not be attributed to them.
+
+| Metric | First baseline | L32 | L64 |
+| --- | ---: | ---: | ---: |
+| C1 median client latency | 1,065.635 ms | 1,090.406 ms (+2.32%) | 1,074.513 ms (+0.83%) |
+| C4 median client latency | 1,619.871 ms | 1,799.633 ms (+11.10%) | 1,751.396 ms (+8.12%) |
+| C4 median whole-batch latency | 1,628.462 ms | 1,887.201 ms (+15.89%) | 1,848.089 ms (+13.49%) |
+| C1 median acceptance length | 3.59 | 3.64 | 3.75 |
+| C4 median acceptance length | 3.67 | 3.28 | 3.405 |
+
+The whole-batch figures retain the 15 concurrent batches as the timing units.
+From the source's rounded acceptance statistic, the corresponding integer
+request-accounted verify counts are uniquely determined here: C1 is 71 rounds
+for baseline, 70 for L32 and 68 for L64. C4 is split evenly between 69/70,
+71/86 and 69/82 rounds, respectively. These are inferred request counts, not
+direct observations of GPU graph replays; the helper retains ambiguity for
+rounded values with more than one integer solution.
+
+Fewer rounds do not by themselves make C1 faster. Its median request decode
+window is 887.020 ms originally, 908.710 ms at L32 and 896.140 ms at L64.
+Dividing each request's window by its accounted rounds gives medians of
+12.493, 12.982 and 13.179 ms, respectively. These include host scheduling and
+overlap, not just recurrence kernels. At C4, changed outputs and concurrent
+request interactions prevent interpreting such averages as kernel timings.
+
+The second baseline restart also completes all 75 measured requests and six
+warmup batches without errors or preemption. Its C1/C4 median client latencies
+are **1,061.186 / 1,604.796 ms**, and median C4 whole-batch latency is
+1,615.668 ms. The 30 measured batches have exactly the same output multisets
+as the first baseline, including multiplicities but not request arrival order;
+acceptance and inferred round counts also agree. Both restarts use the same
+eight GPU UUIDs, source, native objects, model, graph ladder and input protocol.
+
+Against this second baseline, L32 client latency regresses **2.75% / 12.14%**
+at C1/C4, and L64 **1.26% / 9.14%**. C4 whole-batch latency increases 16.81%
+and 14.39%, respectively. Comparisons against both baseline restarts are kept
+separately; there is no pooled or selectively chosen baseline. Each candidate
+still has only one restart in this cohort. **Neither capacity passes the
+no-regression gate.**
+
+After validating and stopping the last owned server, both model nodes pass
+another idle check. The isolated experiment compares value tiles 32/16 at
+L16/L32/L64, requiring bitwise output, state and history equality before timing.
+It also records compiler register, spill and shared-memory metadata. No
+production code or default changes have been made for that experiment.
