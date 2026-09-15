@@ -2268,3 +2268,24 @@ producer precision and defaults are unchanged. The local M24 runbook retains
 commands, source and input hashes, complete timing samples, compiler records,
 validation results and both-node idle evidence. There is no new full-model
 performance result, NSYS report or AIME score.
+
+### Rebase integration with upstream main
+
+Rebased onto upstream main `eaf66b5b`. Host cache registration retains the
+replay-history publication guard while supplying main's newly required API
+arguments. Scheduler regression tests now pass the former default values
+explicitly. DeepSeek V4.1's history groups declare zero state lag and no replay
+dependency, preserving their existing cache behavior; the recipe test checks
+both fields. These are integration changes, not KDA arithmetic changes.
+
+On Python 3.12.13 and PyTorch 2.8.0+cpu, the buffered reference suite passes
+all 19 tests and the cache-group specification/page-count suites pass 47 tests
+with two skipped. The CPU state-commit validity contract test also passes.
+A fresh Release build with GCC 13.3.0 passes all 490 scheduler C++ tests;
+the rebuilt Python extension passes all 153 scheduler binding tests. The
+first binding run had two import failures in subprocesses; staging the source
+package beside the rebuilt extension on PYTHONPATH resolves both.
+Full runtime and GPU checks were not rerun: the local CPU environment cannot
+satisfy the kernel package's accelerator requirement.
+Earlier full-model accuracy and performance results do not validate this
+rebased revision.

@@ -575,10 +575,13 @@ TEST(SchedulerConfigValidateTest, StateLagIsNonNegativeAndStateOnly) {
                                .max_state_lag_tokens = lag}};
             if (valid) {
                 EXPECT_NO_THROW(group.Validate());
-                EXPECT_NO_THROW(MakeCoordinator(specs, 128, pool));
+                EXPECT_NO_THROW(MakeCoordinator(specs, 128, pool, /*host_pool=*/nullptr,
+                                                /*stream_device_cache_to_host=*/true));
             } else {
                 EXPECT_THROW(group.Validate(), std::invalid_argument);
-                EXPECT_THROW(MakeCoordinator(specs, 128, pool), std::runtime_error);
+                EXPECT_THROW(MakeCoordinator(specs, 128, pool, /*host_pool=*/nullptr,
+                                             /*stream_device_cache_to_host=*/true),
+                             std::runtime_error);
             }
         }
     }
@@ -608,7 +611,8 @@ TEST(SchedulerConfigValidateTest, ReplayHistoryRequiresAStateDependencyAndSafeHa
     const auto specs = MakeSpecsFromConfig(cfg);
     EXPECT_EQ(specs[0].replay_checkpoint_group, 1U);
     BlockPool pool(32, {1, 1});
-    EXPECT_NO_THROW(MakeCoordinator(specs, 4, pool));
+    EXPECT_NO_THROW(MakeCoordinator(specs, 4, pool, /*host_pool=*/nullptr,
+                                    /*stream_device_cache_to_host=*/true));
     for (const std::string& dependency : {"", "replay", "missing"}) {
         auto invalid = cfg;
         invalid.cache_groups[0].replay_checkpoint_group = dependency;
@@ -637,11 +641,15 @@ TEST(SchedulerConfigValidateTest, ReplayHistoryRequiresAStateDependencyAndSafeHa
     for (std::uint32_t dependency : {0U, 2U}) {
         auto invalid_specs = specs;
         invalid_specs[0].replay_checkpoint_group = dependency;
-        EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool), std::runtime_error);
+        EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool, /*host_pool=*/nullptr,
+                                     /*stream_device_cache_to_host=*/true),
+                     std::runtime_error);
     }
     auto invalid_specs = specs;
     invalid_specs[0].sliding_window = 4;
-    EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool), std::runtime_error);
+    EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool, /*host_pool=*/nullptr,
+                                 /*stream_device_cache_to_host=*/true),
+                 std::runtime_error);
 }
 
 TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {

@@ -3720,7 +3720,8 @@ TEST(MambaStateKindTest, LaggedRetentionPreservesTheEndpointBlock) {
             const CacheGroupSpec spec{
                 .kind = AttnKind::kMambaState, .block_granularity = grain, .max_state_lag_tokens = lag};
             BlockPool pool(1, {1});
-            CacheCoordinator coord = MakeCoordinator(std::array{spec}, grain, pool);
+            CacheCoordinator coord = MakeCoordinator(std::array{spec}, grain, pool, /*host_pool=*/nullptr,
+                                                     /*stream_device_cache_to_host=*/true);
             CacheForGroup(coord, pool, "boundary", 0);
             EXPECT_EQ(coord.GroupBoundaryLookbackPages(0), 1);
             EXPECT_EQ(coord.ProbePrefix(std::vector<std::string>{"boundary"}).device.num_common_tokens, grain);
@@ -3747,7 +3748,8 @@ TEST(MambaStateKindTest, LaggedStateIsNeitherAdmissionCreditNorReclaimed) {
             BlockPool pool(2, {1});
             const std::array specs{
                 CacheGroupSpec{.kind = AttnKind::kMambaState, .block_granularity = 128, .max_state_lag_tokens = lag}};
-            CacheCoordinator coord = MakeCoordinator(specs, 128, pool);
+            CacheCoordinator coord = MakeCoordinator(specs, 128, pool, /*host_pool=*/nullptr,
+                                                     /*stream_device_cache_to_host=*/true);
             std::vector<BlockTable> tables(1);
             ASSERT_TRUE(AdmitForTest(coord, tables, 140));
             const auto checkpoint_id = tables[0].Blocks()[0]->Location();
@@ -3755,7 +3757,9 @@ TEST(MambaStateKindTest, LaggedStateIsNeitherAdmissionCreditNorReclaimed) {
                 // The temporary ref lives only through registration; leaving
                 // it alive during admission would independently pin the block.
                 CacheBlockRef checkpoint = tables[0].Blocks()[0];
-                coord.GroupPrefixIndex(0).Register(pool, checkpoint, Key("checkpoint", 0), NextTestAccessEpoch());
+                coord.GroupPrefixIndex(0).Register(pool, checkpoint, Key("checkpoint", 0), NextTestAccessEpoch(),
+                                                   /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                   /*newly_cached=*/nullptr);
                 // A resumed request needs only the materialized snapshot,
                 // even when the live request's retention extends further.
                 EXPECT_EQ(coord.GroupBoundaryLookbackPages(0), 1);
@@ -3812,7 +3816,9 @@ TEST(ReplayHistoryTest, ResumeOwnsFreshHistoryAndNeverPublishesIt) {
                 if (host_extension) {
                     coord.CacheHostBlock(ref, Key("b", group));
                 } else {
-                    coord.GroupPrefixIndex(group).Register(pool, ref, Key("b", group), NextTestAccessEpoch());
+                    coord.GroupPrefixIndex(group).Register(pool, ref, Key("b", group), NextTestAccessEpoch(),
+                                                           /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                           /*newly_cached=*/nullptr);
                 }
             }
             EXPECT_EQ(coord.GroupBoundaryLookbackPages(replay_id), 0);
@@ -4076,7 +4082,8 @@ TEST(ReplayHistoryTest, EmptySuffixAdvancesWithoutStorageAndAdmitsDecodeAtomical
         {.kind = AttnKind::kMambaState, .block_granularity = 4},
         {.kind = AttnKind::kSlidingWindow, .sliding_window = 5, .block_granularity = 2, .replay_checkpoint_group = 0},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool);
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*host_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     for (const std::int32_t after : {8, 16}) {
         const std::vector<GroupDemand> demands{
@@ -4089,7 +4096,7 @@ TEST(ReplayHistoryTest, EmptySuffixAdvancesWithoutStorageAndAdmitsDecodeAtomical
              .num_computed_tokens = after - 8,
              .materialized_suffix_start = after / 2},
         };
-        auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands);
+        auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, std::nullopt);
         ASSERT_TRUE(admission);
         EXPECT_TRUE(admission->new_page_ids[1].empty());
         EXPECT_EQ(tables[1].NumBlocks(), after / 2);
@@ -4103,13 +4110,13 @@ TEST(ReplayHistoryTest, EmptySuffixAdvancesWithoutStorageAndAdmitsDecodeAtomical
         {.table = &tables[0], .num_tokens = 19, .reserve_tokens = 4, .materialized_suffix_start = 4},
         {.table = &tables[1], .num_tokens = 19, .reserve_tokens = 3, .materialized_suffix_start = 9},
     };
-    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), final_demands));
+    EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), final_demands, std::nullopt));
     EXPECT_EQ(tables[0].NumBlocks(), 4);
     EXPECT_EQ(tables[1].NumBlocks(), 8);
     held.clear();
     // Free the synthetic state input to provide four physical suffix blocks.
     coordinator.Free(tables);
-    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), final_demands);
+    auto admission = coordinator.Admit(coordinator.ProbePrefix({}), final_demands, std::nullopt);
     ASSERT_TRUE(admission);
     EXPECT_EQ(admission->new_page_ids[1].size(), 2u);
     EXPECT_EQ(tables[1].NumBlocks(), 11);
