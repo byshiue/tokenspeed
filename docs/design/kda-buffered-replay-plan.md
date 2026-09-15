@@ -7,7 +7,9 @@ accepted/quiescent endpoint 物化。M14 接通 mixed batch 中的 buffered deco
 M15 接入实验性容量参数与 kernel 注册；真实 TP8 的首轮 L8/L16 测试都未通过
 性能不退步的目标，输出也未与基线逐 token 一致。M16 已验证 decode checkpoint
 延迟发布修复，并完成新旧实现的短 NSYS 对照。M17 验证 L16 的静态 kernel
-tile 调整；完整 AIME 对照、重启复测及其余容量验证仍未完成。
+tile 调整，并完成同条件 AIME：baseline 26/30，L16 官方 28/30、完整最终答案
+27/30。匹配的端到端延迟在 C1/C4 分别增加 1.49%/13.69%，性能验收仍未通过；
+重启复测及其余容量验证仍未完成。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 

@@ -40,6 +40,8 @@ M15 source commit: `fea0e94fbd816116d9eebd0ac6b833e05bc8054b`
 (`feat(kda): expose experimental buffered decode`).
 M16 source commit: `38a396c8f5b0dc474ecda4ab624ec7789e0a3ad2`
 (`fix(cache): retain exact decode checkpoint publication evidence`).
+M17 source commit: `61e7508033cec8022b7f1052fdda27a3d0970dc4`
+(`perf(kda): tune small-batch capacity-16 recurrence tiles`).
 No default capacity or serving performance benefit has been established.
 M15 registers the GPU recurrence and adds an explicit experimental capacity;
 it is not a production-validated default. Eagle3 must run the new path without a performance regression
@@ -51,7 +53,7 @@ against the frozen baseline before the work meets its completion gate.
 | B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
 | C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
 | D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
-| E. Real-model correctness and performance | First baseline/L8/L16 runs and matched traces complete; M16 generated-prefix reuse passes; corrected baseline AIME is 26/30 | Buffered AIME, remaining capacities and restart repeats are pending; no-regression has not passed |
+| E. Real-model correctness and performance | Matched traces and full AIME complete: baseline 26/30; M17 L16 official 28/30, completed final answers 27/30; M16 generated-prefix reuse passes | M17 L16 latency regresses 1.49% at C1 and 13.69% at C4; remaining capacities and restart repeats are pending |
 
 ## Recording a result
 
@@ -1427,8 +1429,9 @@ baseline trace is reported below.
 
 ### M17: matched traces and bounded launch tuning
 
-Source under validation: based on `a6d3e3fa`; not yet a committed or validated
-full-model optimization. Only native four-token, capacity-16 recurrence with
+Source: `61e7508033cec8022b7f1052fdda27a3d0970dc4`, based on `a6d3e3fa`.
+Kernel/runtime validation passed; the full-model results below do not pass the performance gate.
+Only native four-token, capacity-16 recurrence with
 12 local heads and batch sizes one through four changes its value tile from
 32 to 16. Other shapes retain their previous configuration. Four warps, the
 history tile, arithmetic, flush policy and L8 behavior stay unchanged. The existing parameterized recurrence
@@ -1476,7 +1479,9 @@ tests plus 77 subtests** (three skips, 48.11s), and **527 shared runtime tests
 plus 317 subtests** (36.61s). Warning counts were unchanged. A separate actual
 dispatch check passed **14 cases**, confirming the selected tile and bitwise
 results at B1/2/3/4/8/16/32 with six or twelve heads. Large batches and other
-head counts keep tile 32. Full-model validation of the candidate remains open.
+head counts keep tile 32. All applicable all-files hooks passed before the
+signed-off source commit. Serving uses a separate archive of that commit and
+the unchanged matching M16 scheduler binary. Full-model results follow below.
 The earlier isolated scaling/FMA experiments did not establish exact
 agreement with the original native verify kernel; no such math change was
 adopted.
@@ -1512,3 +1517,72 @@ and **1,597.885 ms at C4**; median decode throughput is 288.4 and 214.5 tokens/s
 and acceptance length is 3.59 and 3.67. No request failed or was preempted.
 The candidate must use this same ladder for its paired timing; these results
 are not mixed into the earlier 1/2/4 comparison.
+
+### M17 full-model AIME and matched performance
+
+Both complete evaluations use the frozen original `2e4b5407` and M17
+`61e75080`, the same eight GB300 GPUs, full 93-layer real NVFP4 weights, TP8,
+EAGLE3 and CUDA graphs/overlap. L16 is explicitly enabled only for M17.
+The software, target and draft revisions are unchanged from the environment
+record above. This pair captures graph sizes **1/2/3/4**, with padding disabled.
+It is separate from the earlier 1/2/4 profile and timing pair.
+
+AIME uses EvalScope 1.11.1 and all 30 frozen `math-ai/aime26` questions,
+revision `79037aebdb6580008fb960d17cb21fd3099083e3`, with temperature 1,
+seed 42, a 63,488-token output budget, concurrency four and one attempt per
+question. There are no prompt cache hits, retries or replacement samples.
+All 30 actual input messages, dataset hashes, normalized evaluation commands,
+GPU identities, dependencies and native objects match between sources.
+
+| AIME result | Original | M17 L16 |
+| --- | ---: | ---: |
+| Official scorer | 26/30 (86.67%) | 28/30 (93.33%) |
+| Completed final-response audit | 26/30 (86.67%) | 27/30 (90.00%) |
+| Request errors | 0 | 0 |
+| Output-budget stops | 1 | 1 |
+| Total output tokens | 203,117 | 263,275 |
+
+The candidate's budget-truncated question at zero-based index 14 has no final
+response channel. The official scorer extracts the correct number, 83, from
+its unfinished text; the final-response audit excludes that point. The
+baseline also truncates that question but receives no point. M17 corrects
+indices 21 and 29, misses index 23 that baseline answered correctly, and both
+miss index 6. Independent full-text regrading agrees with the official scorer
+on every question. This is one matched dataset run, not evidence of a general
+accuracy improvement or bitwise equivalence. Different generation lengths
+make AIME wall times unsuitable as a controlled speed comparison.
+
+The unprofiled timing protocol is unchanged: the identical frozen continuation,
+51,936 input tokens, 51,328 cached tokens, 608 new prefill tokens and 256
+generated tokens per request. Each source completes three rounds at C1/C4,
+with one warmup and five measured batches per round: **75 measured requests**
+and six warmup batches. Host audits exclude active profiler injection.
+
+| Metric | Original | M17 L16 | Change |
+| --- | ---: | ---: | ---: |
+| C1 median client latency | 1,058.916 ms | 1,074.716 ms | +1.49% |
+| C4 median client latency | 1,597.885 ms | 1,816.588 ms | +13.69% |
+| C1 median decode throughput | 288.4 tokens/s | 285.7 tokens/s | |
+| C4 median decode throughput | 214.5 tokens/s | 187.7 tokens/s | |
+| C1 median acceptance length | 3.59 | 3.64 | |
+| C4 median acceptance length | 3.67 | 3.10 | |
+
+No measured request fails or is preempted. Each source has one exact output
+sequence at C1 and two at C4. C4 is 15 concurrent batches, not 60 independent
+timing observations; median whole-batch latency is 1,609.466 ms originally
+and 1,883.348 ms for M17. Acceptance differs, so these are end-to-end results,
+not an isolated measure of recurrence kernel cost. They also do not isolate
+the tile change from M16's scheduler fix or the older graph configuration.
+
+The comparison harness initially hashed completed conversations, including
+assistant replies and generated message IDs, when checking prompt identity.
+The corrected check compares every input-message field except the generated
+ID and records input-only hashes. All 30 comparisons pass; no model input,
+raw prediction, score or timing sample was changed to resolve the check.
+
+Raw predictions, both scoring audits, per-question inputs/results, manifests,
+all request and batch timings, comparison scripts and the matched provenance
+are retained in local artifacts. This is one server run per source; independent
+restart repeats, the remaining capacity sweep and broader workload coverage
+remain open. **The EAGLE3 no-regression gate still fails. Buffered replay stays
+opt-in, with no recommended default capacity.**
