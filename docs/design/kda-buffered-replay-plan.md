@@ -27,6 +27,13 @@ NSYS 对照：L64 的 B4 graph 中位数增加 5.44–5.61%，并比原实现多
 变大。下一步优先降低 history reconstruction 成本，并追踪数值差异对
 acceptance 的影响；不能仅凭较长的 CPU validation 区间推断它是主要瓶颈。
 这些是带 profiler 的诊断结果，不替代 M20 的无 profiler 性能验收。
+M22 已完成隔离的 TF32x3 history reconstruction 实验：tile sweep 的 198 个
+数值用例通过，但扩大到全部可达 history 长度后，488 个用例中有 9 个未通过
+与当前实现的 BF16 output 对照容差；两者均通过独立 FP32 reference，容差未放宽。
+静态候选通过 109 个 kernel/reference 测试、201 个 runtime 测试和 77 个 subtest，
+但短 history 仍有性能退步，未接入生产代码，也没有新的完整模型或 AIME 结果。
+下一步结合实际 history 分布和同输入下的数值差异继续定位，不以局部最优 tile
+推断模型收益。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 

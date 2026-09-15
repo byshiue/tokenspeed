@@ -1990,3 +1990,92 @@ The local M21 runbook records exact commands, source/environment provenance,
 all attempts, validation, graph samples, package hashes and cleanup evidence.
 Capture-helper tests pass all four cases; these are diagnostic-helper checks,
 not additional model-accuracy tests.
+
+### M22: history reconstruction experiments
+
+Production source remains `ad28ea43`, with the M21 record at `8142a2e8`.
+This phase tests isolated, unregistered kernel copies; it does not change
+serving dispatch, cache ownership, flush policy or the default capacity.
+Experiments run sequentially on one otherwise idle GB300 in the same
+persistent allocation used for M21. The cached environment is Python 3.12.3,
+PyTorch 2.13.0+cu130, CUDA 13, driver 580.167.08 and
+tokenspeed-triton 3.8.10.post20260906. No profiler or model server is running.
+
+The candidate replaces the broadcast product/reduction in
+`U^T @ (K * suffix(D))` with TF32x3 matrix multiplication and FP32 accumulation.
+Checkpoint and K/U/D storage remain FP32, as does the division-free suffix
+product. This still reconstructs state and computes outputs; it is not an
+output-only route. Changing reduction order does not imply bitwise agreement.
+
+The first L64/B4/history-32 smoke passes the independent sequential FP32
+reference and current-kernel comparison, but is **5.78% slower**. A subsequent
+tile sweep covers B1/B4, capacities 16/32/64, empty/mid/near-flush histories,
+value tiles 16/32/64 and history tiles 16/32/64. All **198 records** pass the
+numerical checks. Some long-history configurations improve 10–22%, while
+short-history configurations regress. The best tile for each individual
+fixture is not a deployable policy. Compiler register, spill, shared-memory
+and Tensor Core instruction records are retained alongside every timing.
+
+A GPU-side short-history scalar / long-history matrix branch then loses its
+expected benefit: the same B4/history-32 smoke is **9.87% slower**, despite
+passing numerical checks. This does not isolate the compiler or occupancy
+cause, and the branch is not adopted.
+
+The next candidate uses one static history tile of 16 for native-input,
+four-token L64 recurrence with 12 local heads, K=V=128 and B1–4. Other shapes
+retain the current scalar calculation and launch configuration. Confirmation
+covers every reachable history length 0–60 at B1/2/3/4, with two seeds:
+**488 cases**. Both implementations pass the independent reference, but nine
+cases fail the current-to-prototype BF16 output tolerance. Those failures
+remain failures; no tolerance is widened. Their timing samples are omitted
+by the predeclared correctness gate, not replaced by successful reruns.
+An untimed replay of all nine finds one mismatched element per case: adjacent
+BF16 values on opposite sides of the independent FP32 reference. Both kernels'
+outputs, state and history still pass that reference at the unchanged
+tolerances. This identifies rounding-boundary crossings in these fixtures,
+not a state-lifecycle failure; it does not explain the earlier full-model
+acceptance difference or establish model accuracy for the prototype.
+
+There are **239 paired timing cases**, each ordered current/candidate/candidate/
+current. As before, each sample uses a 16-call CUDA graph, 25 replays and five
+event-timed repetitions. Observed changes range from **−14.08% to +14.43%**.
+The table summarizes mean changes over the timed histories in each interval;
+it is not weighted by a model's actual history distribution.
+
+| Batch | History 1–15 | History 16–31 | History 32–47 | History 48–60 |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | +5.76% | +1.39% | −1.20% | −2.13% |
+| 2 | −1.13% | −5.04% | −6.75% | −7.05% |
+| 3 | −1.24% | −5.09% | −6.69% | −7.10% |
+| 4 | −1.22% | −5.36% | −7.70% | −8.98% |
+
+Even intervals with a negative mean contain slower short-history cases.
+These are generated-history, kernel-only measurements, not a claim of
+full-model speedup or an unbiased estimate over all confirmation cases.
+
+The static prototype also passes **109 existing kernel/reference tests** in
+167.91s and **201 runtime tests plus 77 subtests** in 88.27s. The three skips
+are the same two optional FLA prefill cases and AMD-specific indexed decode
+case. Tests cover multi-round reconstruction, weak/identity/zero decay,
+rejection, flush, page reuse, padding, endpoint materialization and eager/
+CUDA-graph execution. Prepared-input and unsupported static geometries keep
+their original arithmetic; native L64 cases exercise the new path.
+
+Validation replaces the registered callable's code and its JIT/helper
+references only inside the test process, preserving callable identity for the
+normal resolver test. It does not edit a frozen archive or installed package.
+The first combined test invocation stops at collection because kernel and
+runtime suites share a top-level package name; its failure is retained.
+Running the suites in separate processes, as in the established runbook,
+resolves that harness issue. An earlier smoke preflight also mistakenly treats
+Torch's ordinary CUPTI dependency as profiler injection; that failed attempt
+is retained, and corrected runs check the actual Nsight injection mappings.
+
+**No reconstruction candidate is adopted in this phase.** The current code
+is unchanged, the pairwise output gate remains unsatisfied, and short-history
+performance needs work. There is no new full-model timing, NSYS capture or
+AIME score. The EAGLE3 no-regression gate remains unmet. The local M22 runbook
+retains experimental sources, hashes, commands, every failure, raw timings
+and test results. Further work should measure actual history-length usage
+and isolate same-input producer/recurrent numerical differences before another
+model-level comparison; a favorable tile-sweep minimum is not enough.
