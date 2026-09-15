@@ -34,6 +34,15 @@ M22 已完成隔离的 TF32x3 history reconstruction 实验：tile sweep 的 198
 但短 history 仍有性能退步，未接入生产代码，也没有新的完整模型或 AIME 结果。
 下一步结合实际 history 分布和同输入下的数值差异继续定位，不以局部最优 tile
 推断模型收益。
+M23 已完成真实 NVFP4 TP8 的 history/same-input 诊断，CUDA graph 和 overlap
+保持开启。C4 每批有 70 轮 B4 和 13 轮 B2，其中 61 轮 B4 的 history 长度
+不一致；所有 request/group 的位置、flush 和物化转移检查通过。10 条 continuation
+输出与 M20 L64 一致，18 个单层快照通过未放宽的独立 reference。原 accepted
+replay 的 FP32 conv/gate 与 buffered 的 BF16 producer 是这些快照中 state 差异
+的主要来源；这不证明完整模型 acceptance 差异的因果关系。诊断含额外同步和
+快照，不用于性能验收，也没有新 AIME 分数。下一步以真实 mixed history 和
+跨层工作集验证 kernel 候选，单独追踪 producer 精度，不能直接推广均匀 history
+的测试收益或把局部数值接近当成完整模型正确性。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 

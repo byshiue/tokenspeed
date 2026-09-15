@@ -2079,3 +2079,118 @@ retains experimental sources, hashes, commands, every failure, raw timings
 and test results. Further work should measure actual history-length usage
 and isolate same-input producer/recurrent numerical differences before another
 model-level comparison; a favorable tile-sweep minimum is not enough.
+
+### M23: real-model history and same-input numerical diagnosis
+
+Production source remains `ad28ea43`; the preceding experiment record is
+`dc36f6fd`. This phase adds local diagnostic helpers and evidence, not a
+production kernel, dispatch or arithmetic change. The EAGLE3 no-regression
+gate is still unmet.
+
+The run uses a new persistent allocation under the same binding: eight GB300
+GPUs across two nodes with a healthy common NVLink fabric. The cached
+environment remains Python 3.12.3, PyTorch 2.13.0+cu130, CUDA 13,
+driver 580.167.08, tokenspeed-triton 3.8.10.post20260906 and FlashInfer 0.6.18.
+The real target is the full 93-layer Kimi-K3 NVFP4 model, TP8, BF16 activations
+and FP8 KV cache. Target config SHA256 remains
+`66ff1cc0486ab1a0901ce5e1f8bc00ad075ff263fc357991d6c23b6e756706b5`;
+the EAGLE3 draft revision is `4c48d2bb72134094340067e3012ebe0e822fac37`.
+L64, four-token verify, graphs 1/2/3/4 without padding, overlap, segmented
+prefill, prefix caching and the existing attention/MoE backends stay enabled.
+Both-node audits verify all eight owned workers and no Nsight injection.
+
+A process-local wrapper copies one rank's first local KDA layer into separate,
+fixed-address diagnostic buffers allocated before graph capture. It samples
+checkpoint/history and conv state after the layer's load fence, then captures
+the produced conv, gate, output and candidate K/U/D before shared scratch is
+reused. Recording after ordinary accepted commit also retains every group's
+positions, flush flags and accepted counts. These copies and synchronized
+readbacks make the run **unsuitable for timing claims**. Production compute,
+acceptance, validity agreement, checkpoint ownership and graph inputs are
+unchanged; snapshot memory is reported separately from the production budget.
+
+The probe first runs six existing real-cache GPU cases: T1/L8 and T4/L8/L37,
+each eager and CUDA graph. Their numerical, lifecycle, rejection and rebind
+assertions pass. An independent CPU check validates the resulting 192 valid
+rounds, six intentionally invalid-acceptance rounds and 16 tensor fixtures.
+The original helper's final count check incorrectly expected 192 total rather
+than 198; that failed attempt is retained, and the original artifacts are
+verified without rerunning the GPU cases or changing their tolerances.
+
+The real-model client performs one warmup and one diagnostic batch at C1 and
+C4: ten continuation requests, each with 256 outputs. Inputs are the same
+frozen agentic continuation used in M20: 51,936 prompt tokens, 51,328 cached,
+608 new, temperature 0, seed 1 and ignore-EOS. Each batch starts with a cache
+flush and the matching frozen parent prime. All ten requests finish without
+preemption. Each batch's output-token multiset matches all 15 corresponding
+M20 L64 batches; this reproduces the current implementation, not the original
+baseline's numerical behavior or an AIME accuracy result.
+
+The ledger contains 313 rounds: five initial short-request rounds, four
+parent-prime rounds and 304 continuation rounds. HTTP completion can precede
+the overlapped commit recorder: each prime inherits the following stage
+marker, and each continuation batch has one unmarked trailing round. The
+client's completion snapshot reports 312 because the final trailing record
+arrives afterward. The original ledger and failed summary attempts remain
+intact. Reconciliation separates parents by their exact input endpoint and
+accepted count, then validates trailing slot/end/checkpoint continuity. It
+does not reset a failed transition or discard a continuation record.
+
+After that reconciliation, both repeats have the same history distribution:
+
+| Concurrency | Decode rounds | Mean history per live row | Rounds with a capacity flush | Aligned materializations, per group |
+| --- | --- | ---: | ---: | ---: |
+| 1 | 69 × B1 | 25.78 | 3 | 2 |
+| 4 | 70 × B4 + 13 × B2 | 27.54 | 7 | 4 |
+
+All recorded groups agree on history lengths and checkpoints. Across every
+continuation, the existing `h + 2*T > L` flush rule, accepted endpoint
+advancement and aligned materialization transitions validate. At B4,
+**61 of 70 rounds have mixed history lengths**; the average per-round maximum
+is 32.10, versus a per-row mean of 27.06. About 45.7% of B4 row observations
+have history below 24. This is the distribution a follow-up kernel experiment
+needs to cover; uniform histories and a best tile per fixture are insufficient.
+
+After stopping only the owned server and independently confirming both nodes
+idle, an offline GPU analysis processes all 18 saved tensor fixtures: four
+parent-prime and 14 continuation snapshots, including empty, mixed and
+near-flush histories. It uses the original verify and batched accepted-replay
+primitives, whose source hash matches the frozen baseline. Both start from
+the same independently reconstructed FP32 state. A separate CPU pass checks
+all 18 snapshots against the unchanged sequential reference: output and conv
+use `atol=2e-5, rtol=2e-4 + BF16_eps/2`; FP32 candidate fields use
+`atol=2e-5, rtol=2e-4`. All pass. An initial fixture/ledger equality check
+mistakenly included the filename added only after tensor serialization;
+its failure is retained and corrected by validating that filename separately.
+
+The same-input comparison isolates a local numerical boundary:
+
+- Original verify versus buffered recurrence, with a common start state and
+  common BF16 producers, differs in only 22 of 245,760 BF16 output elements;
+  maximum absolute difference is `3.82e-6`.
+- Starting buffered recurrence from the independent reconstructed state versus
+  the captured output differs in 10 elements, with maximum `1.91e-6`.
+- Original accepted replay versus buffered accepted history has a maximum
+  state difference of `2.05e-3`, with relative L2 errors `2.01e-4`–`6.21e-4`.
+  Original replay computes conv and gate in FP32; buffered history consumes
+  the BF16 conv/gate used for verification.
+- An independent FP32-conv/FP32-gate recurrence matches original replay's
+  state within `2.39e-7` maximum absolute error. The BF16-producer recurrence
+  matches buffered history within `7.16e-7`. Convolution rounding contributes
+  more than gate rounding in these fixtures; both effects are retained in
+  the four-way producer comparison.
+
+This accounts for most of the **sampled layer's local state difference**. It
+does not establish all-layer/rank parity, explain EAGLE3 acceptance causally,
+or justify changing verification producers. The one-layer original descriptor
+call is a numerical diagnostic, not its production all-layer launch geometry.
+Raw fixtures include model-derived tensors and stay in local artifacts.
+
+The local M23 runbook retains source hashes, environment and input provenance,
+all helper versions/failures, request responses, history ledgers, tensor
+fixtures and analysis commands. No serving implementation is promoted, and
+there is no new unprofiled performance result, NSYS report or AIME score.
+The next kernel experiment should use recorded mixed histories and a rotating
+cross-layer working set, keeping producer precision as a separate controlled
+question. Any candidate still needs unchanged reference/regression gates and
+the original full-model EAGLE3 comparison before adoption.
