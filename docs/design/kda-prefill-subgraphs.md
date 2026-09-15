@@ -42,7 +42,13 @@ metadata. Startup uses only placeholder state pages.
 
 `--prefill-graph-capture-batch-sizes 1 2` captures exact request counts one
 and two. It is independent of the decode batch ladder. The token capacities
-still come from `--prefill-graph-capture-sizes`. When the request-count option
+still come from `--prefill-graph-capture-token-sizes`. These are total input
+tokens per forward, summed across requests and excluding cached prefixes;
+shorter inputs are padded. The old `--prefill-graph-capture-sizes` spelling
+remains a compatibility alias, but using both spellings is an error.
+Both map to the existing `prefill_graph_capture_sizes` configuration field.
+Capture request counts are exact BS values, not maximum capacities, and do not
+replace the scheduler's `--max-num-seqs` limit. When the request-count option
 is unset, each token bucket uses the minimum number of requests needed to fit
 within the model context. Capture balances tokens across those requests;
 it never inserts empty sequences. A configured count that cannot fill a
@@ -72,7 +78,7 @@ speedup still need controlled measurements.
 Set `TOKENSPEED_KDA_PREFILL_GRAPH=1` with the `cutedsl_kda` backend and
 prefill CUDA graphs enabled. The default is off. The cache uses the padded
 token extent chosen by the outer prefill graph, following
-`--prefill-graph-capture-sizes` or the default outer bucket ladder.
+`--prefill-graph-capture-token-sizes` or the default outer bucket ladder.
 There is no separate KDA size list or schedule-count limit. Schedules are
 created lazily for each encountered bucket, sequence count, stream and PDL
 setting. Configuring more buckets can increase capture time and memory use;

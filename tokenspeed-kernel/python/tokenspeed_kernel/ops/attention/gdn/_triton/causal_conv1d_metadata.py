@@ -86,7 +86,12 @@ def refresh_causal_conv1d_capacity_metadata(query_start_loc, metadata, token_cap
 
 @dataclass(frozen=True)
 class CausalConv1dPrefillMetadata:
-    """Read-only program-to-request and program-to-chunk maps for one forward."""
+    """Program-to-request/chunk maps, read-only while layers consume them.
+
+    Ordinary maps belong to one forward. Capacity maps belong to the graph
+    owner and are refreshed in consumer-stream order before the next replay.
+    Frozen fields prevent rebinding, not mutation of the tensors' contents.
+    """
 
     batch_indices: torch.Tensor
     chunk_offsets: torch.Tensor

@@ -68,7 +68,7 @@ def cutedsl_kda_supports_prepared_plan() -> bool:
     )
 
 
-def cutedsl_kda_forward_prepared(
+def cutedsl_kda_forward_with_prepared_plan(
     q,
     k,
     v,
@@ -86,12 +86,16 @@ def cutedsl_kda_forward_prepared(
 ):
     """Launch the same native scan with an explicit device-built chunk plan.
 
-    Inputs follow the public token-major forward ABI. cu_chunks is an int32
+    The caller provides Q/K/V/beta in the native token-major layout, FP32 gate
+    and live boundaries. cu_chunks is an int32
     prefix sum per sequence; chunk_to_seq has ceil(token_capacity / 16) + N - 1
     entries. Extra chunks map to the last sequence and are rejected by native
     live-bound checks. The caller initializes these buffers on the consumer
-    stream. Scratch and outputs belong to this invocation (or its graph pool).
-    Returns output and final state. No process-global planner is replaced.
+    stream. This entry still asks the native host to choose a route, obtains
+    or allocates workspace, and allocates output and final state. It is not
+    a fully preallocated entry, and a prepared plan does not imply a captured
+    CUDA graph. Scratch and outputs belong to this invocation (or its graph
+    pool). Returns output and final state. No process-global planner is replaced.
     """
     import torch
     from tokenspeed_cutedsl_kda import kda_host as host

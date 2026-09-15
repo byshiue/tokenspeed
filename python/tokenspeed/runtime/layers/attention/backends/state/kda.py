@@ -58,14 +58,14 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     BreakableCapture,
     current_valid_rows,
 )
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    MambaAttnBackend,
-    logger,
-)
-from tokenspeed.runtime.layers.attention.backends.state.prefill_graph import (
+from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_graph import (
     KdaOuterGraphBinding,
     KdaPrefillGraphCache,
     KdaPrefillGraphMetadata,
+)
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+    MambaAttnBackend,
+    logger,
 )
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
@@ -151,6 +151,8 @@ class KdaAttnBackend(MambaAttnBackend):
         super().init_prefill_graph_state(max_num_tokens, max_bs)
 
     def prepare_prefill_graph_bindings(self, bucket: int) -> list:
+        # The startup feature switch enables this optimization; bind() sets the
+        # temporary inline execution state only while stable metadata is active.
         if (
             self._prefill_graph_enabled
             and self.kda_backend == "cutedsl_kda"
@@ -195,6 +197,10 @@ class KdaAttnBackend(MambaAttnBackend):
             rows = torch.arange(output.shape[0], device=output.device)
             padding = rows >= self.forward_metadata.query_start_loc[-1]
             return output.masked_fill_(padding.view(-1, *([1] * (output.ndim - 1))), 0)
+        # Only a pure EXTEND break during outer replay may try the separate
+        # CuTeDSL cache, never during capture. Otherwise use the same forward.
+        # Admission here still allows cache fallback for checkpoints, changed
+        # signatures or the first warmup call.
         if not (
             self._prefill_graph_enabled
             and self.kda_backend == "cutedsl_kda"
@@ -999,22 +1005,20 @@ class KdaAttnBackend(MambaAttnBackend):
         inputs_packed: bool,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run only the real-token prefix through the KDA prefill kernel.
+        """Run an exact-length or fixed-capacity KDA scan with live boundaries.
 
-        FlashKDA sizes its output from the input shape but tiles from
-        ``cu_seqlens``: bucket-padded inputs would leave the output tail
-        unwritten and feed padding into its final full-tile loads. The graph
-        handoff clears and restores the bucket tail afterward.
+        Ordinary metadata slices inputs to the real-token prefix. Capacity
+        metadata retains the physical packed extent; GPU boundaries determine
+        live work, so that extent is not a live-token count. The adapter clears
+        inputs before full-tile loads; inline output padding is cleared by the
+        in-graph gather or scrub. Only an ordinary break uses the handoff copy.
 
-        ``cu_seqlens_cpu`` is the metadata-built host int64 copy of
-        ``query_start_loc``'s contents (``init_forward_metadata`` constructs
-        and validates it once per extend batch, mirroring MHA's
-        ``cu_extend_seq_lens_cpu``). It is REQUIRED by the kda_paged_prefill
-        op: every solution plans its chunk indices from it on the host —
-        otherwise the boundary read recurs as a stream-synchronizing D2H on
-        every KDA layer of every prefill chunk, stalling the launch thread
-        behind all queued GPU work (which serializes the chunk pipeline's
-        stages).
+        ``cu_seqlens_cpu`` is the required metadata-built int64 mirror of
+        ``query_start_loc``. It supplies exact-length host planning and
+        capacity admission without a per-layer synchronizing D2H. The prepared
+        capacity path builds its chunk plan on device instead of on the host.
+        ``inputs_packed`` carries the producer promise defined by the kernel
+        facade; being inside a graph alone does not establish that promise.
         """
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]

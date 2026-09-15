@@ -68,6 +68,7 @@ def test_conv_capacity_refresh_masks_history_loads():
         chunk_offsets=torch.empty(19, dtype=torch.int32, device="cuda"),
         block_m=8,
     )
+    # Zero length tests the conv map builder only, not KDA/native scan admission.
     for lengths in ([1, 1, 1, 125], [125, 1, 1, 1], [0, 8, 9, 16]):
         bounds = torch.tensor(
             [0] + torch.tensor(lengths).cumsum(0).tolist(), device="cuda"

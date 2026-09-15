@@ -97,6 +97,11 @@ def prepare_capacity_scan(q, k, v, gate, beta, boundaries, inputs_packed: bool):
     inputs_packed is an explicit producer promise: the checkpoint packer
     already materialized contiguous Q/K/V/beta and zeroed capacity padding.
     The false case copies/scrubs every input. Neither case mutates its inputs.
+
+    Returns (q, k, v, gate, beta, cu_chunks, chunk_to_seq). Gate is FP32 and
+    both plan tensors are int32. With inputs_packed, Q/K/V/beta alias the inputs;
+    gate and the device plan are still produced here. The native
+    cutedsl_kda_forward_with_prepared_plan adapter defines the chunk bounds.
     """
     _, tokens, heads, dim = q.shape
     sequences = boundaries.numel() - 1

@@ -25,14 +25,14 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    MambaForwardMetadata,
-)
-from tokenspeed.runtime.layers.attention.backends.state.prefill_graph import (
+from tokenspeed.runtime.layers.attention.backends.state.kda_prefill_graph import (
     KdaOuterGraphBinding,
     KdaPrefillGraphCache,
     _checkpoint_slot_batch,
     _clone_metadata,
+)
+from tokenspeed.runtime.layers.attention.backends.state.mamba import (
+    MambaForwardMetadata,
 )
 
 
@@ -631,7 +631,7 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
 )
 def test_inline_capture_request_counts(sizes, bucket, expected):
     from tokenspeed.runtime.execution.prefill_graph import (
-        get_prefill_capture_batch_sizes,
+        resolve_prefill_capture_batch_sizes,
     )
 
     config = SimpleNamespace(
@@ -640,11 +640,11 @@ def test_inline_capture_request_counts(sizes, bucket, expected):
         data_parallel_size=2,
         prefill_graph_capture_batch_sizes=sizes,
     )
-    assert get_prefill_capture_batch_sizes(config, bucket) == expected
+    assert resolve_prefill_capture_batch_sizes(config, token_bucket=bucket) == expected
     for invalid in [[0], [-1], [5]]:
         config.prefill_graph_capture_batch_sizes = invalid
         with pytest.raises(ValueError, match="capture batch sizes"):
-            get_prefill_capture_batch_sizes(config, bucket)
+            resolve_prefill_capture_batch_sizes(config, token_bucket=bucket)
 
 
 def test_outer_capture_records_one_variant_per_configured_request_count():

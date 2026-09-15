@@ -219,6 +219,8 @@ class HybridLinearAttnBackend(AttentionBackend):
 
     @break_point
     def _forward_break(self, *args, **kwargs):
+        # Keep the outer graph boundary and host transfer callbacks here;
+        # _forward is shared by this route and inline attention capture.
         return self._forward(*args, **kwargs)
 
     def _forward(
@@ -234,7 +236,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         record_kv_cache,
         **kwargs,
     ):
-        """Dispatch one layer to its full-attention or GDN backend (the break point).
+        """Dispatch shared compute to the layer's full- or state-attention backend.
 
         The ordinary route carries its own ``@break_point``;
         the frozen capture-time scalars (forward_mode/bs) are re-read from the

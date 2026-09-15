@@ -653,6 +653,11 @@ def merge_prefill_checkpoint_outputs(
 ) -> torch.Tensor:
     """Restore packed body/tail outputs to original token order.
 
+    Without a CUDA inverse map, zero-initialize and scatter each scan's output.
+    With one, a single gather writes the full output, including zero padding.
+    The caller guarantees valid indices are in range. This copies token outputs,
+    not checkpoint state.
+
     Args:
         body: Body scan output, with dense or strided feature dimensions.
         tail: Tail scan output with the same feature geometry as body.
@@ -780,12 +785,15 @@ def write_prefill_recurrent_checkpoints(
     checkpoint_blocks: torch.Tensor,
     rows: torch.Tensor,
 ) -> None:
-    """Scatter packed recurrent checkpoint states into the state pool.
+    """Scatter packed recurrent states into a pool or temporary state tensor.
 
     Args:
-        checkpoint_state: Dense scan results, one state per selected row.
-        ssm_states: Dense recurrent-state pool, updated in place.
-        checkpoint_blocks: Per-request checkpoint destination ids; negative
+        checkpoint_state: Scan results, one state per selected row; strides
+            determine the state layout.
+        ssm_states: Recurrent-state destination, updated in place. May also be
+            temporary body final states receiving the active tail states.
+        checkpoint_blocks: Per-request destination indices into ``ssm_states``;
+            these are pool block IDs or temporary state row numbers. Negative
             destinations skip the write. Destination zero is valid.
         rows: Request rows corresponding to ``checkpoint_state``; negative
             rows skip the write without reading a destination.

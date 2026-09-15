@@ -205,7 +205,11 @@ def test_capacity_compatibility_fallback(native_cuda, monkeypatch):
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("capacity", [256, 2048, 8192])
 def test_capacity_preparation_dynamic_replay(native_cuda, sequences, packed, capacity):
-    """Refresh live bounds without recapture, including poisoned padding."""
+    """Isolate device-plan replay with new GPU bounds and poisoned padding.
+
+    The captured call does not rerun Python admission against its CPU mirror.
+    Production runtime must refresh both mirrors before replay.
+    """
     assert cutedsl_op.cutedsl_kda_supports_prepared_plan()
     lengths = [capacity // sequences] * sequences
     inputs, state, bounds, cpu = _inputs("cuda", lengths)

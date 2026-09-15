@@ -121,6 +121,7 @@ def test_multi_value_capture_sizes_route_to_engine():
     for flag in (
         "--cudagraph-capture-sizes",
         "--prefill-graph-capture-sizes",
+        "--prefill-graph-capture-token-sizes",
         "--prefill-graph-capture-batch-sizes",
     ):
         r = _split([flag, "288", "320", "--dp-sampling"])

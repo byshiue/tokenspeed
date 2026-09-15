@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Opt-in capacity-based KDA graph cache for breakable-prefill experiments."""
+"""KDA capacity metadata for inline outer capture and separate subgraphs."""
 
 import logging
 from contextlib import contextmanager
@@ -53,6 +53,16 @@ class KdaPrefillGraphMetadata(MambaForwardMetadata):
 
 @dataclass(frozen=True)
 class _CheckpointCapacityBatch(_PrefillCheckpointBatch):
+    """Fixed execution slots, not additional scheduler requests or state blocks.
+
+    ``rows`` and ``body_rows`` map request rows, never cache block IDs.
+    Negative ``tail_state_rows`` keep a dummy tail from replacing body state.
+    ``output_token_sources`` maps original output rows into concatenated
+    body/tail storage; the tail base is the body capacity, not its live length.
+    ``packed_capacity`` is the restored outer output capacity, not the sum of
+    the two scan allocations.
+    """
+
     packed_capacity: int
     tail_state_rows: torch.Tensor
     output_token_sources: torch.Tensor
@@ -168,6 +178,12 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
 
 
 def _refresh_checkpoint_destinations(target, source):
+    """Refresh existing destination buffers and mask inactive checkpoint slots.
+
+    No live checkpoints clears all destinations, preventing prior page IDs
+    from leaking into this replay. State-group keys, shapes and dtypes must
+    match; incompatible storage raises rather than rebinding captured tensors.
+    """
     old = target.state_checkpoint_blocks_by_group
     new = source.state_checkpoint_blocks_by_group
     if new is not None and old.keys() != new.keys():
@@ -184,6 +200,12 @@ def _refresh_checkpoint_destinations(target, source):
 
 
 def _capacity_metadata(source, bucket, tail_capacity):
+    """Create an isolated execution snapshot without allocating request state.
+
+    ``tail_capacity=None`` prepares a separate full-batch scan. A non-None
+    capacity also reserves fixed checkpoint/tail slots for inline capture.
+    The graph owner retains the snapshot and its stable device buffers.
+    """
     capacity = KdaPrefillCapacity(bucket, source.extend_seq_lens_cpu.numel())
     capacity.validate(source.cu_extend_seq_lens_cpu, bucket)
     cloned = _clone_metadata(source)
@@ -214,6 +236,11 @@ def _capacity_metadata(source, bucket, tail_capacity):
 
 
 def _clone_metadata(value):
+    """Clone tensors, dictionaries and dataclass fields recursively.
+
+    Other values are retained as-is, not deep-copied. New mutable field types
+    need an isolation review before they can be shared by these snapshots.
+    """
     if isinstance(value, torch.Tensor):
         return value.clone()
     if isinstance(value, dict):
@@ -230,6 +257,12 @@ def _clone_metadata(value):
 
 
 def _argument_key(value):
+    """Match tensor address, shape, strides, dtype and device, or a scalar value.
+
+    Tensor contents may change at the same address. Live request boundaries
+    and page IDs belong in refreshed metadata, not untracked Python arguments.
+    Non-tensor arguments must equal their capture-time values.
+    """
     if isinstance(value, torch.Tensor):
         return (
             value.data_ptr(),
@@ -261,7 +294,11 @@ class KdaOuterGraphBinding:
         self.metadata = _capacity_metadata(source, bucket, tail_capacity)
 
     def compatible(self, ctx):
-        """Return whether the live context matches this captured request geometry."""
+        """Check pool, transfer, forward mode and exact request-count matching.
+
+        Length, tail-capacity and state-group checks still run during refresh
+        and may raise. Passing this predicate is not full geometry validation.
+        """
         source = self.backend.forward_metadata
         return (
             self.backend.cache_pool is self.pool
@@ -275,7 +312,12 @@ class KdaOuterGraphBinding:
 
     @contextmanager
     def bind(self, refresh: bool):
-        """Bind stable metadata, optionally refreshing it before live replay."""
+        """Temporarily bind the outer owner's stable metadata and inline flag.
+
+        Use ``refresh=False`` for warmup/capture and ``True`` for live replay.
+        Variants sharing the outer pool run serially. Exiting restores backend
+        references, but does not undo GPU work already queued on the stream.
+        """
         backend = self.backend
         source = backend.forward_metadata
         previous_inline = backend.prefill_graph_inline
@@ -291,6 +333,14 @@ class KdaOuterGraphBinding:
 
 
 def _refresh_capacity_metadata(target, source):
+    """Refresh target contents at stable addresses without modifying source.
+
+    Run once before all consuming layers, in consumer-stream order; do not
+    overlap a refresh with replay using the same buffers. Checkpoint maps are
+    rebuilt on CPU and uploaded through temporary packed storage before being
+    copied into the target. In-place refresh is not allocation-free or H2D-free.
+    State-group geometry changes raise instead of replacing bound storage.
+    """
     target.capacity.validate(
         source.cu_extend_seq_lens_cpu, target.capacity.token_capacity
     )
@@ -351,6 +401,14 @@ class KdaPrefillGraphCache:
         self._capture_resources = {}
 
     def run(self, backend, layer_id, bucket, arguments, forward):
+        """Warm, capture or replay one layer under a capacity schedule.
+
+        Schedules match sequence count, token bucket, stream and PDL; each layer
+        also matches the argument signature described by ``_argument_key``.
+        A new forward must supply a new source metadata object: object identity,
+        not tensor contents, triggers the once-per-forward metadata refresh.
+        Consume the returned output before the next call reuses its graph pool.
+        """
         source = backend.forward_metadata
         # Body/tail scans have different packed extents and checkpoint indices.
         # A full-batch capacity graph cannot replay that metadata contract.

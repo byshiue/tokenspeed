@@ -675,8 +675,10 @@ with another layout; the wrapper must not round-trip native state through
 FLA's `[N, H, K, V]` convention. Direct wrapper callers use the native
 layout for both initial and final state. Exact-length gate conversion to FP32
 and beta packing retain their ordinary PyTorch operations. The native wrapper
-allocates the scan output; breakable graph replay copies it into the graph-owned stable
-handoff buffer. No output-buffer extension to the native wrapper is required.
+allocates the scan output. Ordinary attention breaks copy it into a stable
+graph-owned handoff buffer; inline KDA keeps output restoration and padding
+cleanup inside the graph, without that handoff copy. No output-buffer
+extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
 
@@ -706,7 +708,9 @@ release and recapture remain the orchestrator's responsibility.
 
 Internal-checkpoint forwards have a merged capture with two scan capacities.
 Stable body/tail token maps use negative indices for inactive rows; packing
-zeros those rows and output scattering ignores them. Each scan consumes its
+zeros those rows, and inverse-map gathering restores live output order while
+zeroing output padding. Compact batches without an inverse map use scatter.
+Each scan consumes its
 own live GPU boundaries and CPU mirror. Checkpoint writes retain the eager
 ordering: convolution snapshots precede convolution updates, and recurrent
 snapshots precede the tail scan. The graph binds scheduler-owned checkpoint

@@ -10,6 +10,9 @@ so capture and replay take the same code path.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -20,6 +23,106 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+
+class PrefillCaptureArgsTest(unittest.TestCase):
+    def setUp(self):
+        from tokenspeed.runtime.utils.server_args import ServerArgs
+
+        self.parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(self.parser)
+
+    def test_token_aliases_share_config_and_capture_selection(self):
+        from tokenspeed.cli._argsplit import split_argv
+        from tokenspeed.runtime.execution.prefill_graph import (
+            PrefillGraph,
+            get_prefill_token_buckets,
+            resolve_prefill_capture_batch_sizes,
+        )
+
+        configurations = []
+        for flag in (
+            "--prefill-graph-capture-token-sizes",
+            "--prefill-graph-capture-sizes",
+        ):
+            argv = [
+                "--model",
+                "test",
+                flag,
+                "1024",
+                "2048",
+                "4096",
+                "--prefill-graph-capture-batch-sizes",
+                "2",
+                "1",
+                "2",
+            ]
+            direct = self.parser.parse_args(argv)
+            routed = self.parser.parse_args(split_argv(argv).engine)
+            self.assertEqual(vars(direct), vars(routed))
+            self.assertFalse(hasattr(direct, "prefill_graph_capture_token_sizes"))
+            self.assertEqual(direct.prefill_graph_capture_sizes, [1024, 2048, 4096])
+            config = SimpleNamespace(**vars(direct))
+            config.prefill_graph_max_tokens = config.chunked_prefill_size = 4096
+            config.context_len = 4096
+            config.max_num_seqs = 8
+            config.data_parallel_size = 1
+            buckets = get_prefill_token_buckets(config)
+            combinations = [
+                (bucket, bs)
+                for bucket in buckets
+                for bs in resolve_prefill_capture_batch_sizes(config, bucket)
+            ]
+            self.assertEqual(
+                combinations,
+                [
+                    (1024, 1),
+                    (1024, 2),
+                    (2048, 1),
+                    (2048, 2),
+                    (4096, 1),
+                    (4096, 2),
+                ],
+            )
+            owner = PrefillGraph.__new__(PrefillGraph)
+            owner.capture_buckets = buckets
+            self.assertEqual((owner._padded_bucket(868 + 869), 2), (2048, 2))
+            self.assertIsNone(owner._padded_bucket(4097))
+            configurations.append((vars(direct), combinations))
+        self.assertEqual(*configurations)
+
+    def test_token_aliases_are_mutually_exclusive(self):
+        from tokenspeed.cli._argsplit import split_argv
+
+        flags = ("--prefill-graph-capture-token-sizes", "--prefill-graph-capture-sizes")
+        for first, second in (flags, flags[::-1]):
+            for value in ("1024", "2048"):
+                for inline_value in (False, True):
+                    args = (
+                        [first + "=1024", second + "=" + value]
+                        if inline_value
+                        else [first, "1024", second, value]
+                    )
+                    argv = ["--model", "test", *args]
+                    for routed in (argv, split_argv(argv).engine):
+                        with self.subTest(argv=routed):
+                            with contextlib.redirect_stderr(io.StringIO()) as error:
+                                with self.assertRaises(SystemExit) as raised:
+                                    self.parser.parse_args(routed)
+                            self.assertEqual(raised.exception.code, 2)
+                            self.assertIn("not allowed with argument", error.getvalue())
+                            self.assertIn(first, error.getvalue())
+                            self.assertIn(second, error.getvalue())
+
+    def test_defaults_and_help_keep_token_and_request_units_separate(self):
+        args = self.parser.parse_args(["--model", "test"])
+        self.assertIsNone(args.prefill_graph_capture_sizes)
+        self.assertIsNone(args.prefill_graph_capture_batch_sizes)
+        help_text = " ".join(self.parser.format_help().split())
+        self.assertIn("Total input-token capacities per forward", help_text)
+        self.assertIn("not per-request sequence lengths", help_text)
+        self.assertIn("not maximum request capacities", help_text)
+        self.assertIn("Compatibility alias", help_text)
 
 
 def _spec(

@@ -51,7 +51,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.thirdparty.cutedsl_kda import (
-    cutedsl_kda_forward_prepared,
+    cutedsl_kda_forward_with_prepared_plan,
     cutedsl_kda_supports_prepared_plan,
 )
 
@@ -123,7 +123,7 @@ def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
             kwargs["cu_seqlens"],
             inputs_packed,
         )
-        out, state = cutedsl_kda_forward_prepared(
+        out, state = cutedsl_kda_forward_with_prepared_plan(
             q,
             k,
             v,

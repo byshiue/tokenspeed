@@ -123,7 +123,14 @@ def _packed_qkv_views(
 
 @dataclass(frozen=True)
 class _PrefillCheckpointBatch:
-    """The last internal prefix-boundary checkpoint of each eligible request."""
+    """Body/tail maps for each request's last internal prefix checkpoint.
+
+    ``body_rows`` selects request rows for the body; ``rows`` selects body
+    state for packed tails. Neither contains cache block IDs. Ordinary batches
+    pack only real tails; capacity metadata may add masked dummy slots.
+    ``state_update_rows`` maps tails back through ``body_rows``, with negative
+    rows preserving body final state.
+    """
 
     rows: torch.Tensor
     sequence_starts: torch.Tensor
@@ -1532,14 +1539,18 @@ class MambaAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return prefill outputs and final states, saving internal checkpoints.
 
-        Without an internal checkpoint, scan the full batch using its prepared
-        metadata. ``seq_len`` includes bucket padding; ``num_real_tokens`` does
-        not. Otherwise, the body batch contains every request. A row crossing
-        an internal cache boundary stops there; all other rows run to completion.
-        The second packed batch contains only the checkpointed rows' remaining
-        tails and starts from the body scan's final state. Together the two scans
-        cover every input token exactly once while materializing both the aligned
-        checkpoint state and the final continuation state.
+        Without checkpoint execution metadata, scan the full batch once.
+        Otherwise every request enters the body: crossing rows stop at their
+        checkpoint and other rows finish there. Compact batches pack only real
+        tails, initialized from body final state. Capacity batches reserve a
+        tail slot per request, including zero-input dummy tokens. A dummy scan
+        is not an identity update: its output, checkpoint destination and final
+        state writeback must all be masked. Each valid input token is computed
+        once while aligned checkpoints and final continuation states are kept.
+
+        ``seq_len`` is the physical input extent. ``num_real_tokens`` excludes
+        padding for ordinary metadata, but can be the packed storage extent for
+        capacity metadata; live GPU boundaries still govern scan work.
         """
         if checkpoint_blocks is None or checkpoint_batch is None:
             metadata = self.forward_metadata
@@ -1714,6 +1725,8 @@ class MambaAttnBackend(AttentionBackend):
             checkpoint_batch.token_extent,
             checkpoint_batch.output_sources,
         )
+        # Destinations here are temporary body_state row numbers, not persistent
+        # state-pool block IDs. Inactive tails leave the body's final state intact.
         write_prefill_recurrent_checkpoints(
             tail_state,
             body_state,
@@ -2456,16 +2469,17 @@ class MambaAttnBackend(AttentionBackend):
             f_b_weight: KDA second gate projection.
             beta_raw: KDA raw per-head beta logits.
             seq_len: Padded token extent of the batch.
-            num_real_tokens: Token extent excluding the graph padding tail.
+            num_real_tokens: Input extent to retain: live tokens for ordinary
+                metadata, packed storage capacity for capacity metadata.
             lower_bound: KDA decay clamp.
             inputs_packed: Checkpoint packer produced contiguous Q/K/V/beta
                 with zero padding. KDA can reuse them; GDN ignores this hint.
             cu_seqlens_cpu: Metadata-built host int64 copy of
                 ``query_start_loc``'s contents (see
                 ``MambaForwardMetadata.cu_extend_seq_lens_cpu``). The KDA
-                override forwards it so every prefill solution plans its
-                chunk indices on the host without a stream-synchronizing D2H
-                read; the GDN scan plans on device and ignores it.
+                override uses it for exact-length host planning or capacity
+                admission without a per-layer synchronizing D2H. Prepared KDA
+                plans are built on device; GDN plans on device and ignores it.
 
         Returns:
             ``(core_attn_out, last_recurrent_state)``.
