@@ -1773,3 +1773,135 @@ locations. This phase adds no AIME score or Nsight capture. The prepared
 cross-layer capacity-flush and broader-corpus experiments remain unexecuted;
 work is paused after this phase. Buffered replay remains opt-in, with no
 recommended default capacity.
+
+### M20: cross-layer capacity-flush feasibility
+
+Work resumes at `3ee2666f`, whose production kernels are unchanged from the
+frozen M19 source `324c796e`. This first experiment changes no production code,
+flush policy, state ownership or runtime placement. It runs on an idle GB300
+from the M19 allocation with the same cached software, not a model server.
+
+The comparison is 69 per-layer recurrences versus one existing cross-layer
+endpoint materialization followed by 69 recurrences with empty history only
+on the flushed rows. Both use the same pre-candidate endpoint and the existing
+`h + 2*T > L` rule. The fixture has three cache groups, 12 local heads,
+128-dimensional keys/values and T4; it tests L8/16/32/64, B1/B4, empty and
+flush rounds, plus mixed B4 rounds with padding. Two seeds give **40 numerical
+cases: all pass the existing tolerances, and 34 are bitwise equal** for output,
+full state and K/U/decay history. The six non-bitwise cases are retained; no
+tolerance changes or full-model accuracy claims accompany these results.
+
+For one seed, each of the 20 shapes uses CUDA-graph timings in
+per-layer/batched/batched/per-layer order: 16 calls per graph, 25 replays per
+event sample and five samples per variant. The measured total includes the
+materializer even in empty rounds. Relative to the bracketed per-layer timing:
+
+| History capacity | B1 flush | B4 all flush | B4 mixed |
+| --- | ---: | ---: | ---: |
+| 8 | −5.61% | +19.27% | +21.57% |
+| 16 | −27.81% | −2.55% | +14.61% |
+| 32 | −42.03% | −12.55% | +12.73% |
+| 64 | −56.30% | −22.25% | +10.39% |
+
+Empty rounds slow down by 0.17–1.03%. All inputs are ready before timing;
+the test excludes model compute, cache-load fences, acceptance, publication
+and terminal-request handling. The mixed-batch regressions rule out adopting
+this relocation as-is. The follow-up below separates those costs without
+changing the frozen source or moving any runtime operation.
+
+The local M20 runbook records the environment, source/script/result hashes,
+commands, complete shape results and independent idle checks. No new AIME
+score or Nsight capture is available. The original EAGLE3 no-regression gate
+remains unmet, and buffered replay remains opt-in without a default capacity.
+
+The follow-up isolates a launch-scheduling problem in the existing endpoint
+writer. Its flattened work order repeats the request/value-tile cycle. With
+B4 and four value tiles, the original 304-program stride is a multiple of that
+16-item cycle. When only row zero needs a write, just 76 programs ever visit
+selected work, each handling up to 44 tiles. A 303-program stride spreads the
+same 3,312 selected tiles across all 303 programs, with 8–12 tiles each. These
+are enumerated logical work counts, not measured GPU occupancy.
+
+A separate grid-size sweep preserves all state/output/history bits. Increasing
+the grid can recover mixed-row parallelism but increases empty-round launch
+cost. Smaller value tiles also fail to provide a general improvement: all 56
+configuration/shape checks pass the existing tolerance, but several lose
+bitwise equality or regress despite eliminating compiler-reported spills.
+Those negative results remain in the local artifact.
+
+The candidate instead reduces a persistent grid's program count until its
+stride is coprime to the request/value-tile cycle. It never exceeds the existing
+cap and leaves full grids unchanged. This is static shape arithmetic: it adds
+no GPU metadata, allocation, host readback or runtime branch on request flags.
+The FP32 reconstruction, flush policy, endpoint/stamp order and cache fences
+are unchanged. In particular, it does **not** install the experimental
+pre-forward cross-layer capacity flush used by the diagnostic fixture.
+
+A fresh 40-case sweep is bitwise equal to the original endpoint launch for
+all output, state and K/U/decay fields. Bracketed CUDA-graph endpoint timings
+for mixed B4 are:
+
+| Capacity | Original endpoint | Balanced endpoint | Change |
+| --- | ---: | ---: | ---: |
+| 8 | 222.233 us | 124.878 us | −43.81% |
+| 16 | 297.374 us | 88.764 us | −70.15% |
+| 32 | 465.896 us | 133.704 us | −71.30% |
+| 64 | 810.322 us | 223.505 us | −72.42% |
+
+The diagnostic's combined endpoint-plus-69-recurrence latency falls
+12.18–28.56% in those mixed cases. Empty endpoints remain about 1.3–1.5 us;
+their paired changes range from −0.123 to +0.122 us. L8 still regresses versus
+keeping capacity reconstruction inline, even after balancing, so this is not
+a blanket endorsement of moving flushes. Nor are these serving speedups.
+
+The actual workspace API, rather than the experimental launch override, passes
+38 further bitwise comparisons against frozen M19, including B2/B3/B8 and
+non-power-of-two capacity 17. The existing endpoint test now parameterizes
+one-program, balanced persistent and full grids against the same mixed-row
+oracle, with T1/T4, padding, rejected NaN candidates, implicit zero state and
+eager/graph execution. **109 kernel/reference tests** pass in 152.58s and
+**201 runtime tests plus 77 subtests** pass in 54.71s, with the same three
+optional/backend-specific skips. The exact all-files hooks pass again before
+the signed-off source commit **`ad28ea43`**, based on `3ee2666f`. The committed
+kernel and test hashes match the GPU-validated files.
+
+That source is frozen separately for a real NVFP4 TP8 EAGLE3 L64 run, followed
+by a fresh original-baseline restart on the same eight GPUs. Both retain the
+M19 graph/overlap and 75-request protocol, with no profiler attached. Both
+runs complete without request errors or preemption. Both-node startup checks
+confirm the graph/overlap settings; all eight candidate ranks select buffered
+recurrence. Hardware, software, native objects, model configuration and input
+protocol match the preceding cohort.
+
+All 30 measured batch output multisets match M19 L64, including multiplicities,
+and acceptance remains 3.75 at C1 and 3.405 at C4. The two original-baseline
+restarts also match all 30 output multisets. This validates the grid edit on
+this workload, not general accuracy or token equivalence to the original
+implementation.
+
+| Metric | Preceding original baseline | M19 L64 | M20 L64 | Following original baseline |
+| --- | ---: | ---: | ---: | ---: |
+| C1 median client latency | 1,060.345 ms | 1,068.392 ms | 1,070.813 ms | 1,059.107 ms |
+| C4 median client latency | 1,599.908 ms | 1,750.318 ms | 1,773.082 ms | 1,596.933 ms |
+| C4 median whole-batch latency | 1,611.606 ms | 1,842.901 ms | 1,848.242 ms | 1,605.830 ms |
+
+Against the preceding/following original baselines, M20 client latency is
+**0.99% / 1.11% higher at C1** and **10.82% / 11.03% higher at C4**.
+C4 whole-batch latency is 14.68% / 15.10% higher. Against M19 L64, this run is
+also slightly slower: **+0.23% at C1, +1.30% at C4**, and +0.29% for the
+whole C4 batch. Each restart has three timing rounds and 15 measured C4
+batches; its 60 C4 requests are not 60 independent batch trials. These are
+observed comparisons, not evidence that the stride change alone caused the
+model-level difference. No sample is replaced and no end-to-end benefit is
+claimed. **The original EAGLE3 no-regression gate remains unmet.**
+
+The controller validates and stops both owned server steps, then confirms both
+nodes idle. The final server needs a second idle probe while CUDA workers
+retire; both probes remain in the log. A separate report helper initially
+rejects that valid retry history, then is corrected to verify the final probe
+while retaining the earlier output. No model or timing run is repeated.
+The local M20 phase summary records the complete comparisons, source hashes,
+startup/output checks and cleanup evidence. There is no new AIME score,
+Nsight capture or broader-corpus result. The next diagnostic target is the
+remaining end-to-end cost; relocating capacity flushes still needs its cache
+fence and terminal-request contract resolved.

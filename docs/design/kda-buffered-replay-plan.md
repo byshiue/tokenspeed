@@ -12,8 +12,15 @@ tile 调整，并完成同条件 AIME：baseline 26/30，L16 官方 28/30、完�
 新一组 GPU 上，M18/M19 已完成 L32/L64 与多次 baseline 重启对照。M19 的
 静态 kernel tile 调优通过数值和回归测试，但相对前后两次 baseline，L32 的
 C1/C4 延迟仍增加 1.84–1.92% / 10.02–10.36%，L64 增加
-0.68–0.76% / 9.07–9.40%。本阶段结束后暂停；跨层 flush 合并、更多独立复测
-及更广的工作负载验证尚未执行，不能视为完整性能验收通过。
+0.68–0.76% / 9.07–9.40%。按用户指示恢复后，M20 的跨层 flush 隔离实验
+通过 40 个数值用例，但原有 endpoint writer 的 mixed C4 批次慢了
+10.39–21.57%。随后定位到 persistent grid 的 request-row 负载不均；调整静态
+stride 后，40 个对照用例保持 bitwise 一致，mixed C4 的独立 endpoint 延迟
+降低 43.81–72.42%。此改动仅优化现有 writer，不把容量 flush 移到其他执行位置；
+源码 `ad28ea43` 已通过数值和 runtime 回归，以及真实 TP8 工作负载的输出一致性
+检查。但相对前后两次原始 baseline，C1/C4 延迟仍增加 0.99–1.11% /
+10.82–11.03%；相对 M19 L64 本次观测也稍慢，性能验收未通过。容量 flush
+跨层合并仍未接入，后续需要定位端到端开销，不能把 kernel 收益等同于模型收益。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 
