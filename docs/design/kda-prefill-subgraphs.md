@@ -1,218 +1,165 @@
-# Capacity-based KDA prefill graphs
+# KDA prefill CUDA graphs
 
-KDA prefill launches many short kernels between the existing breakable graph
-segments. Replaying that attention region as a CUDA graph reduces host launch
-overhead while keeping the existing extend implementation.
+KDA prefill runs a sequence of short kernels for state preparation, convolution,
+gate projection, recurrent scanning and state writeback. Launching those kernels
+from Python at every layer can leave gaps between GPU operations, especially
+when an incremental request adds relatively few tokens to a cached conversation.
 
-## Implementation
+KDA prefill graphs reduce this host launch overhead by capturing KDA together
+with the surrounding model operations. Fixed-capacity buffers let a capture
+handle different input lengths: the graph keeps the same addresses and launch
+shapes, while metadata supplies the live request boundaries and state pages.
 
-### Merged outer capture
+The feature is opt-in and currently requires the `cutedsl_kda` backend. It uses
+the existing prefill computation and scheduler-owned checkpoints.
 
-Eligible KDA layers now capture directly inside the outer prefill graph,
-alongside their projections and post-attention operations. MLA remains an
-eager break. This removes the separate per-layer KDA graph launch and its
-output handoff copy. Padding is cleared inside the merged graph.
+## How it works
 
-The backend prepares stable capacity metadata before capture and refreshes
-live boundaries, convolution maps and state-page indices once before replay.
-The merged capture accepts any positive live length within its token bucket,
-with the same request count used at capture. The original outer graph remains
-available for mixed batches and uncaptured request counts. Layerwise PD transfer
-and data parallelism retain that original route.
+### Capture KDA with the surrounding model operations
 
-Each merged capture reserves one checkpoint/tail slot per request and records
-the same body scan, checkpoint write and tail scan used by eager prefill.
-The graph key is just `(token bucket, request count)`: changing the number or
-identity of checkpointed requests refreshes metadata, not the graph.
-The body reserves the outer bucket's capacity. Tail storage reserves
-`min(bucket, BS * max(1, prefix_granularity - 1))` tokens.
+The outer prefill graph captures the model in segments, with attention calls
+normally forming breaks between them. For eligible KDA batches, KDA runs inside
+those segments alongside its input projections, gated RMSNorm, output projection
+and neighboring model operations. Consecutive KDA layers can therefore share a
+segment. MLA attention calls still form breaks.
 
-A request without an internal checkpoint runs entirely in the body. Its tail
-slot contains one zero-input dummy token, keeping every native scan sequence
-positive-length. Negative token indices suppress that slot's output, negative
-checkpoint destinations suppress cache writes, and a negative state-update
-row preserves the body's final state. Dummy scan results are discarded, not
-assumed to be identity updates. This leaves native scan/GEMM arithmetic intact.
-The tradeoff is a fixed tail launch even when no request has a checkpoint.
+For a KDA layer that writes an internal checkpoint, the logical flow is:
 
-Replay refreshes both scans' boundaries and token maps, state-update rows and
-scheduler-owned checkpoint page IDs once before the first layer. The metadata
-refresh does not allocate request state or modify the scheduler's source
-metadata. Startup uses only placeholder state pages.
+```text
+Input projections
+  → KDA main: process new tokens up to the checkpoint boundary
+  → Preserve the boundary checkpoint
+  → KDA tail: continue from that boundary to the request's final state
+  → Restore token order, normalize and project the output
+```
 
-`--prefill-graph-capture-batch-sizes 1 2` captures exact request counts one
-and two. It is independent of the decode batch ladder. The token capacities
-still come from `--prefill-graph-capture-token-sizes`. These are total input
-tokens per forward, summed across requests and excluding cached prefixes;
-shorter inputs are padded. The old `--prefill-graph-capture-sizes` spelling
-remains a compatibility alias, but using both spellings is an error.
-Both map to the existing `prefill_graph_capture_sizes` configuration field.
-Capture request counts are exact BS values, not maximum capacities, and do not
-replace the scheduler's `--max-num-seqs` limit. When the request-count option
-is unset, each token bucket uses the minimum number of requests needed to fit
-within the model context. Capture balances tokens across those requests;
-it never inserts empty sequences. A configured count that cannot fill a
-particular token bucket within the context limit is skipped for that bucket.
+Main and tail are parts of the same outer capture, not separately selected
+graphs. This removes the per-layer KDA graph launch and the output handoff copy
+at the attention break.
 
-For example, two extends of 868 and 869 tokens with aligned cached prefixes
-use the 2048-token, two-request capture. Their bodies contain
-768 tokens each and their tails contain 100 and 101 tokens. The body reserves
-2048 tokens; the packed tail reserves at most 254 at prefix granularity 128.
-No-tail, one-tail and two-tail batches all reuse this capture, including when
-the checkpoint moves between request rows.
+Before replay, the backend refreshes request boundaries, convolution maps,
+token maps and state-page indices once for all KDA layers. The buffers retain
+their addresses; the scheduler remains responsible for cache allocation and
+checkpoint ownership. This refresh happens outside the graph and still includes
+CPU work and host-to-device copies.
 
-Request-count coverage is opt-in because it multiplies startup work.
-Configuring 1 and 2 creates two inline variants per token bucket, in addition
-to the ordinary graph. With eight token buckets this is 16 inline variants,
-down from 40 with exact checkpoint-count variants. Shared pools reuse scratch,
-but retained metadata and
-graph objects still cost memory; bucket count alone does not bound that cost.
+### Reuse captures across lengths and checkpoint patterns
 
-All capture variants belong to the outer graph owner and share its pool;
-they are never replayed concurrently. This adds capture work and retained
-metadata. The added cost relative to single-request capture and the full-model
-speedup still need controlled measurements.
+A merged capture is selected by two values:
 
-### Separate KDA graphs for the original outer capture
+- **Token capacity:** the total input tokens for one forward, summed across
+  requests. For pure prefill, this counts newly computed tokens and excludes
+  cached prefixes. The smallest configured bucket that fits is selected.
+- **Request count:** the exact batch size. A capture for two requests does not
+  pad a one-request batch into its second slot.
 
-Set `TOKENSPEED_KDA_PREFILL_GRAPH=1` with the `cutedsl_kda` backend and
-prefill CUDA graphs enabled. The default is off. The cache uses the padded
-token extent chosen by the outer prefill graph, following
-`--prefill-graph-capture-token-sizes` or the default outer bucket ladder.
-There is no separate KDA size list or schedule-count limit. Schedules are
-created lazily for each encountered bucket, sequence count, stream and PDL
-setting. Configuring more buckets can increase capture time and memory use;
-the eight-bucket measurements below do not quantify larger configurations.
+Each capture reserves one checkpoint/tail slot per request, so the number and
+identity of requests with checkpoints can change without another capture.
+The main scan reserves the outer token capacity. Tail storage is sized as
+`min(token_capacity, BS * max(1, prefix_granularity - 1))`.
 
-The first call warms native plans. The second captures the same callable and
-replays it once. Later calls refresh stable metadata buffers and replay.
-Changing tensor addresses, shapes, strides or scalar arguments uses the
-ordinary callable instead. Cache-pool rebinding releases the graph cache.
+For example, consider two requests with aligned cached prefixes that add
+868 and 869 tokens at checkpoint granularity 128:
 
-The new graph covers state staging, causal convolution, QKV splitting, the
-second gate projection, scan input preparation, KDA scan and state writeback.
-QKV projection, gated RMSNorm and output projection remain in their existing
-outer graph segments. Shared metadata refresh runs once per forward outside
-the new graph.
+| Stage | Request 1 | Request 2 | Combined live tokens | Reserved capacity |
+|---|---:|---:|---:|---:|
+| Full prefill | 868 | 869 | 1737 | 2048 |
+| KDA main | 768 | 768 | 1536 | 2048 |
+| KDA tail | 100 | 101 | 201 | 254 |
 
-`KdaPrefillCapacity` separates fixed launch capacity from live sequence
-boundaries. The facade validates the CPU length mirror; the CuTeDSL adapter
-uses capacity bounds for host planning while kernels consume live GPU bounds.
-Inactive convolution programs receive the padding sentinel. Scan input padding
-is cleared before native full-tile loads. Other backends retain exact-length
-planning. The native scan and GEMM arithmetic are unchanged.
+Both requests use the `(2048 tokens, BS 2)` capture. A two-request batch with
+zero, one or two internal checkpoints can reuse it, provided its live tokens
+fit the bucket.
 
-Layers on the same replay stream share a private graph pool. Different
-streams have separate pools, and the outer graph pool stays separate because
-its intermediates remain live across the attention break. See
-[the execution invariants](unified_path.md#experimental-kda-prefill-subgraphs).
+A request without an internal checkpoint runs entirely in main. Its tail slot
+contains a dummy token whose output and state writes are suppressed. This keeps
+the scan topology fixed and preserves main's final state. The tradeoff is that
+the captured tail scan still runs when no request needs a checkpoint. Padding
+never becomes a scheduler request or a persistent cache entry.
 
-## Measured performance
+## Enable the feature
 
-These measurements describe the earlier separate-KDA-graph implementation,
-not the merged outer capture described above.
+For a supported KDA model, add these settings to your serving command. Keep the
+model's other options, such as tensor parallelism and quantization, as usual:
 
-The comparison used the same source with the KDA graph switch OFF and ON:
-real 93-layer Kimi-K3 NVFP4 weights, TP8 on eight Blackwell GPUs in one NVLink
-domain, BF16 computation, FP8 KV cache, CuTeDSL KDA, CUDA graphs and overlap
-enabled. Timing runs did not use NSYS or per-request replay instrumentation.
-The serving environment used PyTorch 2.13.0+cu130 and InstantTensor 0.1.9.
+```bash
+TOKENSPEED_KDA_PREFILL_GRAPH=1 tokenspeed serve /path/to/model \
+  --kda-backend cutedsl_kda \
+  --chunked-prefill-size 4096 \
+  --prefill-graph-max-tokens 4096 \
+  --prefill-graph-capture-token-sizes 128 256 512 1024 2048 4096 \
+  --prefill-graph-capture-batch-sizes 1 2
+```
 
-The workload used public SWE-smith trajectories
-(`SWE-bench/SWE-smith-trajectories`) to build six serial conversations with
-eleven requests each. Two conversations warmed the model; four supplied
-44 measured requests, including four cold prompts and 40 incremental requests.
-Each request generated 500 tokens. Baseline input token IDs were frozen for
-ON. Cold prompts targeted 50,000 tokens; incremental prefill work ranged from
-681 to 6,714 tokens. The eight capacities were
-128, 256, 512, 768, 1024, 2048, 4096 and 8192.
+Prefill graphs must remain enabled: omit `--disable-prefill-graph` and
+`--enforce-eager`. Set `TOKENSPEED_KDA_PREFILL_GRAPH=0`, or leave it unset, to
+turn off KDA graph capture while retaining the ordinary prefill and decode
+graph settings.
 
-| Metric | OFF | ON | Reduction |
-|---|---:|---:|---:|
-| Incremental request prefill, median | 243.570 ms | 201.850 ms | 17.13% |
-| Incremental prefill, sum over 40 requests | 10.768 s | 9.148 s | 15.04% |
-| Cold-prompt prefill, median | 2453.700 ms | 2471.890 ms | -0.74% |
-| Client E2E, sum over 44 requests | 230.171 s | 229.422 s | 0.33% |
+### Choose token buckets and batch sizes
 
-Prefill time is the request's scheduled-to-prefill-complete interval and can
-include multiple forward steps. It is not a single kernel's duration.
-An OFF repeat measured a 244.000 ms incremental prefill median and a
-229.878 s E2E sum. The small E2E difference is not evidence of a stable
-end-to-end speedup: 500-token decoding dominates this workload.
+| Setting | Meaning |
+|---|---|
+| `--prefill-graph-max-tokens` | Largest captured token capacity. Defaults to `min(2048, chunked-prefill size)`; `0` disables prefill graphs. |
+| `--prefill-graph-capture-token-sizes` | Shared token buckets for outer and KDA captures. There is no separate KDA bucket list. |
+| `--prefill-graph-capture-batch-sizes` | Exact request counts captured with inline KDA. Independent of the decode graph's batch-size list. |
 
-Populating all eight capacities added 3.440 GiB of live Torch allocation per
-GPU. Graph-pool live allocation was 3.408 GiB and its reservation was
-3.723 GiB. These are overlapping accounting views, not additive costs.
-This measurement covers single-sequence serving; additional sequence counts
-or streams can consume more memory.
+The token limit is capped by the chunked-prefill size. An explicit bucket list
+is sorted and deduplicated; entries outside the positive range up to that limit
+are excluded, and the effective limit is always included. Without an explicit
+list, the runtime builds a relative-spacing ladder with a 16-token minimum step
+and a 512-token maximum step.
 
-## Validation
+If capture batch sizes are omitted, each token bucket uses the minimum request
+count needed to fit within the model context, usually one. Explicit counts must
+fit the scheduler's per-rank request limit. A count that cannot fill a bucket
+with positive-length requests within the model context is skipped for that
+bucket. This option does not change `--max-num-seqs` or force the scheduler to
+form batches of those sizes.
 
-For the merged capture, GPU regressions check that state-attention breaks
-disappear while full-attention breaks remain. They also check changing live
-lengths and page IDs, exactly-once state writes, metadata restoration, and
-fallback selection. A saved-real-activation check covered 18 complete KDA
-regions at live lengths 58, 76, 94, 1536, 3584 and 6656. Each region captured
-as one graph; 54 shared-pool replays in forward and reverse order matched
-eager outputs and convolution/recurrent states bit-for-bit on each of two
-GPUs. This is operator-level validation, not a new full-model benchmark.
+The old spelling `--prefill-graph-capture-sizes` remains an alias for
+`--prefill-graph-capture-token-sizes`. Use only one spelling in a command;
+specifying both is an error.
 
-Checkpoint regressions additionally replay an 837-token extend (768-token
-body plus 69-token tail), changing lengths within the same 1024-token bucket,
-fresh and resumed state, and different checkpoint/continuation pages. A
-two-request test moves the checkpoint between request rows. Each replay must
-match eager token outputs and the entire convolution/recurrent state pools
-bit-for-bit, with zero output padding. Padded pack/scatter tests also cover
-strided scan outputs and both KDA and GDN token-axis conventions.
+The example above creates **12 merged capture configurations**: six token
+buckets times two request counts, assuming each combination fits the model
+context and request limit. It also retains six ordinary outer configurations
+for fallback. A configuration may contain multiple graph segments, so these
+counts are not counts of individual CUDA graph objects or replay launches.
 
-Multi-request regressions exercise startup capture and selection for configured
-request counts, balanced placeholder batches, and zero, some or all requests
-with checkpoints. Native KDA tests compare valid outputs and whole state pools
-against eager for request counts 1, 2 and 4, including the 868+869 example.
-These are operator and graph-owner checks, not an AIME accuracy result.
+Choose buckets around the work your forwards actually perform. Sparse buckets
+reduce capture work but pad more tokens, including in projections and MoE
+operations captured by the outer graph. Denser buckets reduce padding at the
+cost of more capture time and retained memory. Additional request counts also
+increase capture work and storage. Shared graph pools reuse scratch, but graph
+objects, outputs and stable metadata remain resident per configuration.
 
-A full-model correctness check used real 93-layer Kimi-K3 NVFP4 weights,
-TP8 on eight Blackwell GPUs, CuTeDSL KDA, BF16 computation, FP8 KV cache and
-overlap. Paired inputs were constructed from a frozen SWE-smith trajectory:
-both requests shared 50,304 cached tokens, followed by extends of 868/869,
-868/768 or 768/896 tokens. Each request generated eight tokens.
-Two ordinary-graph passes, three merged-graph passes and two eager passes
-produced identical output tokens for all 42 generated sequences. Actual replay
-records on all eight ranks verified the two-request, two/one/zero-checkpoint
-variants; HTTP request count alone was not used as evidence of batching.
+## Coverage and fallback
 
-A further 16-sequence cold/warm check consumed the internal checkpoints from
-the 868/869 pair. Both requests then hit 51,072 cached tokens and extended only
-100/101 tokens. Outputs matched between cold and warm and between ordinary and
-merged graphs, including repeats. All-rank records verified the warm
-two-request, zero-checkpoint replay in the 256-token bucket.
+Merged KDA capture applies to pure prefill batches with a captured request count
+and a matching token bucket. Live lengths and checkpoint patterns can vary
+within that configuration.
 
-The paired requests were queued through the existing admission gate and
-released together to make batch size two reproducible. These runs used local
-path auditing, without NSYS. They establish correctness for the tested inputs,
-not benchmark latency, general batch-invariant generation or an AIME score.
+- Mixed prefill/decode batches and uncaptured request counts retain the
+  ordinary outer graph, with attention breaks.
+- Data parallelism and layerwise prefill/decode cache transfer retain the
+  ordinary outer route.
+- Forwards above the largest token bucket run eager. Requests with longer
+  prompts can still use graphs for individual scheduled chunks that fit.
+- Other KDA backends retain their existing execution behavior.
 
-The following larger validation runs were performed on the earlier separate
-subgraphs:
+Within an ordinary outer graph's pure-prefill attention break, the same switch
+can also enable a separate per-layer KDA subgraph. It uses the outer token
+bucket and captures lazily: the first eligible call warms the kernels, the
+second captures and replays, and later calls replay. It requires compatible
+tensor addresses, shapes, strides and scalar arguments, and does not support
+internal-checkpoint batches. Incompatible calls execute the existing eager
+attention callable; the surrounding outer segments remain graphed.
 
-Regression tests cover capacity admission, inactive convolution programs,
-metadata isolation, exactly-once cache writes, changed input addresses,
-replay across more than eight buckets, metadata restoration on failure, stream-local pool sharing
-and cache reinitialization.
+Ordinary outer capture and fully eager execution are different fallbacks:
+missing a merged KDA configuration does not by itself disable graphs for the
+rest of the model. Capture failures and invalid metadata are reported as errors,
+not silently treated as unsupported batches.
 
-GPU validation exercised 1,920 capacity cases across eight buckets and
-sequence counts 1, 2 and 4. Real-activation checks compared 414 native-scan
-cases and 414 complete KDA cases, including outputs and convolution/recurrent
-state. Shared-pool checks covered 828 reordered replays and 207 replays with
-different live lengths in the same bucket; these comparisons were bitwise equal.
-
-A separate full-model correctness run replayed all 66 frozen requests in
-OFF/OFF/ON/ON/OFF phases. All ten phase pairs matched all output tokens and
-cache/scheduling lengths. Startup health checks were retained, with a
-3600-second periodic health interval; logs confirmed no health request
-overlapped the 330-request window. Earlier runs with periodic health traffic
-showed output variation even within the same mode. This is controlled workflow
-parity, not general batch-invariant generation or a task-accuracy score.
-
-Separate NSYS captures verified graph replay on all eight ranks without new
-captures in the measured interval. Their timings are not used in the table.
+See [the execution invariants](unified_path.md#experimental-kda-prefill-subgraphs)
+for the metadata, padding and graph-pool lifetime contracts.
