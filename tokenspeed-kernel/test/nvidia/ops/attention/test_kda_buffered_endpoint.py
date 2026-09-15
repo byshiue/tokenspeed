@@ -28,6 +28,7 @@ if not torch.cuda.is_available():
     pytest.skip("requires a GPU", allow_module_level=True)
 
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_endpoint import (
+    _materialize_endpoints,
     materialize_endpoints,
     prepare_endpoint_commit,
 )
@@ -35,7 +36,10 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_endpoint import (
 
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("captured", [False, True])
-def test_endpoint_identity_zero_seed_rejection_and_graph(width, captured):
+@pytest.mark.parametrize("max_programs, expected_programs", [(1, 1), (8, 7), (36, 36)])
+def test_endpoint_identity_zero_seed_rejection_and_graph(
+    width, captured, max_programs, expected_programs, monkeypatch
+):
     torch.manual_seed(713)
     layers, groups, batch, heads, dim, cols, rows, grain, prefix = (
         3,
@@ -91,6 +95,17 @@ def test_endpoint_identity_zero_seed_rejection_and_graph(width, captured):
     ok = torch.ones((groups, batch), dtype=torch.bool, device="cuda")
     needed = torch.zeros_like(ok)
 
+    class CheckedLaunch:
+        def __getitem__(self, grid):
+            assert grid == (expected_programs,)
+            return _materialize_endpoints[grid]
+
+    # Exercise one-program, balanced persistent and full grids with the same
+    # mixed-row numerical oracle, including graph capture of an empty round.
+    monkeypatch.setitem(
+        materialize_endpoints.__globals__, "_materialize_endpoints", CheckedLaunch()
+    )
+
     def run():
         for group in range(groups):
             prepare_endpoint_commit(
@@ -124,7 +139,7 @@ def test_endpoint_identity_zero_seed_rejection_and_graph(width, captured):
             key_strides=hk[0].stride(),
             correction_strides=hu[0].stride(),
             decay_strides=hd[0].stride(),
-            max_programs=8,
+            max_programs=max_programs,
         )
 
     stream = torch.cuda.Stream()

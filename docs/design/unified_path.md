@@ -540,6 +540,11 @@ No additional state store is needed when the source is already exact. The
 per-group `materialized` flag records a required write, not its completion;
 stamp commit may consume it only after all layer stores finish. The caller's
 handoff mask grants neither writable ownership nor publication provenance.
+The endpoint writer keeps a bounded persistent grid for empty rounds. For
+multi-iteration grids, its static stride is coprime to the request/value-tile
+cycle, avoiding programs that repeatedly visit only inactive request rows.
+This depends only on batch/field geometry, never a host read of device flags;
+the operation sequence, reconstruction arithmetic and cache fences are unchanged.
 
 Quiescent endpoint materialization uses `materialize_current`: the caller
 supplies fresh tables and exact accepted endpoints for a live-only batch,

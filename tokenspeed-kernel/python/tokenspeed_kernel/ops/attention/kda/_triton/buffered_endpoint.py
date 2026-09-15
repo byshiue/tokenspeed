@@ -20,6 +20,8 @@
 
 """Accepted-endpoint materialization; no scheduler publication is issued here."""
 
+import math
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import _reconstruct_history
@@ -281,6 +283,8 @@ def materialize_endpoints(
     max_programs is a positive startup-fixed persistent-grid bound. Empty
     rounds return after checking live flags; active programs stride over all
     selected tiles without a host decision or a different graph.
+    Persistent grids use a stride coprime to the request/value-tile cycle so
+    programs are not pinned to inactive rows in a partially materialized batch.
 
     Preparation must validate the full history/state backing before data stores;
     prepare_endpoint_commit validates acceptance after all layer forwards, or
@@ -365,9 +369,17 @@ def materialize_endpoints(
     ):
         raise ValueError("positive endpoint field geometry required")
     if batch and layers:
-        _materialize_endpoints[
-            (min(max_programs, layers * heads * batch * triton.cdiv(value_dim, 32)),)
-        ](
+        row_period = batch * triton.cdiv(value_dim, 32)
+        total_work = layers * heads * row_period
+        programs = min(max_programs, total_work)
+        if programs < total_work:
+            # The flattened work order cycles through each row's value tiles.
+            # A common factor can keep programs on the same inactive rows for
+            # every iteration. Adjust only the static stride, within the cap;
+            # flags, arithmetic and grids with one tile per program are unchanged.
+            while math.gcd(programs, row_period) != 1:
+                programs -= 1
+        _materialize_endpoints[(programs,)](
             descriptors,
             groups,
             end,
