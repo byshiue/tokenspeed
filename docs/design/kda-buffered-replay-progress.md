@@ -2194,3 +2194,77 @@ The next kernel experiment should use recorded mixed histories and a rotating
 cross-layer working set, keeping producer precision as a separate controlled
 question. Any candidate still needs unchanged reference/regression gates and
 the original full-model EAGLE3 comparison before adoption.
+
+### M24: cache policies under recorded mixed-history patterns
+
+Production remains `ad28ea43`, with M23 recorded in `90253f7a`. This phase
+tests three unregistered kernel copies: evict-first checkpoint loads,
+evict-last K/U/D history loads, and their combination. A CPU source-contract
+test removes only those cache hints and the registration decorator, then
+compares the complete parsed source trees with production. All three match:
+no arithmetic, loop, tile, dtype, store, acceptance or flush-policy change.
+
+The experiment reuses the verified persistent M23 allocation. Both nodes are
+idle before GPU work; the original server step is confirmed absent. The
+eight-GB300 fabric and frozen source/dependency hashes pass the same preflight.
+Measurements run on one otherwise idle GB300 with the cached Python 3.12.3,
+PyTorch 2.13.0+cu130, CUDA 13, driver 580.167.08 and
+tokenspeed-triton 3.8.10.post20260906 environment, without Nsight injection.
+
+Unlike the earlier dense fixtures, the actual Kimi-K3 recipe and target
+config allocate the test arena. It contains 48 LCM parents and 69 KDA layers,
+with three state/history groups owning disjoint parent ranges. The arena is
+1,040,449,536 bytes. FP32 history strides are `(36864, 1536, 128, 1)`;
+state strides are `(221184, 16384, 128, 1)`, and raw table rows retain stride
+8193. Absolute checkpoints are rebased to `120 + original_checkpoint % 8`,
+preserving history-page alignment while ensuring every capacity flush writes
+a separate state slot. Timed graph replays cannot evolve their input state.
+
+Nine fixtures cover seven saved M23 continuation snapshots, a C1 empty-history
+row selected from a real B4 snapshot, and the recorded maximum-spread vector
+`[2, 2, 60, 60]`. The last uses replicated long-history snapshot values with
+the recorded lengths; it is not a capture of that complete model round.
+Each selected layer's values are copied into 69 independently owned layer
+fields. Comparing one warm layer with all 69 layers in rotation is a
+**recurrence-only cache-pressure proxy**, not a full model: it executes no
+MLA, draft, producer or accepted-commit kernels.
+
+All **18 fixture/working-set cases** pass independent FP32 output, candidate
+K/U/D and flush-state references at the unchanged tolerances. Each of the
+four implementations also matches the current kernel's complete byte arena
+and BF16 output bitwise, and input checkpoints remain unchanged. Those
+checks repeat after timing to detect unintended writes or evolving fixtures.
+
+Timings use CUDA graphs and balanced ordering:
+current/state/history/combined/combined/history/state/current. A warm-layer
+graph contains 16 calls; a rotating graph contains one 69-layer pass. Each
+has ten warmup replays, followed by five event-timed samples of 25 replays.
+Reported times are per recurrence call, including graph-internal launch gaps.
+
+The rotating working set makes long histories substantially more expensive:
+the current kernel's C1/history-60 time rises from 14.86 to 22.61 microseconds;
+the mixed `[2, 2, 60, 60]` case rises from 19.73 to 25.61 microseconds. The
+cache hints do not remove this cost. Checkpoint streaming helps the initial
+C4/history-4 rotating fixture by 7.09%, but slows C1 empty history by 3.15%.
+Keeping history resident slightly regresses the tested long-history rotating
+cases. Its compiled B2/B4 register count rises from 128 to 130, with no spills;
+this is a compiler observation, not proof of a particular occupancy bottleneck.
+Checkpoint streaming retains the current register counts.
+
+A follow-up tests checkpoint streaming over **all 70 recorded C4 history and
+within-page alignment patterns**, not just the favorable fixture. Values
+remain replicated from one saved long-history snapshot, and all 69 target
+layer fields rotate. Both kernels pass all 140 reference/bitwise checks.
+Using current/stream/stream/current ordering, the observed distribution's
+weighted mean changes from **17.2123 to 17.1376 microseconds per call**:
+only **0.434% faster**. Individual changes range from −6.704% to +0.136%;
+32 patterns improve, 37 regress and one is unchanged. This small isolated
+gain neither resolves nor replaces the original full-model EAGLE3 gate.
+
+**No cache-policy change is adopted.** The result rules out these load hints
+as a sufficient fix and supplies a reusable mixed-history/real-stride harness
+for investigating reconstruction compute and scheduling. Production source,
+producer precision and defaults are unchanged. The local M24 runbook retains
+commands, source and input hashes, complete timing samples, compiler records,
+validation results and both-node idle evidence. There is no new full-model
+performance result, NSYS report or AIME score.

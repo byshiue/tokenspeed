@@ -43,6 +43,11 @@ replay 的 FP32 conv/gate 与 buffered 的 BF16 producer 是这些快照中 stat
 快照，不用于性能验收，也没有新 AIME 分数。下一步以真实 mixed history 和
 跨层工作集验证 kernel 候选，单独追踪 producer 精度，不能直接推广均匀 history
 的测试收益或把局部数值接近当成完整模型正确性。
+M24 已用实际 cache recipe 的 strides/packing 完成 cache-hint 隔离实验，覆盖
+单层热缓存和 69 层轮换工作集。全部 reference 与 bitwise 对照通过；但在
+70 种实际 C4 history/alignment 模式上，checkpoint streaming 的加权 recurrence
+收益只有 0.43%，不构成完整模型性能达标，也未合入。下一步直接分析并优化
+重建 kernel 的计算/调度成本，保留现有精度、状态协议和完整模型验收门槛。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 
