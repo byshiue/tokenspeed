@@ -1586,3 +1586,32 @@ are retained in local artifacts. This is one server run per source; independent
 restart repeats, the remaining capacity sweep and broader workload coverage
 remain open. **The EAGLE3 no-regression gate still fails. Buffered replay stays
 opt-in, with no recommended default capacity.**
+
+### M18: new GPU cohort and remaining capacity checks
+
+Sources remain frozen at original `2e4b5407` and candidate `61e75080`; no
+production code changes accompany this validation. A new persistent allocation
+provides eight GB300 GPUs under the same resource binding. Both nodes pass
+the idle, common healthy/full NVLink fabric, source and dependency checks.
+This is a separate timing cohort, with graph sizes 1/2/3/4 throughout.
+
+Its first baseline completes the smoke and all **75 measured requests** plus
+six warmup batches, with no errors or preemption. C1 median client latency is
+**1,065.635 ms**, C4 **1,619.871 ms**; decode throughput is 287.5 and
+216.25 tokens/s, and acceptance is 3.59 and 3.67. C1 has one exact output
+sequence and C4 two; the smoke matches the earlier baseline cohort. These
+measurements are retained separately, not substituted into the M17 comparison.
+
+Before loading L32, the frozen recurrence test is invoked at that exact
+intermediate capacity: **12 combinations pass in 20.57s**, covering T1/T4,
+eager/graph and prepared/softplus/bounded inputs. The existing sequential
+reference, multi-round rejection/flush/padding/page-reuse checks and numerical
+tolerances are unchanged. This reuses the parameterized test function; it is
+not 12 new tracked test functions or a full-model accuracy result.
+
+The bounded follow-up sequence runs L32, L64 and a second independent baseline.
+Each case must complete smoke, source/worker ownership checks and all timing
+samples before the controller stops its exact owned server step. Both GPU
+nodes must be idle before the next model starts. Failures stop the sequence
+and retain partial artifacts; no retry or sample replacement is automatic.
+Those full-model capacity results and restart comparisons remain pending.
