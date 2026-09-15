@@ -42,6 +42,8 @@ M16 source commit: `38a396c8f5b0dc474ecda4ab624ec7789e0a3ad2`
 (`fix(cache): retain exact decode checkpoint publication evidence`).
 M17 source commit: `61e7508033cec8022b7f1052fdda27a3d0970dc4`
 (`perf(kda): tune small-batch capacity-16 recurrence tiles`).
+M19 source commit: `324c796ea8e10ae9bc7480b19a15043a99f97e47`
+(`perf(kda): tune guarded long-history recurrence tiles`).
 No default capacity or serving performance benefit has been established.
 M15 registers the GPU recurrence and adds an explicit experimental capacity;
 it is not a production-validated default. Eagle3 must run the new path without a performance regression
@@ -53,7 +55,7 @@ against the frozen baseline before the work meets its completion gate.
 | B. LCM ownership, retention and lifecycle contract | M2–M5 foundations; M9 metadata owner; M15 real scheduler/GPU prefix resume | L2/PD and arbitrary live-endpoint handoff need end-to-end validation/integration |
 | C. Unified GPU forward and commit | M12 decode, M14 mixed batches, M15 registration and explicit startup capacity | No default capacity or full-model acceptance yet |
 | D. Graphs, overlap and lifecycle integration | M10–M14 graph/pipeline checks and M15 prefix/finish/cancel/slot tests pass | Full-model overlap and recovery/transfer validation remain |
-| E. Real-model correctness and performance | Matched traces and full AIME complete: baseline 26/30; M17 L16 official 28/30, completed final answers 27/30; M16 generated-prefix reuse passes; M18 L32/L64 complete between two baseline restarts | All measured capacities still regress; candidate restart repeats and broader workload validation remain open |
+| E. Real-model correctness and performance | Matched traces and M17 L16 AIME complete: baseline 26/30; L16 official 28/30, completed final answers 27/30; M16 generated-prefix reuse passes; M18/M19 L32/L64 measurements include baseline restart checks | All measured capacities still regress; M19 AIME, further independent repeats and broader workload validation remain open |
 
 ## Recording a result
 
@@ -1666,7 +1668,9 @@ production code or default changes have been made for that experiment.
 
 ### M19: bounded launch tuning for longer histories
 
-Candidate based on `4f477bee` (uncommitted at this entry). The same GB300
+Source: `324c796e`, based on `4f477bee`; the tests below ran before the signed-off
+source commit, with unchanged kernel and test hashes. The required
+`pre-commit run --all-files` completed successfully. The same GB300
 allocation and software environment as M18 are used; the kernel experiment
 runs alone after both serving nodes pass an idle check. The frozen M17 source
 is the numerical and timing reference. No model weight, sampling parameter,
@@ -1710,5 +1714,62 @@ The full suites then pass: **101 kernel/reference tests** in 171.68s;
 optional/backend-specific skips; and **527 shared runtime tests plus 317
 subtests** in 48.82s. The GPU dispatch artifact's kernel hash matches the
 workspace source held unchanged during these tests. No tolerance was relaxed.
-New real-model measurements remain pending. These microbenchmarks do not
-establish an end-to-end speedup or a default capacity.
+These microbenchmarks alone do not establish an end-to-end speedup or a
+default capacity; the separate real-model results follow below.
+
+The new source is frozen separately from M17 before model startup. Serving
+uses the same eight GB300 GPUs, 93-layer real NVFP4 Kimi-K3, TP8, BF16
+activations, FP8 KV and four-token EAGLE3 verify as M18. Python 3.12.3,
+PyTorch 2.13.0/CUDA 13, driver 580.167.08, tokenspeed-triton 3.8.10,
+FlashInfer 0.6.18 and the cached model/draft revisions are unchanged. Decode
+graphs capture batch sizes 1/2/3/4; segmented prefill graphs and overlap are
+enabled, while graph padding is disabled. Attention breaks in the prefill
+graph still execute eagerly.
+
+The bounded model sequence is new L32, new L64, then another independent
+original-baseline restart. It uses the unchanged 75-request timing protocol
+above. Both candidate runs and the final baseline complete without request
+errors or preemption. Each candidate has one exact
+output sequence at C1 and two at C4. All 30 measured batch output multisets
+match the corresponding M17 capacity run, including multiplicities, and
+acceptance is unchanged. This checks the tile change on this workload; it is
+not token equivalence to the original implementation or a new AIME result.
+
+| Metric | Preceding original baseline | M19 L32 | M19 L64 |
+| --- | ---: | ---: | ---: |
+| C1 median client latency | 1,061.186 ms | 1,080.693 ms (+1.84%) | 1,068.392 ms (+0.68%) |
+| C4 median client latency | 1,604.796 ms | 1,765.626 ms (+10.02%) | 1,750.318 ms (+9.07%) |
+| C4 median whole-batch latency | 1,615.668 ms | 1,869.533 ms (+15.71%) | 1,842.901 ms (+14.06%) |
+
+Against the earlier M17 run at the same capacity, M19 L32 client medians
+decrease 0.89% at C1 and 1.89% at C4. L64 decreases 0.57% at C1 and 0.06%
+at C4; the latter is effectively unchanged, not evidence of a meaningful
+speedup. These are observed single-restart comparisons, with three timing
+rounds per restart, not confidence bounds for a general workload improvement.
+The following baseline provides a separate drift check: C1 median client
+latency is **1,060.345 ms**, C4 **1,599.908 ms**, and C4 whole-batch latency
+**1,611.606 ms**. Its 30 measured batch output multisets and acceptance match
+the preceding baseline. All seven completed cases in this GPU cohort pass
+the shared input/protocol, source/native, eight-GPU identity and startup-flag
+checks. All eight ranks select buffered recurrence in each candidate run.
+
+Against the following baseline, M19 L32 client latency increases
+**1.92% / 10.36%** at C1/C4 and L64 **0.76% / 9.40%**. C4 whole-batch latency
+increases **16.00% / 14.35%**, respectively. The comparisons against the
+preceding baseline remain in the table; neither baseline is pooled or replaced.
+**Neither candidate passes the overall EAGLE3 no-regression gate.** The tile
+change preserves this workload's earlier buffered outputs and acceptance,
+so it also leaves their difference from the original implementation intact.
+
+The final controller's post-stop idle probe times out after all measurements
+and result validation have finished. A separate read-only check confirms both
+GPU nodes are idle. The controller failure and successful cleanup recheck are
+both retained; no model, timing sample or output is rerun to resolve cleanup.
+
+The local `m19/phase-comparison.json` report keeps every baseline/candidate
+comparison, all output checks, tested source hashes and cleanup evidence.
+The adjacent runbook records exact environment, commands and raw artifact
+locations. This phase adds no AIME score or Nsight capture. The prepared
+cross-layer capacity-flush and broader-corpus experiments remain unexecuted;
+work is paused after this phase. Buffered replay remains opt-in, with no
+recommended default capacity.
