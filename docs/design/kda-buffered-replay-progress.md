@@ -1905,3 +1905,88 @@ startup/output checks and cleanup evidence. There is no new AIME score,
 Nsight capture or broader-corpus result. The next diagnostic target is the
 remaining end-to-end cost; relocating capacity flushes still needs its cache
 fence and terminal-request contract resolved.
+
+### M21: matched C4 timeline diagnosis
+
+This phase compares frozen original `2e4b5407` with M20's `ad28ea43`, capacity
+64. It changes no production code. Both run sequentially on the same new
+persistent eight-GB300 allocation, with the real full 93-layer NVFP4 model,
+TP8, BF16 activations, FP8 KV and four-token EAGLE3. The software, cached
+target/draft revisions, native objects, graph sizes 1/2/3/4, disabled graph
+padding, overlap and segmented prefill match the preceding model protocol.
+
+Each source has one C4 warmup and one captured C4 batch: 51,936 input tokens,
+51,328 cache hits, 608 new prefill tokens and 256 outputs per request. The
+same parent is primed separately before each batch, outside the capture.
+Both complete all four captured replies without errors or preemption.
+Their warmup/capture output-token multisets match; each capture also matches
+all 15 measured C4 batch output multisets from its corresponding M20 run.
+This confirms reproduction of the earlier workload, not token equivalence
+between implementations or a new L64 AIME result.
+
+The first hardware-traced original attempt stalls during prefill. Its partial
+reports, failed replies and host-stack diagnostics are retained separately;
+they cannot serve as a valid comparison. After scoped cleanup and independent
+idle checks, both completed runs use Nsight Systems 2025.6.3 with explicit
+software CUDA tracing, NVTX, graph-node tracing and profiler-API capture.
+No CPU sampling or context-switch collection is enabled. The profiler backend
+is the only protocol change; neither model source nor cached dependencies
+are modified to recover the capture.
+
+Every GPU has prefill batches of 1+1+2 requests. All decode forwards correlate
+to complete graphs with consistent node counts: original B4/B2 graphs have
+2,945/2,664 kernel nodes, buffered graphs 2,876/2,595. Stop-shutdown warnings
+are retained, while neither completed run reports incomplete CUPTI events.
+Both reports per source are exported and packaged with clear source/capacity
+and rank-group names, alongside a summary and checksums. Independent checks
+confirm both nodes idle after each run.
+
+| Captured metric | Original | Buffered L64 |
+| --- | ---: | ---: |
+| B4 decode graphs per GPU | 70 | 70 |
+| B2 decode graphs per GPU | 1 | 13 |
+| B4 graph median, rank 0 | 15.246 ms | 16.088 ms (+5.53%) |
+| B4 graph medians, all eight GPUs | 15.239–15.261 ms | 16.082–16.101 ms |
+| Median of per-graph KDA verify/recurrence launch medians, rank 0 B4 | 7.968 us | 17.872 us |
+| Median between-graph gap, rank 0 | 351.088 us | 335.360 us |
+| Decode GPU window, rank 0 | 1,109.538 ms | 1,356.424 ms (+22.25%) |
+
+Across ranks, the B4 graph median increases **5.44–5.61%**. The original
+acceptance lengths are 3.70/3.64/3.64/3.70; buffered lengths are
+3.70/3.11/3.70/3.11. Two buffered requests therefore keep the batch running
+for 12 additional B2 rounds. These are actual graph counts, not estimates
+from rounded acceptance. Rank 0's B4 graph spans total 1,070.091/1,131.418 ms
+and its B2 spans 13.204/181.524 ms. Different generated tokens also affect
+other model work, so the graph-span difference is not attributable solely
+to the recurrent kernel.
+
+The trace confirms that original accepted replay is already batched across
+all 69 KDA layers: one recurrent commit per round, median **136.352 us** on
+rank 0, outside the model graph. Removing it does not save 69 launches per
+round. Buffered endpoint materialization has 83 launches, median **1.664 us**
+and maximum **255.808 us**; its usual cost is small, while history
+reconstruction remains in every layer's recurrence. The captured metadata
+does not expose exact capacity-flush flags, so timing is not used to invent
+a flush count.
+
+The broad rank-0 CPU interval after result synchronization grows from
+8.080 to 575.504 us. It includes validation, bookkeeping and rank skew, and
+does not translate into a larger typical between-graph gap. One candidate
+gap reaches 16.289 ms and remains in the analysis. Neither dropping the
+cross-rank validity check nor moving its collective is justified by these
+timings. Likewise, overlapping kernel duration sums are not additive
+end-to-end costs.
+
+The next work targets history reconstruction and the numerical/acceptance
+difference. A reconstruction prototype must retain the state-and-output
+route, unified T1/T4 protocol, cache ownership and existing flush policy;
+compare it with the current implementation and independent references before
+any model performance claim. Batched capacity-flush relocation remains
+unimplemented and still needs its load-fence and terminal-request proofs.
+This phase adds no unprofiled timing result or AIME score. **The EAGLE3
+no-regression gate remains unmet; no default capacity is recommended.**
+
+The local M21 runbook records exact commands, source/environment provenance,
+all attempts, validation, graph samples, package hashes and cleanup evidence.
+Capture-helper tests pass all four cases; these are diagnostic-helper checks,
+not additional model-accuracy tests.

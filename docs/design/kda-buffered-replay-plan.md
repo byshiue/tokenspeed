@@ -20,7 +20,13 @@ stride 后，40 个对照用例保持 bitwise 一致，mixed C4 的独立 endpoi
 源码 `ad28ea43` 已通过数值和 runtime 回归，以及真实 TP8 工作负载的输出一致性
 检查。但相对前后两次原始 baseline，C1/C4 延迟仍增加 0.99–1.11% /
 10.82–11.03%；相对 M19 L64 本次观测也稍慢，性能验收未通过。容量 flush
-跨层合并仍未接入，后续需要定位端到端开销，不能把 kernel 收益等同于模型收益。
+跨层合并仍未接入，不能把 kernel 收益等同于模型收益。M21 已完成同条件 C4
+NSYS 对照：L64 的 B4 graph 中位数增加 5.44–5.61%，并比原实现多执行
+12 轮 B2 decode；相同输出预算下，两条较慢请求的 acceptance 从 3.64 降至
+3.11。每层 history recurrence 明显慢于原 verify，而通常的 graph 间隔没有
+变大。下一步优先降低 history reconstruction 成本，并追踪数值差异对
+acceptance 的影响；不能仅凭较长的 CPU validation 区间推断它是主要瓶颈。
+这些是带 profiler 的诊断结果，不替代 M20 的无 profiler 性能验收。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 
