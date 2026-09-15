@@ -117,10 +117,63 @@ def test_padded_checkpoint_pack_and_output_merge(device_name, token_dim):
             x.squeeze(0) for x in (body_out, tail_out, expected)
         )
     merged = merge_prefill_checkpoint_outputs(
-        body_out, tail_out, body_indices, tail_indices, token_dim, 9
+        body_out, tail_out, body_indices, tail_indices, token_dim, 9, None
     )
     torch.testing.assert_close(merged.narrow(token_dim, 0, 7), expected, rtol=0, atol=0)
     assert torch.count_nonzero(merged.narrow(token_dim, 7, 2)) == 0
+
+
+@pytest.mark.parametrize("token_dim", [0, 1])
+@pytest.mark.parametrize("strided", [False, True])
+def test_shared_inverse_gather_replay(token_dim, strided):
+    device = _device()
+    body = torch.randn(8, 3, 4, device=device)
+    tail = torch.randn(5, 3, 4, device=device)
+    if strided:
+        body, tail = body.transpose(-1, -2), tail.transpose(-1, -2)
+    if token_dim == 1:
+        body, tail = body.unsqueeze(0), tail.unsqueeze(0)
+    body_map = torch.empty(8, dtype=torch.int64, device=device)
+    tail_map = torch.empty(5, dtype=torch.int64, device=device)
+    inverse = torch.full((10,), -1, dtype=torch.int64, device=device)
+
+    def run():
+        return merge_prefill_checkpoint_outputs(
+            body, tail, body_map, tail_map, token_dim, 10, inverse
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for live_body, live_tail in [
+        ([0, 1, 4], [2, 3, 5, 6]),
+        ([5], [0, 2]),
+        ([], []),
+        ([1, 3, 5, 7, 9], [0, 2, 4, 6, 8]),
+    ] * 3:
+        body_map.fill_(-1)
+        tail_map.fill_(-1)
+        inverse.fill_(-1)
+        for source, mapping, destinations, start in (
+            (body, body_map, live_body, 0),
+            (tail, tail_map, live_tail, 8),
+        ):
+            source.copy_(torch.randn_like(source))
+            source.narrow(
+                token_dim,
+                len(destinations),
+                source.shape[token_dim] - len(destinations),
+            ).fill_(float("nan"))
+            if destinations:
+                dest = torch.tensor(destinations, device=device)
+                mapping[: len(destinations)].copy_(dest)
+                inverse[dest] = torch.arange(len(destinations), device=device) + start
+        expected = merge_prefill_checkpoint_outputs(
+            body, tail, body_map, tail_map, token_dim, 10, None
+        )
+        graph.replay()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.fixture

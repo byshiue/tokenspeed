@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     CAUSAL_CONV1D_BLOCK_M,
     CausalConv1dPrefillMetadata,
+    build_causal_conv1d_capacity_metadata,
     build_causal_conv1d_prefill_metadata,
     refresh_causal_conv1d_capacity_metadata,
 )

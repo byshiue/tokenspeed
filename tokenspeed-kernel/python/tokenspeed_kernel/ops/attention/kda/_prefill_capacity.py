@@ -34,8 +34,10 @@ class KdaPrefillCapacity:
         num_sequences: Number of real sequence slots in the captured graph.
 
     Each sequence may use up to token_capacity rows, but their combined live
-    lengths must fit token_capacity. Planning scratch reserves that capacity
-    independently for every sequence; live GPU boundaries remain authoritative.
+    lengths must fit token_capacity. Compact native planning bounds total
+    chunks by ceil(token_capacity / chunk_size) + num_sequences - 1.
+    The compatibility path reserves capacity independently per sequence;
+    live GPU boundaries remain authoritative in either case.
     """
 
     token_capacity: int

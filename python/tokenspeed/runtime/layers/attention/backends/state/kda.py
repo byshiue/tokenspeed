@@ -187,6 +187,10 @@ class KdaAttnBackend(MambaAttnBackend):
 
         if self.prefill_graph_inline:
             output = forward()
+            checkpoint = self.forward_metadata.prefill_checkpoint_batch
+            if checkpoint is not None and checkpoint.output_sources is not None:
+                # The fused gather writes the complete output, including padding.
+                return output
             # No eager handoff remains to scrub undefined native output padding.
             rows = torch.arange(output.shape[0], device=output.device)
             padding = rows >= self.forward_metadata.query_start_loc[-1]
@@ -992,6 +996,7 @@ class KdaAttnBackend(MambaAttnBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
+        inputs_packed: bool,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run only the real-token prefix through the KDA prefill kernel.
@@ -1044,6 +1049,7 @@ class KdaAttnBackend(MambaAttnBackend):
             initial_state=recurrent_state,
             cu_seqlens=query_start_loc,
             cu_seqlens_cpu=cu_seqlens_cpu,
+            inputs_packed=inputs_packed,
             capacity=(
                 KdaPrefillCapacity(seq_len, query_start_loc.numel() - 1)
                 if isinstance(self.forward_metadata, KdaPrefillGraphMetadata)

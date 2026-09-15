@@ -27,7 +27,7 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 import torch
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CAUSAL_CONV1D_BLOCK_M,
-    build_causal_conv1d_prefill_metadata,
+    build_causal_conv1d_capacity_metadata,
     refresh_causal_conv1d_capacity_metadata,
 )
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillCapacity
@@ -55,6 +55,11 @@ class KdaPrefillGraphMetadata(MambaForwardMetadata):
 class _CheckpointCapacityBatch(_PrefillCheckpointBatch):
     packed_capacity: int
     tail_state_rows: torch.Tensor
+    output_token_sources: torch.Tensor
+
+    @property
+    def output_sources(self) -> torch.Tensor:
+        return self.output_token_sources
 
     @property
     def state_update_rows(self) -> torch.Tensor:
@@ -110,6 +115,12 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
     tail_indices[: int(slot_lengths.sum())].masked_fill_(
         ~torch.repeat_interleave(active, slot_lengths), -1
     )
+    # Build the inverse once with the other host metadata, not once per layer.
+    # Negative sources also make the gather write zero to all bucket padding.
+    output_sources = torch.full((bucket,), -1, dtype=torch.int64)
+    for indices_, offset in ((body_indices, 0), (tail_indices, bucket)):
+        valid = indices_ >= 0
+        output_sources[indices_[valid]] = torch.arange(indices_.numel())[valid] + offset
     parts = (
         rows,
         starts,
@@ -120,6 +131,7 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
         tail_indices,
         tail_bounds,
         rows.masked_fill(~active, -1),
+        output_sources,
     )
     (
         device_rows,
@@ -131,6 +143,7 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
         tail_indices,
         tail_boundaries,
         state_rows,
+        output_sources,
     ) = upload_packed(parts, source.query_start_loc.device)
     if live is not None:
         positions.index_copy_(0, live.rows, live.checkpoint_positions)
@@ -150,6 +163,7 @@ def _checkpoint_slot_batch(source, bucket, tail_capacity):
         tail_cu_seqlens_cpu=tail_bounds,
         packed_capacity=bucket,
         tail_state_rows=state_rows,
+        output_token_sources=output_sources,
     )
 
 
@@ -189,16 +203,12 @@ def _capacity_metadata(source, bucket, tail_capacity):
             for group, indices in source.state_out_blocks_by_group.items()
         }
         _refresh_checkpoint_destinations(result, source)
-    # Build immutable per-request capacity maps once, independently of live
-    # packed boundaries. Overscheduled conv programs honor the live bounds.
-    host_bounds = capacity.boundaries_cpu()
-    result.conv_prefill_metadata = build_causal_conv1d_prefill_metadata(
-        host_bounds.to(device=source.query_start_loc.device, dtype=torch.int32),
-        host_bounds[1:] - host_bounds[:-1],
+    # Bound total packed work plus one partial block per request. Stable maps
+    # are shared across layers and refreshed before replay on its consumer stream.
+    result.conv_prefill_metadata = build_causal_conv1d_capacity_metadata(
+        result.query_start_loc,
+        bucket,
         CAUSAL_CONV1D_BLOCK_M,
-    )
-    refresh_causal_conv1d_capacity_metadata(
-        result.query_start_loc, result.conv_prefill_metadata, bucket
     )
     return result
 

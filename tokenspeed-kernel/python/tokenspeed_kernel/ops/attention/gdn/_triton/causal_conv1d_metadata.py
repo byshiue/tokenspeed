@@ -34,17 +34,23 @@ def _refresh_conv_capacity_kernel(
     batches,
     offsets,
     CHUNKS: tl.constexpr,
+    SEQUENCES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    length = tl.load(boundaries + row + 1) - tl.load(boundaries + row)
-    for start in range(tl.cdiv(CHUNKS, BLOCK)):
-        chunk = start * BLOCK + tl.arange(0, BLOCK)
-        destination = row * CHUNKS + chunk
-        valid = chunk * BLOCK_M < length
-        tl.store(batches + destination, tl.where(valid, row, -1), chunk < CHUNKS)
-        tl.store(offsets + destination, chunk, chunk < CHUNKS)
+    chunk = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    cursor = tl.full((), 0, tl.int32)
+    request = tl.full((BLOCK,), -1, tl.int32)
+    local = tl.full((BLOCK,), 0, tl.int32)
+    for row in range(SEQUENCES):
+        length = tl.load(boundaries + row + 1) - tl.load(boundaries + row)
+        count = tl.cdiv(length, BLOCK_M).to(tl.int32)
+        live = (chunk >= cursor) & (chunk < cursor + count)
+        request = tl.where(live, row, request)
+        local = tl.where(live, chunk - cursor, local)
+        cursor += count
+    tl.store(batches + chunk, request, chunk < CHUNKS)
+    tl.store(offsets + chunk, local, chunk < CHUNKS)
 
 
 def refresh_causal_conv1d_capacity_metadata(query_start_loc, metadata, token_capacity):
@@ -52,23 +58,27 @@ def refresh_causal_conv1d_capacity_metadata(query_start_loc, metadata, token_cap
 
     Args:
         query_start_loc: Live device packed boundaries [sequences+1].
-        metadata: Writable graph-owned maps, each with sequences times
-            ceil(token_capacity / block_m) entries.
-        token_capacity: Per-sequence scheduling capacity in tokens.
+        metadata: Writable graph-owned maps with
+            ceil(token_capacity / block_m) + sequences - 1 entries each.
+        token_capacity: Total packed token capacity, not capacity per sequence.
 
     Returns:
         None. Inactive programs receive PAD_SLOT_ID (-1), causing the existing
         convolution kernel to exit before its unmasked history loads.
     """
-    chunks = triton.cdiv(token_capacity, metadata.block_m)
     sequences = query_start_loc.numel() - 1
-    if metadata.batch_indices.numel() != sequences * chunks:
+    chunks = triton.cdiv(token_capacity, metadata.block_m) + sequences - 1
+    if (
+        metadata.batch_indices.numel() != chunks
+        or metadata.chunk_offsets.numel() != chunks
+    ):
         raise ValueError("Conv capacity map extent differs from planning capacity")
-    _refresh_conv_capacity_kernel[(sequences,)](
+    _refresh_conv_capacity_kernel[(triton.cdiv(chunks, 256),)](
         query_start_loc,
         metadata.batch_indices,
         metadata.chunk_offsets,
         CHUNKS=chunks,
+        SEQUENCES=sequences,
         BLOCK_M=metadata.block_m,
         BLOCK=256,
     )
@@ -81,6 +91,28 @@ class CausalConv1dPrefillMetadata:
     batch_indices: torch.Tensor
     chunk_offsets: torch.Tensor
     block_m: int
+
+
+def build_causal_conv1d_capacity_metadata(
+    query_start_loc: torch.Tensor, token_capacity: int, block_m: int
+) -> CausalConv1dPrefillMetadata:
+    """Allocate and initialize a compact, replay-stable convolution schedule.
+
+    Device boundaries partition at most token_capacity tokens. Each request
+    can contribute one partial block, so ceil(capacity / block_m) + N - 1
+    slots bound the sum of per-request block counts. Unused slots are inert.
+    Returns graph-owned maps refreshed in place before each forward.
+    """
+    sequences = query_start_loc.numel() - 1
+    if token_capacity <= 0 or block_m <= 0 or sequences <= 0:
+        raise ValueError(
+            "Conv capacity requires positive tokens, block size and requests"
+        )
+    count = triton.cdiv(token_capacity, block_m) + sequences - 1
+    indices = torch.empty((2, count), dtype=torch.int32, device=query_start_loc.device)
+    metadata = CausalConv1dPrefillMetadata(indices[0], indices[1], block_m)
+    refresh_causal_conv1d_capacity_metadata(query_start_loc, metadata, token_capacity)
+    return metadata
 
 
 @triton.jit

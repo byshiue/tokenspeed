@@ -23,8 +23,9 @@
 States use the native ``[N, HV, V, K]`` convention, matching the NVIDIA
 cache and the CuteDSL ABI. The dispatch facade adapts other cache layouts;
 this wrapper must not transpose the state a second time. The native
-token-major build reads ``[B, T, H, D]`` activations directly. PyTorch casts
-the gate to FP32 and packs strided beta logits into contiguous storage.
+token-major build reads ``[B, T, H, D]`` activations directly. Capacity
+execution fuses padding cleanup, FP32 gate conversion and chunk planning.
+Exact-length execution retains the public wrapper's preparation.
 Sigmoid(beta), the safe gate, and QK L2 normalization run in-kernel, like the
 FLA and FlashKDA paths. The safe-gate lower bound is baked into the CUBIN
 and validated on every call.
@@ -36,6 +37,9 @@ import math
 
 import torch
 from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda._triton.prefill_scan_inputs import (
+    prepare_capacity_scan,
+)
 from tokenspeed_kernel.ops.attention.kda.triton import (
     _DENSE_HALF_SIGNATURES,
     _nvidia_kda_prefill,
@@ -46,6 +50,10 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.thirdparty.cutedsl_kda import (
+    cutedsl_kda_forward_prepared,
+    cutedsl_kda_supports_prepared_plan,
+)
 
 _SUPPORTED_ARCHES = frozenset({ArchVersion(10, 0), ArchVersion(10, 3)})
 
@@ -90,6 +98,47 @@ def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
     # facade. Only native host planning receives the larger synthetic bounds;
     # device boundaries continue to identify the real packed token ranges.
     capacity = kwargs.pop("capacity", None)
+    inputs_packed = kwargs.pop("inputs_packed", False)
+    if (
+        capacity is not None
+        and kwargs["q"].is_cuda
+        and kwargs["q"].dtype == torch.bfloat16
+        and kwargs["q"].shape[-1] == kwargs["v"].shape[-1] == 128
+        and all(
+            t.stride(-1) == 1 and t.stride(-2) == 128
+            for t in (kwargs["q"], kwargs["k"], kwargs["v"], kwargs["g_raw"])
+        )
+        and kwargs["beta_logits"].stride(-1) == 1
+        and cutedsl_kda_supports_prepared_plan()
+    ):
+        if kwargs["lower_bound"] is None:
+            raise ValueError("CuteDSL KDA requires a safe-gate bound")
+        cutedsl_kda_check_config(float(kwargs["lower_bound"]))
+        q, k, v, gate, beta, chunks, chunk_rows = prepare_capacity_scan(
+            kwargs["q"],
+            kwargs["k"],
+            kwargs["v"],
+            kwargs["g_raw"],
+            kwargs["beta_logits"],
+            kwargs["cu_seqlens"],
+            inputs_packed,
+        )
+        out, state = cutedsl_kda_forward_prepared(
+            q,
+            k,
+            v,
+            gate,
+            kwargs["A_log"].contiguous(),
+            kwargs["dt_bias"].reshape(q.shape[2], 128).contiguous(),
+            beta,
+            kwargs["cu_seqlens"].to(torch.int64),
+            kwargs["initial_state"].contiguous(),
+            token_capacity=capacity.token_capacity,
+            cu_chunks=chunks,
+            chunk_to_seq=chunk_rows,
+            scale=1.0 / math.sqrt(q.shape[-1]),
+        )
+        return KdaPrefillResult(out, state)
     if capacity is not None:
         # Capacity descriptors make padding physically addressable to native
         # full-tile loads. Conv output padding is undefined, so scrub all scan

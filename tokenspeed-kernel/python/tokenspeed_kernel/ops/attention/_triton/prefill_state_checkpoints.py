@@ -606,6 +606,42 @@ def _scatter_checkpoint_output_kernel(
     tl.store(output + destination * WIDTH + offset % WIDTH, value, live)
 
 
+@triton.jit
+def _gather_checkpoint_output_kernel(
+    body,
+    tail,
+    sources,
+    output,
+    BODY_STRIDES: tl.constexpr,
+    TAIL_STRIDES: tl.constexpr,
+    FEATURES: tl.constexpr,
+    BODY_TOKENS: tl.constexpr,
+    TAIL_TOKENS: tl.constexpr,
+    TOKENS: tl.constexpr,
+    WIDTH: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    token, feature = offset // WIDTH, offset % WIDTH
+    source = tl.load(sources + token, token < TOKENS, -1)
+    is_body = (token < TOKENS) & (source >= 0) & (source < BODY_TOKENS)
+    is_tail = (
+        (token < TOKENS)
+        & (source >= BODY_TOKENS)
+        & (source < BODY_TOKENS + TAIL_TOKENS)
+    )
+    body_offset = source * BODY_STRIDES[0]
+    tail_offset = (source - BODY_TOKENS) * TAIL_STRIDES[0]
+    for dim in tl.static_range(len(FEATURES) - 1, -1, -1):
+        component = feature % FEATURES[dim]
+        feature //= FEATURES[dim]
+        body_offset += component * BODY_STRIDES[dim + 1]
+        tail_offset += component * TAIL_STRIDES[dim + 1]
+    body_value = tl.load(body + body_offset, is_body, 0)
+    tail_value = tl.load(tail + tail_offset, is_tail, 0)
+    tl.store(output + offset, tl.where(is_body, body_value, tail_value), token < TOKENS)
+
+
 def merge_prefill_checkpoint_outputs(
     body: torch.Tensor,
     tail: torch.Tensor,
@@ -613,6 +649,7 @@ def merge_prefill_checkpoint_outputs(
     tail_indices: torch.Tensor,
     token_dim: int,
     token_extent: int,
+    output_sources: torch.Tensor | None,
 ) -> torch.Tensor:
     """Restore packed body/tail outputs to original token order.
 
@@ -623,6 +660,9 @@ def merge_prefill_checkpoint_outputs(
         tail_indices: Original token indices, disjoint from body indices.
         token_dim: Token axis; any preceding dimensions must be singleton.
         token_extent: Output token capacity; unwritten padding stays zero.
+        output_sources: Optional per-forward inverse token map. Nonnegative
+            entries index concatenated body/tail tokens; negative entries
+            produce zero. Shared across layers, including graph replays.
 
     Returns:
         Contiguous output with the original token order and zero bucket padding.
@@ -630,12 +670,38 @@ def merge_prefill_checkpoint_outputs(
     """
     if any(size != 1 for size in body.shape[:token_dim]):
         raise ValueError("checkpoint outputs require singleton leading dimensions")
-    shape = list(body.shape)
-    shape[token_dim] = token_extent
-    output = torch.zeros(shape, dtype=body.dtype, device=body.device)
     for source, indices in ((body, body_indices), (tail, tail_indices)):
         if source.shape[token_dim] != indices.numel():
             raise ValueError("checkpoint output extent differs from token indices")
+    shape = list(body.shape)
+    shape[token_dim] = token_extent
+    if output_sources is not None and body.is_cuda:
+        if output_sources.numel() != token_extent:
+            raise ValueError("checkpoint inverse map differs from output extent")
+        if (
+            body.shape[token_dim + 1 :] != tail.shape[token_dim + 1 :]
+            or body.dtype != tail.dtype
+        ):
+            raise ValueError("checkpoint outputs have different feature geometry")
+        output = torch.empty(shape, dtype=body.dtype, device=body.device)
+        width = body.numel() // body.shape[token_dim]
+        _gather_checkpoint_output_kernel[(triton.cdiv(output.numel(), 1024),)](
+            body,
+            tail,
+            output_sources,
+            output,
+            BODY_STRIDES=body.stride()[token_dim:],
+            TAIL_STRIDES=tail.stride()[token_dim:],
+            FEATURES=body.shape[token_dim + 1 :],
+            BODY_TOKENS=body.shape[token_dim],
+            TAIL_TOKENS=tail.shape[token_dim],
+            TOKENS=token_extent,
+            WIDTH=width,
+            BLOCK=1024,
+        )
+        return output
+    output = torch.zeros(shape, dtype=body.dtype, device=body.device)
+    for source, indices in ((body, body_indices), (tail, tail_indices)):
         if not source.is_cuda:
             live = indices >= 0
             output.index_copy_(

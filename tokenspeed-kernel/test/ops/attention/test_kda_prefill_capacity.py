@@ -64,8 +64,8 @@ def test_conv_capacity_refresh_masks_history_loads():
     )
 
     maps = CausalConv1dPrefillMetadata(
-        batch_indices=torch.empty(64, dtype=torch.int32, device="cuda"),
-        chunk_offsets=torch.empty(64, dtype=torch.int32, device="cuda"),
+        batch_indices=torch.empty(19, dtype=torch.int32, device="cuda"),
+        chunk_offsets=torch.empty(19, dtype=torch.int32, device="cuda"),
         block_m=8,
     )
     for lengths in ([1, 1, 1, 125], [125, 1, 1, 1], [0, 8, 9, 16]):
@@ -73,11 +73,13 @@ def test_conv_capacity_refresh_masks_history_loads():
             [0] + torch.tensor(lengths).cumsum(0).tolist(), device="cuda"
         )
         refresh_causal_conv1d_capacity_metadata(bounds, maps, 128)
-        expected = torch.full((4, 16), -1, dtype=torch.int32)
+        expected = torch.full((19,), -1, dtype=torch.int32)
+        offsets = torch.zeros(19, dtype=torch.int32)
+        cursor = 0
         for row, length in enumerate(lengths):
-            expected[row, : (length + 7) // 8] = row
-        torch.testing.assert_close(maps.batch_indices.cpu().view(4, 16), expected)
-        torch.testing.assert_close(
-            maps.chunk_offsets.cpu().view(4, 16),
-            torch.arange(16, dtype=torch.int32).repeat(4, 1),
-        )
+            count = (length + 7) // 8
+            expected[cursor : cursor + count] = row
+            offsets[cursor : cursor + count] = torch.arange(count)
+            cursor += count
+        torch.testing.assert_close(maps.batch_indices.cpu(), expected)
+        torch.testing.assert_close(maps.chunk_offsets.cpu(), offsets)

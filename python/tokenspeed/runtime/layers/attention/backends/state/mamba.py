@@ -152,6 +152,11 @@ class _PrefillCheckpointBatch:
         """Tail destinations; negative rows denote graph-only inactive slots."""
         return self.rows
 
+    @property
+    def output_sources(self) -> torch.Tensor | None:
+        """Optional shared inverse map from output tokens to packed scan tokens."""
+        return None
+
 
 def _slice_prefill_recurrent_inputs(
     query: torch.Tensor,
@@ -1561,6 +1566,7 @@ class MambaAttnBackend(AttentionBackend):
                 num_real_tokens=num_real_tokens,
                 lower_bound=lower_bound,
                 cu_seqlens_cpu=metadata.cu_extend_seq_lens_cpu,
+                inputs_packed=False,
             )
 
         num_body_tokens = checkpoint_batch.body_token_indices.numel()
@@ -1615,6 +1621,7 @@ class MambaAttnBackend(AttentionBackend):
             num_real_tokens=num_body_tokens,
             lower_bound=lower_bound,
             cu_seqlens_cpu=checkpoint_batch.body_cu_seqlens_cpu,
+            inputs_packed=not checkpoint_batch.use_token_views,
         )
 
         checkpoint_state = (
@@ -1680,6 +1687,7 @@ class MambaAttnBackend(AttentionBackend):
             num_real_tokens=num_tail_tokens,
             lower_bound=lower_bound,
             cu_seqlens_cpu=checkpoint_batch.tail_cu_seqlens_cpu,
+            inputs_packed=not checkpoint_batch.use_token_views,
         )
 
         # GDN preserves the leading scan batch as [1, T, ...], while KDA's
@@ -1704,6 +1712,7 @@ class MambaAttnBackend(AttentionBackend):
             checkpoint_batch.tail_token_indices,
             token_dim,
             checkpoint_batch.token_extent,
+            checkpoint_batch.output_sources,
         )
         write_prefill_recurrent_checkpoints(
             tail_state,
@@ -2150,10 +2159,22 @@ class MambaAttnBackend(AttentionBackend):
                 b.view(seq_len, -1),
             )
 
-        # KDA can consume zero-copy strided views. When recurrent-state replay is
-        # enabled, the existing split kernel must remain because it also saves the
+        # KDA can consume zero-copy strided views. The checkpoint packer also
+        # materializes these views, so splitting them first would copy twice.
+        # When recurrent-state replay is enabled, the split kernel also saves the
         # persistent inputs needed to reconstruct accepted state later.
-        if is_target_verify and self._verify_packed_qkv_views and replay_inputs is None:
+        checkpoint_packing = (
+            not is_target_verify
+            and checkpoint_blocks is not None
+            and checkpoint_batch is not None
+            and not checkpoint_batch.use_token_views
+        )
+        if (
+            self._verify_packed_qkv_views
+            and replay_inputs is None
+            and mixed_qkv.stride(-1) == 1
+            and (is_target_verify or checkpoint_packing)
+        ):
             query, key, value = _packed_qkv_views(
                 mixed_qkv,
                 num_q_heads=num_heads,
@@ -2408,6 +2429,7 @@ class MambaAttnBackend(AttentionBackend):
         seq_len: int,
         num_real_tokens: int,
         lower_bound: float | None,
+        inputs_packed: bool,
         cu_seqlens_cpu: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Chunked scan of an extend/prefill batch, from the gathered state.
@@ -2436,6 +2458,8 @@ class MambaAttnBackend(AttentionBackend):
             seq_len: Padded token extent of the batch.
             num_real_tokens: Token extent excluding the graph padding tail.
             lower_bound: KDA decay clamp.
+            inputs_packed: Checkpoint packer produced contiguous Q/K/V/beta
+                with zero padding. KDA can reuse them; GDN ignores this hint.
             cu_seqlens_cpu: Metadata-built host int64 copy of
                 ``query_start_loc``'s contents (see
                 ``MambaForwardMetadata.cu_extend_seq_lens_cpu``). The KDA

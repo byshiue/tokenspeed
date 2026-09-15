@@ -673,9 +673,9 @@ The NVIDIA CuteDSL prefill adapter declares its native `v_major`
 (`[N, H, V, K]`) state layout. The dispatch facade alone adapts a caller
 with another layout; the wrapper must not round-trip native state through
 FLA's `[N, H, K, V]` convention. Direct wrapper callers use the native
-layout for both initial and final state. Gate conversion to FP32 and beta
-packing retain their ordinary PyTorch operations. The native wrapper allocates
-the scan output; breakable graph replay copies it into the graph-owned stable
+layout for both initial and final state. Exact-length gate conversion to FP32
+and beta packing retain their ordinary PyTorch operations. The native wrapper
+allocates the scan output; breakable graph replay copies it into the graph-owned stable
 handoff buffer. No output-buffer extension to the native wrapper is required.
 These preparation changes modify neither the native scan, its gate math, nor
 GEMM arithmetic.
@@ -722,6 +722,15 @@ separate-subgraph cache still rejects internal checkpoints. Replay refresh inclu
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
 the convolution boundary and existing int64 mirror.
 
+The checkpoint metadata also owns an inverse output-token map, built with
+the existing packed host metadata and refreshed at the same stable addresses.
+Each layer gathers body and tail outputs in one kernel, writing zero for
+negative sources. This replaces two scatters plus output initialization;
+the inline path needs no additional output-padding scrub. Eager compact
+checkpoint batches retain their ordinary merge when no inverse map is supplied.
+Q/K/V may remain views of convolution output until the existing checkpoint
+packer materializes them. Saved verification payloads keep their split producer.
+
 Merged graphs reserve one tail slot per real request. An inactive slot has
 one zero-input dummy token, a negative output-token map, no checkpoint
 destination and a negative state-update row. Its scan result must never replace
@@ -767,10 +776,12 @@ tensors remain strongly owned by their graph entries.
 
 The private KDA metadata overrides only the packed execution extent; real
 host lengths and GPU boundaries still agree. An explicit
-`KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths
-and reserves the padded token capacity independently for each sequence.
+`KdaPrefillCapacity` passed to the kernel facade admits the live CPU lengths:
+each sequence may fill the bucket, but their combined tokens must also fit it.
 The CuTeDSL adapter alone converts this descriptor to native planning bounds.
-The convolution map has fixed per-sequence capacity. One GPU metadata refresh
+Convolution maps reserve `ceil(token_capacity / block_m) + sequences - 1`
+programs, bounding the sum of per-request rounded lengths without reserving
+the entire token bucket for every request. One GPU metadata refresh
 per forward marks inactive programs with PAD_SLOT_ID before all layers run:
 the convolution kernel otherwise performs unmasked prior-token loads even
 for an excess chunk. Scan inputs are cleared past the live device boundary
@@ -779,6 +790,22 @@ native full-tile loads. Both conv and scan read live GPU boundaries;
 total live tokens must fit the physical packed extent. Empty sequence slots
 are not admitted. Batch-count changes require another schedule.
 Other solutions retain exact live-length planning and reject capacity mode.
+
+For the pinned token-major CuTeDSL ABI, a fused preparation kernel scrubs
+padding, converts gates to FP32 and builds the device chunk plan. Its total
+chunk capacity is `ceil(token_capacity / 16) + sequences - 1`, while each
+sequence retains the full per-sequence walk bound. The third-party adapter
+passes this explicit plan to the existing native launch without replacing
+global functions or changing scan arithmetic. Routing and workspace partition
+rules remain owned by the native host. Unsupported layouts retain the public
+wrapper's capacity preparation.
+
+Only the checkpoint packer may assert `inputs_packed`: it owns contiguous
+Q/K/V/beta and initializes every padded token. That contract skips redundant
+copies, never inferred merely from being inside capture. Gate projection can
+still produce undefined padding, so gate scrub/cast always runs. Per-call
+plan and scratch tensors belong to the active graph pool or eager invocation;
+they are not a mutable process-global plan shared across replay streams.
 
 This is an experimental capacity contract.
 Full-model overlap, memory use and performance must be validated before

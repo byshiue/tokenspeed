@@ -90,6 +90,12 @@ def test_checkpoint_slots_keep_shape_and_mask_inactive_requests(count):
         torch.cat((body, tail)).sort().values, torch.arange(1737)
     )
     assert not fixed.use_token_views
+    sources = fixed.output_sources
+    packed_destinations = torch.cat(
+        (fixed.body_token_indices, fixed.tail_token_indices)
+    )
+    torch.testing.assert_close(packed_destinations[sources[:1737]], torch.arange(1737))
+    assert torch.all(sources[1737:] == -1)
     assert (
         source.prefill_checkpoint_batch is None
         if count == 0
