@@ -723,16 +723,20 @@ def triton_kda_buffered_recurrent(
         and key_dim == value_dim == 128
     )
     value_tile = 8 if narrow_tile else 32
-    # Measured small-batch, 12-head native L16 windows favor a smaller value
-    # tile. Larger batches lose to the extra programs, so keep their old tile.
-    # Four warps and the FP32 history reconstruction tile remain unchanged.
+    # Measured native 12-head shapes favor a smaller value tile. For longer
+    # histories, B2/B3 and larger batches lose to the extra programs; L64/B4
+    # also regresses near flush. Keep their wider tile. This static choice
+    # leaves four warps and FP32 history reconstruction unchanged.
     if (
         transform_inputs
         and width == 4
-        and capacity == 16
-        and batch <= 4
         and heads == 12
         and key_dim == value_dim == 128
+        and (
+            (capacity == 16 and batch <= 4)
+            or (capacity == 32 and batch in (1, 4))
+            or (capacity == 64 and batch == 1)
+        )
     ):
         value_tile = 16
     history_tile = min(

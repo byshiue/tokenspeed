@@ -1663,3 +1663,52 @@ another idle check. The isolated experiment compares value tiles 32/16 at
 L16/L32/L64, requiring bitwise output, state and history equality before timing.
 It also records compiler register, spill and shared-memory metadata. No
 production code or default changes have been made for that experiment.
+
+### M19: bounded launch tuning for longer histories
+
+Candidate based on `4f477bee` (uncommitted at this entry). The same GB300
+allocation and software environment as M18 are used; the kernel experiment
+runs alone after both serving nodes pass an idle check. The frozen M17 source
+is the numerical and timing reference. No model weight, sampling parameter,
+state representation, flush policy or arithmetic operation changes.
+
+An initial sweep compares value tiles 32/16 with four warps and one stage at
+L16/L32/L64, B1/2/3/4/8/16/32, four history lengths and two seeds. **All 168
+cases are bitwise equal** for output, materialized state and all history
+fields. Paired CUDA-graph timings use 32/16/16/32 order, with 16 calls per graph,
+25 replays per sample and five event samples. All cases, including regressions
+and baseline-anchor drift, are retained.
+
+Tile 16 reduces compiled registers per thread from 130 to 96 in these shapes;
+both variants report zero spills and 8,192 bytes of shared memory per program.
+It doubles the number of value-tile programs. This is compiler evidence, not
+a measurement of achieved occupancy or proof of a single bottleneck.
+
+The promising shapes are checked again with two new seeds at **every reachable
+history length**: 0–28 at L32/B1 and L32/B4, and 0–60 at L64/B1. **All 238
+additional cases are bitwise equal.** The paired isolated kernel latency
+changes across those lengths are:
+
+| Shape | Tile-16 latency change versus tile 32 |
+| --- | ---: |
+| L32, B1 | −12.99% to −8.34% |
+| L32, B4 | −9.62% to −2.62% |
+| L64, B1 | −13.11% to −6.59% |
+
+The candidate extends the existing static tile choice only to those three
+shapes, with native T4, 12 local heads and 128-dimensional keys/values. L16
+keeps its prior B1–4 tuning. B2/B3 at longer capacities, L64/B4, larger batches,
+other capacities/head counts, T1 and prepared-input execution are unchanged.
+The existing parameterized recurrence test adds exact L32/T4 coverage; its
+assertions and tolerances are unchanged. Validation of the actual candidate
+passes **112 strict dispatch/numerical cases** across L16/L17/L32/L64,
+B1/2/3/4/8/16/32, H6/H12 and two seeds. This includes shapes deliberately left
+on tile 32, not just the new tile-16 cases.
+
+The full suites then pass: **101 kernel/reference tests** in 171.68s;
+**201 integration tests plus 77 subtests** in 92.05s, with the same three
+optional/backend-specific skips; and **527 shared runtime tests plus 317
+subtests** in 48.82s. The GPU dispatch artifact's kernel hash matches the
+workspace source held unchanged during these tests. No tolerance was relaxed.
+New real-model measurements remain pending. These microbenchmarks do not
+establish an end-to-end speedup or a default capacity.

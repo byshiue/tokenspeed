@@ -109,7 +109,7 @@ def _wide_input_offsets(out):
 
 
 @pytest.mark.parametrize("width", [1, 4])
-@pytest.mark.parametrize("extra_capacity", [0, 8, 9, 56])
+@pytest.mark.parametrize("extra_capacity", [0, 8, 9, 24, 56])
 @pytest.mark.parametrize("graph_mode", [False, True])
 @pytest.mark.parametrize("input_kind", ["prepared", "softplus", "bounded"])
 def test_buffered_rounds_and_graph_match_sequential(
