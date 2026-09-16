@@ -158,3 +158,38 @@ define acceptable reduction numerics. Measure larger messages and other subgroup
 placements before choosing a byte-size threshold. Retain NCCL for unsupported
 topologies and workloads. The current evidence supports further development, not
 enabling a new backend by default.
+
+## Optional Triton RSAG reduction
+
+The integrated comparison holds FlashInfer NVLink A2A and the quantized GEMM
+fixed, replacing only NCCL ReduceScatter with existing Triton RSAG. RSAG
+includes its input staging copy and returns a cloned output; these timings
+do not rely on exposing a reusable communication-buffer view.
+
+With 16 GB300 GPUs arranged as four TP4 groups, 16 rows per rank, real FP8
+projection weights from an NVFP4 checkpoint, and CUDA graphs, six alternating
+rounds of 500 iterations gave these median complete-projection latencies:
+
+| Projection | NCCL reduction | RSAG reduction | Latency reduction |
+|---|---:|---:|---:|
+| KDA | 51.87 µs | 43.49 µs | 16.15% |
+| MLA | 51.90 µs | 43.89 µs | 15.43% |
+
+Each round reports the maximum rank time. These are standalone projection
+results, not full-model decode latency or throughput. Do not multiply gains
+from separate A2A and reduction experiments to claim an end-to-end speedup.
+
+An initial wider policy exposed regressions: combining NCCL A2A with RSAG
+was about 14–17% slower at 17–64 rows per rank in this run. Some uneven
+batches also slowed down. The retained policy uses RSAG only when fused
+FlashInfer A2A is active, with balanced physical batches of 1–16 rows per
+rank. Larger and uneven cases retain NCCL reduction; paired fallback results
+were within roughly 0–2.5% of the reference.
+
+RSAG uses FP32 accumulation for its BF16 multimem reduction. Relative L2
+difference from NCCL was about 0.36%; outputs are not bitwise interchangeable.
+The test harness checks reduction error against an FP32 sum of the same GEMM
+partials separately from projection quantization error. It also checks exact
+eager/graph replay agreement and preservation of outputs across workspace
+reuse. These checks do not replace full-model logits or generation validation,
+so the backend remains opt-in.

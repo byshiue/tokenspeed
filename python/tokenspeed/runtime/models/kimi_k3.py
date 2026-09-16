@@ -3217,6 +3217,15 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     device=weight.device,
                 )
                 workspace.initialize_a2a(exchanges[0].parallel, max_input_size)
+                workspace.initialize_reduce_scatter(
+                    exchanges[0].parallel,
+                    [
+                        layer.self_attn.o_proj.output_size
+                        for layer in self.model.layers
+                        if hasattr(layer, "self_attn")
+                        and layer.self_attn.output_projection_exchange is not None
+                    ],
+                )
             elif max_num_tokens > workspace.max_tokens:
                 raise RuntimeError("Cannot grow a prepared projection workspace")
             for exchange in exchanges:
