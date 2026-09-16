@@ -33,6 +33,8 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.flashinfer import (
     create_projection_a2a,
     flashinfer_projection_a2a,
+    flashinfer_projection_a2a_borrowed,
+    prepare_borrowed_projection_a2a,
 )
 from tokenspeed_kernel.ops.communication.triton import (
     create_state,
@@ -42,6 +44,10 @@ from tokenspeed_kernel.ops.communication.triton import (
 )
 from tokenspeed_kernel.ops.communication.triton import (
     triton_pack_projection_input,
+)
+from tokenspeed_kernel.ops.communication.triton_projection import (
+    ProjectionPeerState,
+    triton_projection_reduce_scatter,
 )
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
@@ -71,8 +77,8 @@ RSAG_MAX_TOKENS = FLASHINFER_MAX_TOKENS
 
 
 def projection_rs_backend(value: str) -> str:
-    if value not in ("nccl", "triton_rsag"):
-        raise ValueError(f"{RS_ENV_NAME} must be nccl or triton_rsag")
+    if value not in ("nccl", "triton_rsag", "triton_peer"):
+        raise ValueError(f"{RS_ENV_NAME} must be nccl, triton_rsag, or triton_peer")
     return value
 
 
@@ -160,6 +166,8 @@ class ProjectionWorkspace:
         self.a2a_reason = None
         self._a2a_initialized = False
         self.rsag_states = {}
+        self.peer_states = {}
+        self.borrowed_a2a = None
         self._rs_initialized = False
 
     def initialize_reduce_scatter(
@@ -174,6 +182,35 @@ class ProjectionWorkspace:
         if self._rs_initialized:
             return
         backend = projection_rs_backend(os.environ.get(RS_ENV_NAME, "nccl"))
+        if backend == "triton_peer":
+            if self.a2a is None or parallel.tp_size != 4:
+                logger.warning(
+                    "Projection peer reduction requires fused TP4 A2A; using NCCL"
+                )
+                self._rs_initialized = True
+                return
+            if self.send.dtype != torch.bfloat16 or any(
+                width <= 0 for width in output_sizes
+            ):
+                raise ValueError(
+                    "Projection peer reduction requires BF16 and positive widths"
+                )
+            group = pg_manager.get_process_group("nccl", parallel.tp_group)
+            self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
+            for width in sorted(set(output_sizes)):
+                state = ProjectionPeerState(
+                    group,
+                    min(self.max_tokens, FLASHINFER_MAX_TOKENS),
+                    width,
+                    self.send.device,
+                )
+                probe = state.input_buffer(1)
+                probe.zero_()
+                triton_projection_reduce_scatter(state, probe, 1)
+                self.peer_states[width] = state
+            logger.info(
+                "Projection ReduceScatter: triton_peer, direct GEMM and borrowed A2A"
+            )
         if backend == "triton_rsag":
             if self.send.dtype != torch.bfloat16 or any(
                 width <= 0 or width % 8 for width in output_sizes
@@ -225,6 +262,12 @@ class ProjectionWorkspace:
             and 0 < max_tokens <= min(self.max_tokens, RSAG_MAX_TOKENS)
         )
 
+    def peer_state(self, output_size: int, rows: int, fused_a2a: bool):
+        """Select the same prepared fast path from shared physical counts."""
+        if fused_a2a and 0 < rows <= min(self.max_tokens, FLASHINFER_MAX_TOKENS):
+            return self.peer_states.get(output_size)
+        return None
+
     def reduce_scatter(
         self,
         partial: torch.Tensor,
@@ -233,6 +276,9 @@ class ProjectionWorkspace:
         fused_a2a: bool,
     ) -> torch.Tensor:
         """Return owned output rows; never expose the reusable RSAG buffer."""
+        peer = self.peer_state(partial.shape[1], max_tokens, fused_a2a)
+        if peer is not None:
+            return triton_projection_reduce_scatter(peer, partial, max_tokens)
         if self.use_rsag(partial.shape[1], max_tokens, fused_a2a):
             return triton_reduce_scatter(
                 self.rsag_states[partial.shape[1]],
@@ -281,6 +327,11 @@ class ProjectionWorkspace:
 
     def close(self) -> None:
         """Collectively release IPC resources after all referencing graphs die."""
+        if self.peer_states:
+            torch.cuda.synchronize(self.send.device)
+            dist.barrier(group=next(iter(self.peer_states.values())).group)
+        self.peer_states.clear()
+        self.borrowed_a2a = None
         if self.a2a is not None:
             self.a2a.close()
             self.a2a = None
@@ -346,12 +397,20 @@ class KimiOutputProjection:
         # One row already has rank-major byte order. Other shapes fuse the
         # transpose and padding, preserving the original BF16/FP16 values.
         fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
-        if fused_a2a:
+        peer = workspace.peer_state(linear.output_size, max_tokens, fused_a2a)
+        if peer is not None:
+            recv = flashinfer_projection_a2a_borrowed(
+                workspace.borrowed_a2a, inputs.contiguous()
+            )
+        elif fused_a2a:
             recv = flashinfer_projection_a2a(workspace.a2a, inputs.contiguous())
         else:
             packed = triton_pack_projection_input(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)
-        partial, _ = linear(recv)
+        if peer is not None:
+            partial, _ = linear.forward_into(recv, None, peer.input_buffer(max_tokens))
+        else:
+            partial, _ = linear(recv)
         output = workspace.reduce_scatter(
             partial.contiguous(), parallel, max_tokens, fused_a2a
         )

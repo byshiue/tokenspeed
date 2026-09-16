@@ -161,6 +161,13 @@ enabling a new backend by default.
 
 ## Optional Triton RSAG reduction
 
+**Measurement caveat:** the historical results in this section time one
+projection per graph and include inter-replay submission gaps. They are not
+isolated collective timings. The harness now captures up to 20 operations
+per graph, warms the captured graph, and divides CUDA-event time by the
+actual operation count. Compare backends with this method before selecting
+one; do not combine gains measured with different replay protocols.
+
 The integrated comparison holds FlashInfer NVLink A2A and the quantized GEMM
 fixed, replacing only NCCL ReduceScatter with existing Triton RSAG. RSAG
 includes its input staging copy and returns a cloned output; these timings
@@ -193,3 +200,61 @@ partials separately from projection quantization error. It also checks exact
 eager/graph replay agreement and preservation of outputs across workspace
 reuse. These checks do not replace full-model logits or generation validation,
 so the backend remains opt-in.
+
+## Copy-free FlashInfer A2A and peer reduction
+
+The integrated `triton_peer` candidate removes two intermediate copies:
+FlashInfer's receive-buffer copy and the copy from GEMM output into symmetric
+reduction storage. The prepared FP8 GEMM writes into that storage directly.
+The reduction retains its publication/reuse barriers and returns owned output.
+
+The comparison below uses 16 GB300 GPUs, four TP4 groups, BF16 activations,
+and real block-scaled FP8 KDA/MLA projection weights from an NVFP4 checkpoint.
+Both matrices have shape [7168, 12288]. The reference uses FlashInfer A2A,
+the same quantized GEMM, and NCCL reduction. Each sample captures 20 complete
+projections per graph, warms the graph, and times 500 operations with CUDA
+events. Values are medians of six alternating samples, each taking the
+maximum across all 16 ranks. These are not full-model measurements.
+
+| Projection | Rows/rank | Reference | Copy-free peer | Latency reduction |
+|---|---:|---:|---:|---:|
+| KDA | 1 | 34.66 µs | 30.68 µs | 11.5% |
+| KDA | 8 | 36.85 µs | 31.99 µs | 13.2% |
+| KDA | 16 | 39.11 µs | 35.19 µs | 10.0% |
+| MLA | 1 | 34.65 µs | 30.77 µs | 11.2% |
+| MLA | 8 | 37.01 µs | 32.05 µs | 13.4% |
+| MLA | 16 | 39.24 µs | 35.25 µs | 10.2% |
+
+Larger and uneven physical batches retained NCCL. Their paired latencies
+were within 0.8% of the reference in this run. Fast-path numerical checks,
+eager/graph equivalence, changing valid rows, inactive groups and output
+lifetime checks passed. Across all tested shapes, relative L2 difference
+from TP1 was below 0.7%; this includes quantized sharding effects and is not
+a full-model accuracy result. At 16 rows/rank, independent TP1 projection
+was still faster than the optimized TP4 operation. Communication optimization
+does not establish that projection sharding is a latency win.
+
+A short production-helper NSYS capture used five replays of 20 KDA
+projections for each path. On each GPU of the inspected TP4 group, the
+reference had 100 receive copies of 393216 bytes. The optimized path had
+zero memcpy events and no staging-copy kernel: each projection ran A2A,
+activation quantization, GEMM, two barriers, and owner reduction.
+
+### Other candidates and limits
+
+The earlier 41–44 µs comparison used one projection per graph. Capturing 20
+operations reduced the apparent custom-reduction advantage to about 1.4–1.6%
+before copy removal. NSYS showed that custom reduction kernels themselves
+were not faster than NCCL; complete-path gaps and copies matter.
+
+NCCL's default selected LL. Forcing LL did not help consistently; LL128 and
+Simple were slower. FlashInfer fused UC/MC could not be measured because
+communicator initialization failed, so no speedup or slowdown is assigned
+to them.
+
+Three experimental single-kernel synchronization/reduction variants passed
+numerical checks but increased complete latency to roughly 57–62 µs, versus
+about 35 µs for the copy-free two-barrier path. Remote atomic polling,
+acquire-load polling, and padded signal locations did not improve this
+workload. They are not integrated. Fewer kernel launches alone are not a
+reason to select a backend.

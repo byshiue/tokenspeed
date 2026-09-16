@@ -110,6 +110,31 @@ need not match NCCL's reduction order bit for bit. Tests report error against
 both NCCL and an FP32 reference; eager/graph equivalence and output lifetime
 remain exact checks. This remains opt-in until full-model validation passes.
 
+### Copy-free peer reduction
+
+`TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=triton_peer` selects a TP4 peer-read
+reduction with the same balanced 1–16-row FlashInfer A2A envelope. NCCL remains
+the default and the fallback outside that envelope.
+
+The A2A adapter borrows FlashInfer's persistent receive storage instead of
+copying it into a second tensor. The following GEMM must consume that view
+on the same serialized stream before the next exchange. The adapter retains
+the communicator and its entry/exit barriers; removing the copy does not
+remove peer synchronization. Its CUDA source ships with tokenspeed-kernel
+and compiles against the installed FlashInfer headers before graph capture.
+
+Prepared FP8 GEMMs write directly into persistent symmetric partial-result
+storage when their output shape and layout permit it. Padded or incompatible
+destinations retain a copy fallback. Publication and reuse barriers surround
+the peer-read reduction, which accumulates in FP32 and writes an owned local
+output. Only internal intermediates are borrowed: returned model outputs
+must survive the next layer's workspace reuse.
+
+The TP4 partial buffer needs 896 KiB per GPU at width 7168 and 16 rows per
+rank, excluding synchronization metadata, A2A storage and graph allocations.
+Explicit initialization errors are fatal; never switch collectives after a
+rank-local forward failure. Full-model accuracy remains a separate gate.
+
 ## Validation gates
 
 1. Run a standalone four-GPU harness using small BF16 matrices, then production

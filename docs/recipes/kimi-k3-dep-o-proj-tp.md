@@ -109,12 +109,28 @@ The conservative cutoff avoids measured regressions when combining NCCL A2A
 with RSAG at some batch sizes. Keep complete-projection timing in the
 comparison when evaluating a wider threshold.
 
-The standalone TP4 experiment reduced complete projection latency by roughly
-14–17% at 16 rows per rank with FlashInfer A2A held fixed. This is not an
-end-to-end speedup. Its output differed from NCCL by about 0.36% relative L2,
+The earlier standalone TP4 experiment reported a 14–17% complete-projection
+latency reduction, but timed single-operation graph replays and included
+submission gaps. Do not treat that result as an isolated reduction speedup;
+use chained-graph measurements for backend selection. Its output differed
+from NCCL by about 0.36% relative L2,
 despite slightly lower error against an FP32 reduction reference. Compare
 full-model logits and generation before treating the two backends as
 interchangeable; NCCL stays the default.
+
+The copy-free TP4 candidate uses:
+
+```bash
+export TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=flashinfer
+export TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=triton_peer
+```
+
+It borrows the A2A receive buffer and lets supported FP8 GEMMs write directly
+into symmetric reduction storage. The final output is owned, not a workspace
+view. The same balanced 1–16 physical rows/rank cutoff applies; larger or
+uneven shapes retain NCCL. Standalone 16-GPU BF16 and real-weight projection
+checks pass; full-model logits and generation still need validation, so the
+backend remains opt-in.
 
 This setting changes neither attention cache ownership nor EP placement.
 Unset/`1` preserves the original projection. The value must divide world size
