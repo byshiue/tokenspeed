@@ -37,6 +37,7 @@ from tokenspeed_kernel.ops.attention.kda import (
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
     buffered_conv,
+    buffered_history_gate,
     commit_conv_windows,
     commit_positions,
     materialize_endpoints,
@@ -456,6 +457,20 @@ class KDAReplayWorkspace:
         self.gate_output = torch.empty(
             (*common, self.heads, self.key_dim), dtype=producer_dtype, device=device
         )
+        self.history_conv_output = torch.empty(
+            (
+                (*common, self.heads * (self.key_dim + self.value_dim))
+                if layout.max_window > 1
+                else (0,)
+            ),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.history_gate_output = torch.empty(
+            (*common, self.heads, self.key_dim) if layout.max_window > 1 else (0,),
+            dtype=torch.float32,
+            device=device,
+        )
         self.output = torch.empty(
             (*common, self.heads, self.value_dim), dtype=torch.bfloat16, device=device
         )
@@ -493,7 +508,7 @@ class KDAReplayWorkspace:
         self._forks = {
             layer: StreamFork(self._producer_stream) for layer in self.layer_ids
         }
-        self._views: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
+        self._views: dict[tuple[int, int], tuple] = {}
 
     @property
     def nbytes(self) -> int:
@@ -505,6 +520,8 @@ class KDAReplayWorkspace:
                 self.payload,
                 self.conv_output,
                 self.gate_output,
+                self.history_conv_output,
+                self.history_gate_output,
                 self.output,
                 self.conv_ptrs,
                 self.group_indices,
@@ -525,7 +542,7 @@ class KDAReplayWorkspace:
             )
         )
 
-    def _layer_views(self, layer_id: int, bs: int) -> tuple[torch.Tensor, ...]:
+    def _layer_views(self, layer_id: int, bs: int) -> tuple:
         key = (layer_id, bs)
         self.metadata.layer(layer_id, bs)  # Validate layer and runtime batch capacity.
         if key not in self._views:
@@ -539,6 +556,18 @@ class KDAReplayWorkspace:
                 dim=-1,
             )
             window = self.metadata.layout.max_window
+            history_conv = None
+            history_inputs = None
+            if window > 1:
+                history_conv = self.history_conv_output[:bs]
+                history_key, history_value = history_conv.split(
+                    (self.heads * self.key_dim, self.heads * self.value_dim), dim=-1
+                )
+                history_inputs = (
+                    history_key.view(bs, window, self.heads, self.key_dim),
+                    history_value.view(bs, window, self.heads, self.value_dim),
+                    self.history_gate_output[:bs],
+                )
             self._views[key] = (
                 conv,
                 self.payload[self._row[layer_id], :bs],
@@ -547,6 +576,8 @@ class KDAReplayWorkspace:
                 v.view(bs, window, self.heads, self.value_dim),
                 self.gate_output[:bs],
                 self.output[:bs],
+                history_conv,
+                history_inputs,
             )
         return self._views[key]
 
@@ -571,7 +602,9 @@ class KDAReplayWorkspace:
         raw candidates; gate GEMM overlaps it using the existing StreamFork
         protocol. All outputs have stable, preallocated storage on both paths.
         """
-        conv_out, payload, q, k, v, gate, out = self._layer_views(layer_id, bs)
+        conv_out, payload, q, k, v, gate, out, history_conv, history_inputs = (
+            self._layer_views(layer_id, bs)
+        )
         if (
             raw_qkv.shape != conv_out.shape
             or f_a.ndim != 2
@@ -600,7 +633,20 @@ class KDAReplayWorkspace:
                 meta.ok,
                 conv_out,
                 payload,
+                history_out=history_conv,
             )
+            if history_inputs is not None:
+                buffered_history_gate(
+                    f_a,
+                    f_b_weight,
+                    A_log,
+                    dt_bias,
+                    history_inputs[2].view(-1, self.heads * self.key_dim),
+                    num_heads=self.heads,
+                    head_dim=self.key_dim,
+                    local_layers=len(self.layer_ids),
+                    lower_bound=lower_bound,
+                )
         history = self._history[layer_id]
         self.recurrent_kernel(
             q,
@@ -627,6 +673,7 @@ class KDAReplayWorkspace:
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            history_inputs=history_inputs,
         )
         return out
 

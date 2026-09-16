@@ -46,7 +46,120 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # n
 )
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     fused_recurrent_kda_pool,
+    fused_recurrent_kda_verify_megafuse,
 )
+
+
+@pytest.mark.parametrize("batch", [1, 4, 16])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+@pytest.mark.parametrize(
+    "producer_dtype,separate_history",
+    [(torch.bfloat16, False), (torch.float32, False), (torch.float32, True)],
+)
+def test_native_verify_reference_and_checkpoint_preservation(
+    batch, lower_bound, producer_dtype, separate_history
+):
+    """Both frontends share verify arithmetic across launch tiles and gates."""
+    torch.manual_seed(376)
+    heads, dim, width = 12, 128, 4
+    device = "cuda"
+    packed = torch.randn(
+        (batch, width, 3, heads, dim), device=device, dtype=producer_dtype
+    )
+    q, k, v = packed.unbind(2)
+    gate = torch.randn((batch, width, heads, dim), device=device, dtype=producer_dtype)
+    beta = torch.randn((batch, width, heads), device=device, dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device=device)
+    dt_bias = torch.randn(heads * dim, device=device)
+    state = torch.randn((batch + 1, heads, dim, dim), device=device) * 0.1
+    initial_state = state.clone()
+    history = [torch.zeros((batch + 1, 8, heads, dim), device=device) for _ in range(3)]
+    pages = torch.arange(1, batch + 1, device=device, dtype=torch.int32)
+    table = pages[:, None].contiguous()
+    end = torch.ones(batch, device=device, dtype=torch.int32)
+    checkpoint = torch.ones(batch, device=device, dtype=torch.int64)
+    length = torch.zeros(batch, device=device, dtype=torch.int32)
+    valid = torch.full((batch,), width, device=device, dtype=torch.int32)
+    flushed = torch.zeros(batch, device=device, dtype=torch.bool)
+    ok = torch.ones(batch, device=device, dtype=torch.bool)
+    out = torch.empty_like(v, dtype=torch.bfloat16)
+    conv = packed.bfloat16().reshape(batch * width, 3 * heads * dim)
+    gate_bf16 = gate.bfloat16().reshape(batch * width, heads * dim)
+    conv_state = torch.zeros(
+        (batch + 1, 3 * heads * dim, 3), device=device, dtype=torch.bfloat16
+    )
+    conv_weight = torch.zeros((3 * heads * dim, 4), device=device, dtype=torch.bfloat16)
+    fa = torch.zeros((batch * width, 128), device=device, dtype=torch.bfloat16)
+    fb = torch.zeros((heads * dim, 128), device=device, dtype=torch.bfloat16)
+    writes = torch.full((batch, width), -1, device=device, dtype=torch.int32)
+    expected = fused_recurrent_kda_verify_megafuse(
+        conv,
+        conv_weight,
+        conv_state,
+        conv_state,
+        fa,
+        fb,
+        beta.reshape(batch * width, heads),
+        a_log,
+        dt_bias,
+        state,
+        state,
+        pages,
+        writes,
+        num_heads=heads,
+        head_dim=dim,
+        draft_token_num=width,
+        scale=dim**-0.5,
+        lower_bound=lower_bound,
+        store_states=False,
+        bv=None,
+        g_raw=gate_bf16,
+        conv_qkv=conv,
+        num_warps=None,
+        num_stages=None,
+        enable_pdl=False,
+    ).reshape_as(out)
+    history_inputs = None
+    if separate_history:
+        raw_gate = gate + dt_bias.view(heads, dim)
+        history_gate = (
+            -a_log.exp()[None, None, :, None] * F.softplus(raw_gate)
+            if lower_bound is None
+            else lower_bound
+            * torch.sigmoid(a_log.exp()[None, None, :, None] * raw_gate)
+        )
+        history_inputs = (
+            k.clone(),
+            v.clone(),
+            history_gate,
+        )
+    triton_kda_buffered_recurrent(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        *history,
+        table,
+        table,
+        end,
+        checkpoint,
+        length,
+        valid,
+        flushed,
+        ok,
+        out,
+        capacity=64,
+        state_block_tokens=128,
+        transform_inputs=True,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        lower_bound=lower_bound,
+        history_inputs=history_inputs,
+    )
+    torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    torch.testing.assert_close(state, initial_state, atol=0, rtol=0)
 
 
 def test_buffered_dispatch_is_resolved_once_and_fails_closed(monkeypatch):
@@ -250,6 +363,7 @@ def test_buffered_rounds_and_graph_match_sequential(
             A_log=a_log if native else None,
             dt_bias=dt_bias if native else None,
             lower_bound=lower_bound,
+            history_inputs=None,
         )
         commit_positions(
             (stamps,),
@@ -561,6 +675,7 @@ def test_invalid_backing_rejects_entire_row_before_stores(graph_mode):
             A_log=None,
             dt_bias=None,
             lower_bound=None,
+            history_inputs=None,
         )
 
     run()

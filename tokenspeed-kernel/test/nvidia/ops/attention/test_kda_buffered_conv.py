@@ -122,6 +122,7 @@ def test_buffered_conv_reordering_acceptance_and_graph(
                 ok[group],
                 out[layer],
                 payload[layer],
+                history_out=None,
             )
         commit_conv_windows(
             payload,

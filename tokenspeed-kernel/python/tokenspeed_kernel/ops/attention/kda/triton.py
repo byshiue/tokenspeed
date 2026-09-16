@@ -691,6 +691,9 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_endpoint import (  # n
     materialize_endpoints,
     prepare_endpoint_commit,
 )
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_gate import (  # noqa: E402
+    buffered_history_gate,
+)
 from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # noqa: E402
     commit_positions,
     prepare_positions,

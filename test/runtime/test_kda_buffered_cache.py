@@ -400,6 +400,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
         A_log=None,
         dt_bias=None,
         lower_bound=None,
+        history_inputs=None,
     )
     expected_state = state[2].clone() * 0.9
     correction = 0.5 * (v[0, 0] - torch.einsum("hvk,hk->hv", expected_state, q[0, 0]))
@@ -490,6 +491,7 @@ def test_gpu_arena_zeroing_and_recurrence_use_distinct_parents():
             A_log=None,
             dt_bias=None,
             lower_bound=None,
+            history_inputs=None,
         )
         assert ok.item()
         if flush.item():
@@ -1417,6 +1419,8 @@ def test_buffered_workspace_forward_commit_and_budget(
         workspace.payload,
         workspace.conv_output,
         workspace.gate_output,
+        workspace.history_conv_output,
+        workspace.history_gate_output,
         workspace.output,
         meta.tables.tables,
     )
@@ -1661,6 +1665,8 @@ def test_buffered_workspace_forward_commit_and_budget(
                 workspace.payload,
                 workspace.conv_output,
                 workspace.gate_output,
+                workspace.history_conv_output,
+                workspace.history_gate_output,
                 workspace.output,
                 meta.tables.tables,
             )

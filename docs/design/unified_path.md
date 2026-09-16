@@ -520,18 +520,39 @@ candidates per local layer but shares conv/gate/output scratch across layers.
 Each layer must consume its output before the following layer reuses it.
 These are per-round tensors, not private persistent request state.
 
-Multi-token windows retain FP32 conv/gate outputs, matching the original
-accepted replay's producer precision. The recurrence rounds these producers
-to BF16 for verification and keeps a second register-local recurrence for
-candidate history. Both start from one reconstructed committed state; only
-the history recurrence supplies the FP32 K/U/D entries. It adds no second
-reconstruction, persistent state field or post-acceptance replay. Width one
+Multi-token windows keep separate representations for verification and accepted
+history. Verify rounds the conv/gate producers to BF16. History consumes
+replay-order FP32 K, pre-SiLU V, and log-decay; keeping V before SiLU preserves
+the replay's fused projection subtraction. The conv producer writes the extra
+K/V scratch in the same launch, while a separate gate producer uses the batched
+accepted replay's gate tiling. Its scratch is shared across layers and included
+in the recipe budget, not added to persistent request state.
+
+Two register-local recurrence phases start from one reconstructed committed
+state; only the history phase supplies the FP32 K/U/D entries. There is no second
+reconstruction or post-acceptance replay. Width one
 retains ordinary decode's BF16 producer/state arithmetic through the same
 forward and commit. The static scratch dtype follows the maximum window and
 is included in recipe accounting before graph capture. Native verification
 outputs remain BF16; changing the producer precision does not change weights,
 sampling or acceptance rules. Numerical and full-model performance gates are
 required separately.
+
+Blackwell 128-key multi-token target verify and buffered verify share one explicit
+arithmetic implementation. Q/K squared norms, state-key projection and state-Q
+output use a balanced tree that pairs adjacent logical keys at each level,
+regardless of tile or warp layout. Products and additions round separately;
+normalization uses round-to-nearest square root/division, and Q is scaled before
+the output dot. State decay rounds before the correction FMA. Every value row
+follows the same rule. Layout conversions preserve that arithmetic, and no
+global compiler optimization is disabled. Other head dimensions/vendors and
+ordinary decode retain their existing arithmetic.
+
+This is a new numerical contract, not bitwise emulation of an old compiler.
+Verification must retain a frozen original as an independent quality/performance
+reference, alongside shared-arithmetic unbuffered and buffered execution.
+Equality of the new pair isolates replay; it does not establish unchanged
+generation, acceptance rate, AIME score or speed relative to the frozen original.
 
 After all local layer forwards finish, acceptance preparation selects endpoint
 materialization at aligned accepted endpoints or an explicit GPU handoff mask.
@@ -546,16 +567,12 @@ CUDA stream/event implementation overhead. Binding a different pool requires
 a new workspace and recapture; old descriptors must not survive it.
 
 Endpoint materialization shares the forward's FP32 history reconstruction.
-The Triton implementation uses explicit Gluon layouts to keep each tile's
-history axis in registers while distributing value rows across warps. A scalar
-FP32 dot accumulates the history correction without a live expanded `[V,H,K]`
-product; it does not convert operands to TF32 or use tensor cores. Static
-history tiles below eight retain the outer-product sum because the dot's
-compiler contract requires at least eight reduction elements. Native Q/K
-normalization keeps the original full-CTA reduction layout, independently of
-the state layout. These choices change kernel scheduling, not history storage,
-flush decisions, or endpoint ownership. Floating-point
-accumulation order still requires numerical regression checks.
+Gluon layouts batch paged history loads while keeping the update ordered by
+token: round the state decay, then apply the correction FMA. Aggregating decay
+products and outer products would change rounding even with identical K/U/D.
+No TF32 operands or tensor-core reconstruction are used. This preserves the
+accepted replay update order without changing cache ownership, flush decisions
+or endpoint publication.
 After a capacity flush its source is `S_e`; otherwise it starts from `S_c`.
 It consumes only accepted rows through `e+a`, never rejected candidates. A
 zero-acceptance handoff may still need to materialize old committed history.

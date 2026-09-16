@@ -225,10 +225,25 @@ M67 已完成 L8/B4/T4、69 层、TP8 每 rank 形状、CUDA graph 开启的局�
 平均一个无 history 窗口和一个 flush 窗口；不代表稳态 L8 分布或端到端性能。
 因此对齐本身在此处没有性能惩罚，但 buffered 路径尚未达到不慢于原版的目标。
 本次没有改写共享算术契约或采用诊断版，也没有新的 AR/AIME 测试。
+M68 随后完成相同条件下的 KDA 单元测试 NSYS 对照。四份报告的预期 NVTX
+区段与全部 kernel 均已核对，四次 GPU 测试逐元素通过。直接 kernel 计时显示
+对齐版 recurrence 较慢，且每层 history-gate 合计约 238–242 µs／69 层窗口，
+高于原版跨层 batched gate 的 12.2–12.4 µs；省掉约 113 µs accepted replay
+仍不足以抵消。此局部差异不是由更大的 kernel 间 bubble 导致。NSYS 数字是
+带 profiler 的诊断，不能替代 M67 的无 profiler 结果或端到端验收。
 M54 的 history-gate token tile 实验暂缓，仅完成 CPU 准备，尚无 GPU 结果。
 不得因局部 kernel 变快而放宽逐位对照、AR 或重复端到端性能门槛。
 不得将诊断版的重复计算与临时 scratch 当成生产实现或性能达标。所有观测
 同步、诊断拷贝与重复计算均不计入性能收益，当前版本 AIME 尚未验证。
+M69 用户已确认采用共享 verify 算术：unbuffered 与 buffered 使用明确的归约与
+FMA 规则，同时保留冻结旧版作独立对照。这允许新算术与旧编译结果有最后几位
+差异，不等于放宽 replay 一致性或完整模型精度/性能门槛。正式代码已接入，
+187 项 kernel 测试、240 项 runtime 测试与 117 项 subtest 通过（3 项既有 skip）。
+8 个 rank 的 1656 个真实张量 layer/case 中，新 unbuffered/buffered 逐位一致，
+包含 CUDA graph、accepted state 与下一窗口 flush。相对冻结旧版，verify 有
+约 0.0124% 输出元素不同，最大绝对差 0.00048828125；这不是 AR/AIME 验证。
+不采用 M59 的 value-row 特判，不新增用户开关。本次一并提交实现与验证记录；下一步
+仍需对当前共享算术进行三组 KDA 性能对照，再完成固定 L8/C4 的完整模型验证。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 

@@ -15,6 +15,11 @@ store; read and write indices may differ (flat-KV page-boundary crossing).
 ``fused_recurrent_kda_megafuse`` additionally accepts a tokenspeed-only gated
 RMSNorm epilogue (``output_gate``/``norm_weight``/``norm_eps``); with it unset
 the kernel is unchanged.
+
+The Blackwell 128-key multi-token target-verify kernel uses explicit arithmetic in
+``verify_math`` shared with buffered replay. Its rounding is intentionally
+independent of the legacy compiler's contraction choices; this exception does
+not change the ordinary decode or accepted replay arithmetic above.
 """
 
 from __future__ import annotations
@@ -23,6 +28,10 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.kda._triton.verify_math import (
+    verify_normalize,
+    verify_recurrence,
+)
 from tokenspeed_kernel.platform import Platform
 
 
@@ -768,6 +777,7 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
     STORE_STATES: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    SHARED_VERIFY: tl.constexpr,
 ):
     """Run target verify, optionally storing each position's rollback state."""
     pid = tl.program_id(0)
@@ -922,17 +932,24 @@ def fused_recurrent_kda_verify_megafuse_fwd_kernel(
                 b_g < 20.0, tl.math.log(1 + tl.math.exp(b_g)), b_g
             )
 
-        b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
-        b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
-        b_q = b_q * scale
-
-        b_h *= tl.exp(b_gk)[None, :]
-        b_v = b_v - tl.sum(b_h * b_k[None, :], axis=1)
-        b_beta = tl.load(beta + tok * stride_beta_tok + i_hv).to(tl.float32)
-        b_beta = tl.sigmoid(b_beta)
-        b_v *= b_beta
-        b_h += b_v[:, None] * b_k[None, :]
-        b_o = tl.sum(b_h * b_q[None, :], axis=1)
+        if SHARED_VERIFY:
+            b_beta = tl.load(beta + tok * stride_beta_tok + i_hv).to(tl.float32)
+            b_beta = tl.sigmoid(b_beta)
+            b_q, b_k = verify_normalize(b_q, b_k, scale, tl)
+            b_h, b_o, _ = verify_recurrence(
+                b_h, b_q, b_k, b_v, tl.exp(b_gk), b_beta, tl
+            )
+        else:
+            b_q = b_q / tl.sqrt(tl.sum(b_q * b_q) + 1e-6)
+            b_k = b_k / tl.sqrt(tl.sum(b_k * b_k) + 1e-6)
+            b_q = b_q * scale
+            b_h *= tl.exp(b_gk)[None, :]
+            b_v = b_v - tl.sum(b_h * b_k[None, :], axis=1)
+            b_beta = tl.load(beta + tok * stride_beta_tok + i_hv).to(tl.float32)
+            b_beta = tl.sigmoid(b_beta)
+            b_v *= b_beta
+            b_h += b_v[:, None] * b_k[None, :]
+            b_o = tl.sum(b_h * b_q[None, :], axis=1)
         tl.store(
             o + (tok * HV + i_hv) * V + o_v,
             b_o.to(o.dtype.element_ty),
@@ -1261,6 +1278,7 @@ def fused_recurrent_kda_verify_megafuse(
         HAS_PRECOMPUTED_CONV=conv_qkv is not None,
         STORE_STATES=store_states,
         ENABLE_PDL=enable_pdl,
+        SHARED_VERIFY=Platform.get().is_blackwell and K == 128 and T > 1,
         num_warps=num_warps,
         num_stages=num_stages,
         **pdl_kwargs,

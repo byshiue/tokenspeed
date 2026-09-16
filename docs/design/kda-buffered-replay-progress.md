@@ -6,10 +6,16 @@ Passing a reference test does not mean buffered replay is available in serving.
 
 ## Current validation status
 
-The working implementation remains M29R2 and has not passed the Eagle3
-no-regression gate. Later arithmetic candidates are private experiments, not
-adopted changes. Current-version AIME and the broader performance/lifecycle
-gates remain open; earlier results below apply only to their recorded source.
+M69 integrates replay-order producers and ordered reconstruction with a
+user-approved shared verify arithmetic contract into the working tree. Local
+validation passes: 187 kernel tests, 240 runtime tests plus 117 subtests (three
+existing skips), and all 1656 saved real-input layer/cases across eight ranks.
+The new unbuffered/buffered pair matches bitwise; the frozen original remains a
+separate reference and has small output differences. The compiler-specific M59
+diagnostic is not adopted. This change includes the M69 implementation and
+validation record on top of `2829f469`; current-version AR, AIME and the Eagle3
+no-regression gate remain open. Earlier
+results below apply only to their recorded source, not this new arithmetic.
 
 M47R3 restores full-model L64/C1 tokens and acceptance in M50: both paths have
 AR 0.8638 and acceptance length 3.59. Latency still increases 9.01%, so that
@@ -17,7 +23,7 @@ result is not a performance pass. M51 traces the remaining same-trajectory
 cost to history reconstruction and history-gate work, with a separate late-
 rank outlier retained in the profile. C1 recovery does not establish C4.
 
-The active AR investigation is now fixed at L8/C4. M53's first L8 run retains
+The preceding AR investigation was fixed at L8/C4. M53's first L8 run retains
 C1 outputs but changes every measured C4 batch. Its later L16 run stops on a
 cache-hit/workload mismatch; the six-startup comparison is incomplete and
 the partial samples are not replaced. M55 isolates B4 verify differences
@@ -42,8 +48,8 @@ Details, retained failures and remaining implementation work follow below.
 M62–M64 test three alternatives to the compiler-specific diagnostic. Inferred
 Triton layouts worsen verify and accepted-state equality; a static verify
 window and BF16 verification input storage leave all M57 per-layer metrics
-unchanged. None is adopted. The remaining work is a maintainable verify
-arithmetic implementation, not another capacity sweep or a relaxed AR gate.
+unchanged. None is adopted. M69 implements a shared arithmetic contract instead;
+it still requires new full-model AR and performance checks, not a relaxed gate.
 
 ## Source and milestones
 
@@ -3964,3 +3970,126 @@ does not pass the plan's no-regression goal, nor establish E2E latency, AR or
 AIME accuracy. All raw samples and reproduction details are retained in the
 private M67 report. No production kernel change or candidate adoption is
 included; no benchmark or model service remains running.
+
+### M68: direct kernel timelines for original and aligned KDA
+
+The user requests a unit-level NSYS comparison, without an E2E run. M68 reuses
+the exact M67 workload and frozen M47R3/M59R2 sources, rather than the newer
+branch checkpoint. L8/B4/T4, 69 layers, TP8 per-rank H12/D128 geometry and CUDA
+graphs remain fixed. Each of two GB300 GPUs runs original and aligned pytest
+cases separately. Loading, compilation, warmup, reference arithmetic and
+inspection copies stay outside the capture range.
+
+All four GPU pytest cases and two CPU scope/accounting checks pass. Aligned
+outputs and accepted recurrent/conv states remain bitwise equal to original;
+graph outputs match eager before and after profiling. Each report contains
+three graph replays for each of no-history recurrence, history/flush recurrence
+and the complete two-window KDA cycle. All nine intended NVTX ranges and their
+graph-launch correlations pass coverage checks, with 1,674 original or 2,118
+aligned GPU kernels per report. Generic CUDA/NVTX collection warnings are
+retained and disclosed. An additional audit verifies exactly nine launches,
+nine synchronizations and every intended kernel family's call count; no
+intended range or kernel is missing from the accounting.
+
+Individual recurrence-kernel medians in the isolated graphs are 10.016 µs
+original versus 11.968–12.000 µs aligned without history, and 9.888–9.920 µs
+original versus 13.184 µs aligned with history/flush. These are direct kernel
+durations, not graph time divided by layer count. In producer-interleaved
+cycles, recurrence medians are lower for both implementations; cross-scope
+numbers must not be mixed. The original recurrence-only scope excludes its
+later accepted-state replay.
+
+The complete cycle identifies two main costs: longer buffered recurrence and
+69 per-layer history-gate launches. The latter take about 238–242 µs per
+69-layer window, versus 12.2–12.4 µs for original's batched replay-gate
+preparation. Removing original's approximately 113 µs accepted-state replay
+does not offset those costs. Kernel count rises from 210 to 284 per window.
+The recurrence uses 128 rather than 80 registers per thread, with the same
+768 one-warp CTAs; this is a diagnostic clue, not proof of an occupancy or
+spill bottleneck. Complete two-window graph idle gaps are smaller for aligned
+(about 21–22 µs) than original (28–29 µs), so larger bubbles do not explain
+this local slowdown.
+
+Four clearly named reports, raw kernel analysis, correctness records and
+checksums are packaged in the private M68 delivery. Nsight Systems 2025.6.3
+uses software CUDA tracing with graph-node detail. Profiler timings do not
+replace M67's unprofiled performance numbers. No E2E/AR/AIME result, production
+kernel change or candidate adoption is claimed; the no-regression goal remains
+open. Final both-node idle checks pass.
+
+### M69: shared verify arithmetic, implementation and local validation
+
+The user approved a shared verify arithmetic contract for unbuffered and
+buffered execution, retaining the untouched original as a separate reference.
+This permits different rounding from the original compiler output; it does not
+permit replacing the old quality/performance baseline or claiming unchanged AR.
+Work starts from `2829f469` on `kda-buffered-replay`; this change records the
+implementation, tests and validation summary together.
+
+The working implementation integrates the previously isolated M47R3 replay-order
+producers and ordered history reconstruction. Blackwell 128-key multi-token
+target verify and buffered verify now call the same source helpers: adjacent-key
+balanced reductions, explicit product/add rounding, normalized/scaled Q and K,
+rounded state decay, then correction FMA. The helpers adapt register ownership
+for Triton/Gluon without value-row masks or global compiler-flag changes.
+The acceptance rules, frozen accepted-replay kernel, T=1 decode arithmetic,
+LCM ownership and state commit/flush protocol are unchanged. Extra producer
+scratch is preallocated, shared across layers and included in the recipe budget.
+At B4/T4/H12/D128, the added scratch is 288 KiB per rank, not per layer. The new
+arithmetic has no user-selectable switch; other architectures/head dimensions
+and the non-shared verify branch retain their existing operation order.
+
+Local validation uses a new persistent allocation and the existing cached
+GB300/CUDA 13/PyTorch 2.13/Triton 3.8.10.post20260906/FlashInfer 0.6.18
+environment. Tests load working-tree code, not the older private candidate.
+Each attempt records the base commit, working patch, source hashes, added source
+files, environment, exact command, logs and exit status; source changes during a
+run invalidate it. The first two GPU smoke attempts failed at Gluon layout
+compilation. They are retained; the third passed all six initial numerical cases.
+
+Final-source results:
+
+- **187 kernel tests pass.** Coverage includes conv, recurrence, metadata,
+  endpoint, capacity/padding/invalid backing and eager/CUDA graph execution.
+  An independent FP32 reference checks state, correction and output exactly
+  across four tile/warp settings, Triton/Gluon and compiler FP fusion on/off.
+  Native verify covers B1/B4/B16, BF16/FP32/separate history producers and both
+  bounded and softplus gates. Existing tolerances were not widened.
+- **240 runtime tests and 117 subtests pass**, with three existing skips.
+  These include workspace budget/stable storage, cache lifecycle, accepted
+  commit, mixed execution, graph metadata and shared GDN regression.
+- **All 1656 saved real-input layer/cases pass**, across eight TP8 rank
+  snapshots at L8/B4/T4, H12/D128. Each rank checks three groups of 69 layers.
+  Producers, verify output, two graph replays versus eager, accepted conv/state
+  and next-window verify/flush match exactly. Accepted lengths are [1,2,3,4]
+  and [4,3,2,1]; rejected history is poisoned, and the implementation carries
+  state between windows without oracle substitution. B4 is assembled from
+  independent C1 snapshots, not a new C4 model rollout.
+
+The original reference remains a separately imported, frozen module. Shared
+verify differs from it in **15167 / 122093568 BF16 output elements** (about
+0.0124%), with maximum absolute difference **0.00048828125**. Producers match.
+This is a same-input comparison over first/subsequent verify windows, not a
+generation or AR result. Equality of the new pair does not recover the original
+token trajectory by definition.
+
+Failed attempts remain part of the record. The initial runtime run had 21
+missing-helper import failures; correcting the harness import path fixed them.
+The first real-input gate matched verify but found accepted-state differences
+up to 1.9073486328125e-6. A focused diagnostic isolated history correction U:
+K and decay were exact. Moving beta before projection had changed the legacy
+compiler contraction. Restoring history's original source order restored exact
+K/U/decay and all eight ranks. Review also restored the non-shared unbuffered
+branch's beta position, followed by a full final-source rerun. No compiler-row
+mask or tolerance relaxation was adopted.
+
+The three final suites share one Python source manifest, SHA256
+`6886860d22368761e293c1d8dcc7c6d0563cc6b2a0a43c114337b4c9b84c19b7`,
+and each confirms unchanged source during execution. Their patch, added files,
+commands, environment, fixture hashes and failures are retained in the local
+M69 report/runbook. Repository-wide pre-commit hooks and added-file hooks pass.
+
+No full model, AR, AIME, new NSYS or performance measurement is claimed here.
+Earlier M61/M67/M68 numbers do not apply to the new arithmetic contract. Next
+measure the three arms in the same KDA benchmark, then validate fixed L8/C4
+real-model token/acceptance behavior and current-source AIME.

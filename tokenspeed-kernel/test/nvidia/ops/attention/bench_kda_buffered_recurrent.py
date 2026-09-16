@@ -230,6 +230,7 @@ def main():
                             A_log=alog if native else None,
                             dt_bias=bias,
                             lower_bound=lower_bound,
+                            history_inputs=None,
                         )
                         commit_positions(
                             (stamps,),

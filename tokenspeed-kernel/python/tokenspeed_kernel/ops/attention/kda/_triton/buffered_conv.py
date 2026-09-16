@@ -149,6 +149,8 @@ def _buffered_conv(
     OK,
     OUT,
     PAYLOAD,
+    HISTORY,
+    HISTORY_STRIDES: tl.constexpr,
     RAW_STRIDES: tl.constexpr,
     OUT_STRIDES: tl.constexpr,
     PAYLOAD_STRIDES: tl.constexpr,
@@ -190,6 +192,15 @@ def _buffered_conv(
             WEIGHT + channel * WEIGHT_STRIDES[0] + tap * WEIGHT_STRIDES[1], mask, 0
         ).to(tl.float32)
         acc = tl.fma(value, weight, acc)
+        if HISTORY is not None:
+            if tap == 0:
+                x0, w0 = value, weight
+            elif tap == 1:
+                x1, w1 = value, weight
+            elif tap == 2:
+                x2, w2 = value, weight
+            else:
+                x3, w3 = value, weight
         if tap == 3:
             # This tap already loaded the current token. Capture it for the
             # later accepted-window commit, without a separate copy launch.
@@ -201,6 +212,22 @@ def _buffered_conv(
                 raw_value,
                 mask,
             )
+    if HISTORY is not None:
+        # Original replay accumulates the current tap first. K is consumed
+        # after SiLU, while V must retain its pre-SiLU accumulator so the
+        # recurrence can fuse its final multiply with projection subtraction.
+        replay_acc = x3 * w3 + x0 * w0 + x1 * w1 + x2 * w2
+        replay_value = tl.where(
+            channel < 2 * (C // 3), replay_acc * tl.sigmoid(replay_acc), replay_acc
+        )
+        tl.store(
+            HISTORY
+            + row * HISTORY_STRIDES[0]
+            + token * HISTORY_STRIDES[1]
+            + (channel - C // 3) * HISTORY_STRIDES[2],
+            replay_value,
+            mask & (channel >= C // 3),
+        )
     activated = acc * tl.sigmoid(acc)
     tl.store(
         OUT + row * OUT_STRIDES[0] + token * OUT_STRIDES[1] + channel * OUT_STRIDES[2],
@@ -209,7 +236,7 @@ def _buffered_conv(
     )
 
 
-def buffered_conv(raw, weight, state, read, width, ok, out, payload):
+def buffered_conv(raw, weight, state, read, width, ok, out, payload, *, history_out):
     """Compute four-tap conv+SiLU and capture BF16 raw candidates in one launch.
 
     ``raw/payload`` are positive-stride BF16 [B,T,C] tensors with distinct
@@ -220,11 +247,26 @@ def buffered_conv(raw, weight, state, read, width, ok, out, payload):
     ``read/width`` are contiguous int32 [B], ``ok`` bool [B]. The caller must
     run prepare_conv_blocks first and keep all metadata unchanged. Padding and
     invalid rows neither read state nor write output/payload. No state changes
-    until acceptance; T=1 follows the same path. Returns None, allocating nothing.
+    until acceptance; T=1 follows the same path. Explicit history_out is None
+    or FP32 [B,T,2*C/3] replay-order K-after-SiLU and V-before-SiLU scratch.
+    Returns None, allocating nothing.
     """
     if raw.ndim != 3 or min(raw.shape) < 1:
         raise ValueError("raw conv input must be nonempty [B,T,C]")
     batch, width_max, channels = raw.shape
+    extra = ()
+    if history_out is not None:
+        if (
+            width_max <= 1
+            or channels % 3
+            or history_out.shape != (batch, width_max, 2 * (channels // 3))
+            or history_out.dtype != torch.float32
+            or any(s <= 0 for s in history_out.stride())
+        ):
+            raise ValueError(
+                "history conv output requires FP32 packed K/value-accumulator"
+            )
+        extra = (history_out,)
     for tensor, shape in (
         (raw, raw.shape),
         (payload, raw.shape),
@@ -256,7 +298,7 @@ def buffered_conv(raw, weight, state, read, width, ok, out, payload):
             raise ValueError("conv metadata requires contiguous batch vectors")
     if any(
         not t.is_cuda or t.device != raw.device
-        for t in (raw, weight, state, read, width, ok, out, payload)
+        for t in (raw, weight, state, read, width, ok, out, payload, *extra)
     ):
         raise ValueError("conv tensors must share one GPU")
     _buffered_conv[(batch * width_max, triton.cdiv(channels, 256))](
@@ -268,6 +310,8 @@ def buffered_conv(raw, weight, state, read, width, ok, out, payload):
         ok,
         out,
         payload,
+        history_out,
+        () if history_out is None else history_out.stride(),
         raw.stride(),
         out.stride(),
         payload.stride(),
