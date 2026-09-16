@@ -204,13 +204,14 @@ input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
 Publication requires provenance, not just an allocated block or completed hash.
-The request's cache progress records the last aligned boundary materialized by
-local prefill, carried through the same ordered-forward contract as its token
-progress. Decode does not advance that record: verification commits only the
-accepted endpoint and may skip an aligned boundary. Admission, finish and
-retraction pass this provenance to the coordinator. A snapshot is publishable
+The request's cache progress records the last exact aligned boundary materialized
+by local prefill or accepted decode. Decode admission retains this evidence
+while the conservative hash frontier catches up, even after the accepted
+endpoint advances past it. Verification commits only its accepted endpoint:
+crossing a boundary does not prove that its state was written. Admission, finish
+and retraction pass this provenance to the coordinator. A snapshot is publishable
 only when the exact accepted endpoint equals the hashed boundary, or that exact
-boundary has prefill materialization provenance. The conservative admission
+boundary has retained materialization provenance. The conservative admission
 frontier (which subtracts the verify width) is not an exact state endpoint.
 Remote endpoint-only landings
 do not claim an internal prefill checkpoint.

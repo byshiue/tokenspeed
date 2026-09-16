@@ -106,12 +106,14 @@ An aligned endpoint is itself the checkpoint; an extent crossing no boundary
 needs only its final output. Only materialized aligned checkpoints are cached;
 an off-boundary endpoint is never keyed as a complete prefix.
 
-`CacheProgress::materialized_state_boundary_tokens` records the aligned
-boundary produced by the admitted local prefill. Publication of the preceding
-forward uses the old record before the next prefill advances it. Speculative
-decode preserves the record rather than claiming every crossed token boundary.
-The coordinator checks this exact boundary on admission, finish and retraction;
-an aligned accepted endpoint remains publishable without an internal snapshot.
+`CacheProgress::materialized_state_boundary_tokens` records the last exact aligned
+boundary produced by local prefill or accepted decode. Publication of the preceding
+forward uses the old record before the next prefill advances it. Decode admission
+retains an aligned accepted endpoint until the conservative publication frontier
+catches up; a later off-boundary endpoint must not erase that evidence. Merely
+crossing a boundary does not advance the record. The coordinator checks this exact
+boundary on admission, finish and retraction; an aligned accepted endpoint remains
+publishable without an internal snapshot.
 `Request::MaterializedStateBoundaryTokens()` resolves that endpoint from
 accepted feedback, not the conservative admission frontier. Capacity and
 retention continue to use their existing conservative token progress.
