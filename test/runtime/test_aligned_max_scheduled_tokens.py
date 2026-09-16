@@ -43,6 +43,7 @@ def _group(
         group_id=group_id,
         block_granularity=page_size,
         total_pages=8,
+        max_state_lag_tokens=0,
         retention=retention,
         family=family,
     )

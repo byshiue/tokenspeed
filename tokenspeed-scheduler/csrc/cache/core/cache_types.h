@@ -83,6 +83,9 @@ struct CacheGroupSpec {
     std::int32_t block_granularity{0};
     // Cyclic owners of the virtual blocks; must divide cache_blocks_per_lcm_block.
     std::int32_t shard_count{1};
+    // State-only retention lookback beyond the eager-state endpoint. Prefix
+    // reuse still requires one exactly materialized boundary snapshot.
+    std::int32_t max_state_lag_tokens{0};
 };
 
 // Per-group input for one admission. prefix_hashes is the request's cumulative

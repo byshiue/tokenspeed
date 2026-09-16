@@ -285,6 +285,7 @@ def pool_to_cache_groups(pool: Any) -> list:
             family=family,
             cache_blocks_per_lcm_block=int(packing[spec.group_id]),
             shard_count=spec.shard_count,
+            max_state_lag_tokens=spec.max_state_lag_tokens,
         )
         transfer_policy = spec.transfer_policy
         if transfer_policy is not None:

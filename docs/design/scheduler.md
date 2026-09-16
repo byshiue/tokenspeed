@@ -171,6 +171,16 @@ must count the entire materialized suffix, not assume that two outputs always
 occupy two adjacent slots. Tests cover small pools that must reject an oversized
 request instead of accepting a request that can never produce a forward.
 
+State groups may declare `max_state_lag_tokens` to retain a live state behind
+accepted progress. On every role, the startup bound adds
+`ceil(max_state_lag_tokens / block_granularity)` blocks to its existing state
+working-set bound before physical packing. Zero preserves today's sizing;
+the extra allowance is conservative headroom, not additional prefill output.
+Admission credit and reclamation use the same extended retention rule in
+`GroupGeometry`, while prefix matching still requires only one exact snapshot
+([Cache concepts](cache-concepts.md#live-state-retention-lag)). This declaration
+does not enable buffered execution or make a lagging snapshot publishable.
+
 ## 2. Retraction: when admission fails
 
 `maybeRetractForCapacity` fires when **no prefill made progress** this round

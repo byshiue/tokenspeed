@@ -32,6 +32,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.disable_prefix_cache = False
     cfg.cache_groups = [
         ts.CacheGroupConfig(
+            max_state_lag_tokens=0,
             group_id=group_id,
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,

@@ -147,6 +147,7 @@ def test_cache_batch_metadata_accepts_npu_tables():
         token_capacity=4,
         group_specs=(
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="full_attention",
                 retention="full_history",
                 rows_per_page=4,

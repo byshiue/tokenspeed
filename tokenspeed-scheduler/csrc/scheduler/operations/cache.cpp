@@ -67,6 +67,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
                 .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
                 .block_granularity = group.block_granularity,
                 .shard_count = group.shard_count,
+                .max_state_lag_tokens = group.max_state_lag_tokens,
             });
             continue;
         }
@@ -77,6 +78,7 @@ std::vector<CacheGroupSpec> MakeSpecsFromConfig(const SchedulerConfig& config) {
             .cache_blocks_per_lcm_block = group.cache_blocks_per_lcm_block,
             .block_granularity = group.block_granularity,
             .shard_count = group.shard_count,
+            .max_state_lag_tokens = group.max_state_lag_tokens,
         });
     }
     return specs;

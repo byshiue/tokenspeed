@@ -273,6 +273,44 @@ disappear from the GPU budget. (Platforms without the replay kernels fall
 back to the dense `max_bs * (draft_tokens + 1)` per-position state
 workspace, reserved the same way.)
 
+#### Live-state retention lag
+
+`CacheGroupSpec.max_state_lag_tokens` is a non-negative token count, not a
+geometry or prefix-matching grain. It bounds how far a live state consumer may
+read behind accepted progress. History groups must declare zero. Current state
+recipes also declare zero: they still materialize the accepted endpoint each
+round. The field alone does not enable buffered replay.
+
+For a state-group span `G`, conservative scheduler progress `p`, and declared
+lag `d`, only block-table slots below `max(0, floor((p - d - 1) / G))` may
+expire. The `-1` is necessary because state at endpoint `c` occupies slot
+`(c - 1) / G`, including when `c` is aligned. Admission's reclaim credit,
+victim planning, in-place-reserve checks and actual reclamation all use
+`GroupGeometry::ExpiredBlocksAt`; none may independently assume zero lag.
+Overlap protection still comes from conservative scheduler progress and its
+existing reservation horizon, not from silently enlarging `d`.
+
+Matching remains the window-2, single-materialized-snapshot policy. A prefix
+hit initializes a new consumer at that snapshot; it does not need the old
+request's replay history. A larger retention lag grants no publication or
+transfer provenance. Buffered execution must provide that separate contract
+before dispatch is enabled.
+
+Capacity bounds conservatively add `ceil(d / G)` state blocks per live request
+to the existing eager-state working set, before LCM packing. Kimi-K3 keeps its
+larger prefill input/checkpoint/tail/growth budget; the lag allowance is not a
+replacement for it. The C++ single-request bound includes the same extra
+lookback on every role: a declared lag also delays prefill reclamation, even
+though current prefill-only consumers have no need to declare one.
+This is reserved headroom, not an assertion that every allowance block is live
+at the same time, nor a measurement of replay-history memory.
+
+The Python spec and parameterized scheduler binding require an explicit lag,
+including zero, and the bridge carries it unchanged. Serialized group specs
+carry it too; peers missing the field fail contract decoding rather than
+silently guessing eager-state retention. Rebuild the scheduler extension
+together with runtime updates to this contract.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables
@@ -480,8 +518,9 @@ The conversion is `GroupGeometry` in the coordinator layer:
   bookkeeping values the manager stores verbatim; the manager executes the
   plan without deriving anything.
 * `ExpiredBlocksAt(spec, num_computed_tokens)` is the retention *policy*
-  (full attention never expires; SWA and Mamba-at-window-2 slide out whole
-  pages); the manager only *executes* the resulting block count. This is
+  (full attention never expires; SWA and state groups retire whole blocks,
+  with state's window-2 baseline extended by its declared live-state lag);
+  the manager only *executes* the resulting block count. This is
   what dissolved the old `SwaManager`/`MambaStateManager` subclasses.
 
 Where reclaim needs to know whether a block is still cached, it takes the

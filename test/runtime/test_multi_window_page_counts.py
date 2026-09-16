@@ -104,6 +104,7 @@ NULL_PAGE = _pcs.NULL_PAGES
 
 def _spec(group_id, retention, window=None, rows_per_page=64):
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=group_id,
         retention=retention,
         rows_per_page=rows_per_page,

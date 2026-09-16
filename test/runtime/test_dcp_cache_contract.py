@@ -79,6 +79,7 @@ register_cuda_ci(
 
 def _full_history_spec(group_id: str, *, shard_count: int) -> CacheGroupSpec:
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=group_id,
         retention="full_history",
         rows_per_page=64,

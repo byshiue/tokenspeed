@@ -52,6 +52,7 @@ def make_config(
     cfg.num_device_pages = num_device_pages
     cfg.cache_groups = [
         CacheGroupConfig(
+            max_state_lag_tokens=0,
             group_id="full_attention",
             block_granularity=prefix_granularity,
             total_pages=num_device_pages,

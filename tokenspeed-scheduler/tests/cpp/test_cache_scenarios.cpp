@@ -303,6 +303,38 @@ TEST(MambaStateCheckpointCapacityTest, CountsRetainedInputForChunkedSingleForwar
     }
 }
 
+TEST(MambaStateCheckpointCapacityTest, BudgetsDeclaredLagOnEveryRole) {
+    for (Role role : {Role::kFused, Role::kD, Role::kP}) {
+        for (std::int32_t lag : {0, 1, 4, 5, 12}) {
+            SCOPED_TRACE(::testing::Message() << "role=" << static_cast<int>(role) << " lag=" << lag);
+            SchedulerConfig cfg{};
+            cfg.role = role;
+            cfg.prefix_granularity = 4;
+            cfg.max_scheduled_tokens = 8;
+            cfg.max_batch_size = 1;
+            cfg.disable_l2_cache = true;
+            cfg.disable_prefix_cache = true;
+            // Restoring the zero-lag two-block bound must pay for lag on
+            // every role: a declared lookback also delays prefill reclaim.
+            cfg.device_allocator.total_pages = 3 + (lag + 3) / 4;
+            CacheGroupConfig state = MakeGroup("state", 4, cfg.device_allocator.total_pages,
+                                               CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0);
+            state.transfer_policy = CacheTransferPolicy::LatestSnapshot;
+            state.max_state_lag_tokens = lag;
+            cfg.cache_groups = {state};
+            EXPECT_EQ(MakeSpecsFromConfig(cfg)[0].max_state_lag_tokens, lag);
+            Scheduler funded{cfg};
+            EXPECT_EQ(funded.MaxSingleRequestTokens(), role == Role::kP ? 8 : 5);
+            if (lag > 0) {
+                --cfg.device_allocator.total_pages;
+                --cfg.cache_groups[0].total_pages;
+                Scheduler short_one_block{cfg};
+                EXPECT_LT(short_one_block.MaxSingleRequestTokens(), funded.MaxSingleRequestTokens());
+            }
+        }
+    }
+}
+
 TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkSuffixAndSubPageGrowth) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 4;
