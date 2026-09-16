@@ -242,8 +242,17 @@ FMA 规则，同时保留冻结旧版作独立对照。这允许新算术与旧�
 8 个 rank 的 1656 个真实张量 layer/case 中，新 unbuffered/buffered 逐位一致，
 包含 CUDA graph、accepted state 与下一窗口 flush。相对冻结旧版，verify 有
 约 0.0124% 输出元素不同，最大绝对差 0.00048828125；这不是 AR/AIME 验证。
-不采用 M59 的 value-row 特判，不新增用户开关。本次一并提交实现与验证记录；下一步
-仍需对当前共享算术进行三组 KDA 性能对照，再完成固定 L8/C4 的完整模型验证。
+不采用 M59 的 value-row 特判，不新增用户开关。
+M70 在 `5fc562dd` 上优化共享算术的执行方式：warp 内保留相同归约树、逐 token
+交错 verify/history recurrence，并合并 conv/gate producer launch。小 row 数的
+history gate 保留原 scalar kernel，避免改变 FP32 舍入。scratch 预算不增加。
+最终代码通过 197 项 kernel 测试、240 项 runtime 测试与 117 项 subtest（3 项既有
+skip），以及 8 个 rank 的全部 1656 个真实张量 layer/case。开启 CUDA graph 的
+L8/B4/T4 KDA 局部对照已达到冻结原版耗时水平；详细重复测量见 M70 记录。
+该测试使用保存的真实 NVFP4 激活，包含两个窗口的 producers、recurrence 和
+accepted commit，不包含完整模型，旧 producer 也未模拟 runtime StreamFork
+重叠。因此下一步仍需固定 L8/C4 的完整模型 token/AR、AIME 和 E2E 性能验证，
+不能以局部结果替代这些门槛。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 

@@ -471,203 +471,220 @@ def _buffered_recurrent(
     if TRANSFORM_INPUTS:
         a_scale = gl.exp(gl.load(A_LOG + head).to(gl.float32))
         bias = gl.load(DT_BIAS + head * DK + nk, nk < DK, 0).to(gl.float32)
-    for phase in gl.static_range(2 if dual_history else 1):
-        if phase == 1:
-            # Match accepted replay's one-key-per-lane register ownership.
-            # Value rows are independent; retain the candidate's smaller BV.
-            history_state_layout: gl.constexpr = gl.BlockedLayout(
-                [1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]
-            )
-            phase_kk = gl.arange(
-                0, BK, layout=gl.SliceLayout(0, history_state_layout)
-            ).to(gl.int64)
-            phase_vv = (
-                tile * BV
-                + gl.arange(0, BV, layout=gl.SliceLayout(1, history_state_layout))
-            ).to(gl.int64)
-            state = gl.convert_layout(initial_state, history_state_layout)
-        else:
-            phase_kk = kk
-            phase_vv = vv
-            state = initial_state
-        if phase == 0 and align_verify:
-            # Match the ordinary verify's zero-initialized state accumulator.
-            state += 0.0
-        if phase == 1:
-            # Original accepted replay normalizes K within one warp. Other
-            # warps replicate the vector; verify retains its own layout.
-            replay_normalization_layout: gl.constexpr = gl.SliceLayout(
-                0, gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0])
-            )
-            phase_keys = gl.arange(0, BK, layout=replay_normalization_layout).to(
-                gl.int64
-            )
-            if TRANSFORM_INPUTS:
-                phase_bias = gl.convert_layout(bias, phase_keys.type.layout)
-        else:
-            phase_keys = nk
-            if TRANSFORM_INPUTS:
-                phase_bias = bias
-        for token in range(width):
-            if phase == 0:
-                q = gl.load(
-                    Q + _input_offset(row, token, head, phase_keys, Q_STRIDES),
-                    phase_keys < DK,
-                    0,
-                ).to(gl.float32)
-            k = gl.load(
-                K + _input_offset(row, token, head, phase_keys, K_STRIDES),
-                phase_keys < DK,
-                0,
-            ).to(gl.float32)
-            v = gl.load(
-                V + _input_offset(row, token, head, phase_vv, V_STRIDES),
-                phase_vv < DV,
-                0,
-            ).to(gl.float32)
-            d = gl.load(
-                D + _input_offset(row, token, head, phase_keys, D_STRIDES),
-                phase_keys < DK,
-                0,
-            ).to(gl.float32)
-            if phase == 1 and HAS_HISTORY_INPUTS:
-                k = gl.load(
-                    HISTORY_K_INPUT
-                    + _input_offset(
-                        row, token, head, phase_keys, HISTORY_INPUT_STRIDES[0]
-                    ),
-                    phase_keys < DK,
-                    0,
-                ).to(gl.float32)
-            if FP32_PRODUCERS and phase == 0:
-                q = q.to(gl.bfloat16).to(gl.float32)
-                k = k.to(gl.bfloat16).to(gl.float32)
-                v = v.to(gl.bfloat16).to(gl.float32)
-                d = d.to(gl.bfloat16).to(gl.float32)
-            if TRANSFORM_INPUTS:
-                gate = d + phase_bias
-                if LOWER_BOUND is not None:
-                    log_decay = LOWER_BOUND * _sigmoid(a_scale * gate)
-                else:
-                    log_decay = -a_scale * gl.where(
-                        gate < 20.0, gl.log(1 + gl.exp(gate)), gate
-                    )
-                if phase == 0 and not align_verify:
-                    q /= gl.sqrt(gl.sum(q * q, 0) + 1e-6)
+    # Interleave the independent verify/history chains per token. This exposes
+    # instruction-level overlap while keeping their state and rounding separate.
+    verify_state = initial_state
+    replay_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]
+    )
+    replay_state = gl.convert_layout(initial_state, replay_layout)
+    for token_index in gl.static_range(T):
+        token = width * 0 + token_index
+        if token < width:
+            for phase in gl.static_range(2 if dual_history else 1):
                 if phase == 1:
-                    # The original PTX rounds squares before their reduction.
-                    # An opaque multiply prevents contraction into reduction FMAs,
-                    # without disabling FMA for the recurrent update/projection.
-                    squared = gl.inline_asm_elementwise(
-                        "mul.rn.f32 $0, $1, $2;",
-                        constraints="=f,f,f",
-                        args=(k, k),
-                        dtype=gl.float32,
-                        is_pure=True,
-                        pack=1,
+                    # Match accepted replay's one-key-per-lane register ownership.
+                    # Value rows are independent; retain the candidate's smaller BV.
+                    history_state_layout: gl.constexpr = gl.BlockedLayout(
+                        [1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]
                     )
+                    phase_kk = gl.arange(
+                        0, BK, layout=gl.SliceLayout(0, history_state_layout)
+                    ).to(gl.int64)
+                    phase_vv = (
+                        tile * BV
+                        + gl.arange(
+                            0, BV, layout=gl.SliceLayout(1, history_state_layout)
+                        )
+                    ).to(gl.int64)
+                    state = replay_state
                 else:
-                    squared = k * k
-                if phase == 0 and align_verify:
-                    q, k = verify_normalize(q, k, DK**-0.5, gl)
+                    phase_kk = kk
+                    phase_vv = vv
+                    state = verify_state
+                if phase == 0 and align_verify and token_index == 0:
+                    # Match the ordinary verify's zero-initialized state accumulator.
+                    state += 0.0
+                if phase == 1:
+                    # Original accepted replay normalizes K within one warp. Other
+                    # warps replicate the vector; verify retains its own layout.
+                    replay_normalization_layout: gl.constexpr = gl.SliceLayout(
+                        0,
+                        gl.BlockedLayout([1, 1], [1, 32], [gl.num_warps(), 1], [1, 0]),
+                    )
+                    phase_keys = gl.arange(
+                        0, BK, layout=replay_normalization_layout
+                    ).to(gl.int64)
+                    if TRANSFORM_INPUTS:
+                        phase_bias = gl.convert_layout(bias, phase_keys.type.layout)
                 else:
-                    k /= gl.sqrt(gl.sum(squared, 0) + 1e-6)
+                    phase_keys = nk
+                    if TRANSFORM_INPUTS:
+                        phase_bias = bias
+                if phase == 0:
+                    q = gl.load(
+                        Q + _input_offset(row, token, head, phase_keys, Q_STRIDES),
+                        phase_keys < DK,
+                        0,
+                    ).to(gl.float32)
+                k = gl.load(
+                    K + _input_offset(row, token, head, phase_keys, K_STRIDES),
+                    phase_keys < DK,
+                    0,
+                ).to(gl.float32)
+                v = gl.load(
+                    V + _input_offset(row, token, head, phase_vv, V_STRIDES),
+                    phase_vv < DV,
+                    0,
+                ).to(gl.float32)
+                d = gl.load(
+                    D + _input_offset(row, token, head, phase_keys, D_STRIDES),
+                    phase_keys < DK,
+                    0,
+                ).to(gl.float32)
                 if phase == 1 and HAS_HISTORY_INPUTS:
-                    log_decay = gl.load(
-                        HISTORY_LOG_INPUT
+                    k = gl.load(
+                        HISTORY_K_INPUT
                         + _input_offset(
-                            row, token, head, phase_keys, HISTORY_INPUT_STRIDES[2]
+                            row, token, head, phase_keys, HISTORY_INPUT_STRIDES[0]
                         ),
                         phase_keys < DK,
                         0,
                     ).to(gl.float32)
-                d = gl.exp(log_decay)
-            d = gl.convert_layout(d, phase_kk.type.layout)
-            k = gl.convert_layout(k, phase_kk.type.layout)
-            if phase == 0 and align_verify:
-                beta = _sigmoid(
-                    gl.load(
+                if FP32_PRODUCERS and phase == 0:
+                    q = q.to(gl.bfloat16).to(gl.float32)
+                    k = k.to(gl.bfloat16).to(gl.float32)
+                    v = v.to(gl.bfloat16).to(gl.float32)
+                    d = d.to(gl.bfloat16).to(gl.float32)
+                if TRANSFORM_INPUTS:
+                    gate = d + phase_bias
+                    if LOWER_BOUND is not None:
+                        log_decay = LOWER_BOUND * _sigmoid(a_scale * gate)
+                    else:
+                        log_decay = -a_scale * gl.where(
+                            gate < 20.0, gl.log(1 + gl.exp(gate)), gate
+                        )
+                    if phase == 0 and not align_verify:
+                        q /= gl.sqrt(gl.sum(q * q, 0) + 1e-6)
+                    if phase == 1:
+                        # The original PTX rounds squares before their reduction.
+                        # An opaque multiply prevents contraction into reduction FMAs,
+                        # without disabling FMA for the recurrent update/projection.
+                        squared = gl.inline_asm_elementwise(
+                            "mul.rn.f32 $0, $1, $2;",
+                            constraints="=f,f,f",
+                            args=(k, k),
+                            dtype=gl.float32,
+                            is_pure=True,
+                            pack=1,
+                        )
+                    else:
+                        squared = k * k
+                    if phase == 0 and align_verify:
+                        q, k = verify_normalize(q, k, DK**-0.5, gl)
+                    else:
+                        k /= gl.sqrt(gl.sum(squared, 0) + 1e-6)
+                    if phase == 1 and HAS_HISTORY_INPUTS:
+                        log_decay = gl.load(
+                            HISTORY_LOG_INPUT
+                            + _input_offset(
+                                row, token, head, phase_keys, HISTORY_INPUT_STRIDES[2]
+                            ),
+                            phase_keys < DK,
+                            0,
+                        ).to(gl.float32)
+                    d = gl.exp(log_decay)
+                d = gl.convert_layout(d, phase_kk.type.layout)
+                k = gl.convert_layout(k, phase_kk.type.layout)
+                if phase == 0 and align_verify:
+                    beta = _sigmoid(
+                        gl.load(
+                            BETA
+                            + row * BETA_STRIDES[0]
+                            + token.to(gl.int64) * BETA_STRIDES[1]
+                            + head * BETA_STRIDES[2]
+                        ).to(gl.float32)
+                    )
+                    q = gl.convert_layout(q, phase_kk.type.layout)
+                    state, output, correction = verify_recurrence(
+                        state, q, k, v, d, beta, gl
+                    )
+                else:
+                    state *= d[None, :]
+                    projection = gl.sum(state * k[None, :], 1)
+                    if phase == 1 and HAS_HISTORY_INPUTS:
+                        # Replay fuses SiLU's final multiply with the subtraction.
+                        v_acc = gl.load(
+                            HISTORY_V_ACC
+                            + _input_offset(
+                                row, token, head, phase_vv, HISTORY_INPUT_STRIDES[1]
+                            ),
+                            phase_vv < DV,
+                            0,
+                        ).to(gl.float32)
+                        correction = gl.fma(v_acc, _sigmoid(v_acc), -projection)
+                    else:
+                        correction = v - projection
+                    beta = gl.load(
                         BETA
                         + row * BETA_STRIDES[0]
                         + token.to(gl.int64) * BETA_STRIDES[1]
                         + head * BETA_STRIDES[2]
                     ).to(gl.float32)
-                )
-                q = gl.convert_layout(q, phase_kk.type.layout)
-                state, output, correction = verify_recurrence(
-                    state, q, k, v, d, beta, gl
-                )
-            else:
-                state *= d[None, :]
-                projection = gl.sum(state * k[None, :], 1)
-                if phase == 1 and HAS_HISTORY_INPUTS:
-                    # Replay fuses SiLU's final multiply with the subtraction.
-                    v_acc = gl.load(
-                        HISTORY_V_ACC
-                        + _input_offset(
-                            row, token, head, phase_vv, HISTORY_INPUT_STRIDES[1]
-                        ),
+                    if TRANSFORM_INPUTS:
+                        beta = _sigmoid(beta)
+                    correction *= beta
+                    if phase == 1:
+                        state = gl.fma(correction[:, None], k[None, :], state)
+                    else:
+                        state += correction[:, None] * k[None, :]
+                if phase == 0:
+                    if not align_verify:
+                        q = gl.convert_layout(q, phase_kk.type.layout)
+                        output = gl.sum(state * q[None, :], 1)
+                        output *= DK**-0.5
+                    gl.store(
+                        OUT + _input_offset(row, token, head, phase_vv, OUT_STRIDES),
+                        output,
                         phase_vv < DV,
-                        0,
-                    ).to(gl.float32)
-                    correction = gl.fma(v_acc, _sigmoid(v_acc), -projection)
-                else:
-                    correction = v - projection
-                beta = gl.load(
-                    BETA
-                    + row * BETA_STRIDES[0]
-                    + token.to(gl.int64) * BETA_STRIDES[1]
-                    + head * BETA_STRIDES[2]
-                ).to(gl.float32)
-                if TRANSFORM_INPUTS:
-                    beta = _sigmoid(beta)
-                correction *= beta
-                if phase == 1:
-                    state = gl.fma(correction[:, None], k[None, :], state)
-                else:
-                    state += correction[:, None] * k[None, :]
-            if phase == 0:
-                if not align_verify:
-                    q = gl.convert_layout(q, phase_kk.type.layout)
-                    output = gl.sum(state * q[None, :], 1)
-                    output *= DK**-0.5
-                gl.store(
-                    OUT + _input_offset(row, token, head, phase_vv, OUT_STRIDES),
-                    output,
-                    phase_vv < DV,
-                )
-            if phase == 1 or not dual_history:
-                block, token_row = _history_offset(
-                    HISTORY_TABLE, row, end + token, HISTORY_TABLE_STRIDE, ROWS
-                )
-                if tile == 0:
-                    gl.store(
-                        HK
-                        + block * HK_STRIDES[0]
-                        + token_row * HK_STRIDES[1]
-                        + head * HK_STRIDES[2]
-                        + phase_kk * HK_STRIDES[3],
-                        k,
-                        phase_kk < DK,
                     )
-                    gl.store(
-                        HD
-                        + block * HD_STRIDES[0]
-                        + token_row * HD_STRIDES[1]
-                        + head * HD_STRIDES[2]
-                        + phase_kk * HD_STRIDES[3],
-                        d,
-                        phase_kk < DK,
+                if phase == 1 or not dual_history:
+                    block, token_row = _history_offset(
+                        HISTORY_TABLE, row, end + token, HISTORY_TABLE_STRIDE, ROWS
                     )
-                gl.store(
-                    HU
-                    + block * HU_STRIDES[0]
-                    + token_row * HU_STRIDES[1]
-                    + head * HU_STRIDES[2]
-                    + phase_vv * HU_STRIDES[3],
-                    correction,
-                    phase_vv < DV,
-                )
+                    if tile == 0:
+                        gl.store(
+                            HK
+                            + block * HK_STRIDES[0]
+                            + token_row * HK_STRIDES[1]
+                            + head * HK_STRIDES[2]
+                            + phase_kk * HK_STRIDES[3],
+                            k,
+                            phase_kk < DK,
+                        )
+                        gl.store(
+                            HD
+                            + block * HD_STRIDES[0]
+                            + token_row * HD_STRIDES[1]
+                            + head * HD_STRIDES[2]
+                            + phase_kk * HD_STRIDES[3],
+                            d,
+                            phase_kk < DK,
+                        )
+                    gl.store(
+                        HU
+                        + block * HU_STRIDES[0]
+                        + token_row * HU_STRIDES[1]
+                        + head * HU_STRIDES[2]
+                        + phase_vv * HU_STRIDES[3],
+                        correction,
+                        phase_vv < DV,
+                    )
+                if phase == 0:
+                    verify_state = state
+                else:
+                    replay_state = state
+            state = verify_state
 
 
 @register_kernel(
@@ -962,7 +979,7 @@ def triton_kda_buffered_recurrent(
     num_stages = 1
     if align_verify and heads == 12 and key_dim == value_dim == 128:
         value_tile = 8 if batch < 16 else 16
-        num_warps = 4 if batch < 4 else 1
+        num_warps = 4 if batch <= 4 else 1
         num_stages = 3
     _buffered_recurrent[(batch, heads, triton.cdiv(value_dim, value_tile))](
         query,

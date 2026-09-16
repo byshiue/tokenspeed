@@ -36,8 +36,7 @@ from tokenspeed_kernel.ops.attention.kda import (
     resolve_kda_buffered_recurrent,
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
-    buffered_conv,
-    buffered_history_gate,
+    buffered_producers,
     commit_conv_windows,
     commit_positions,
     materialize_endpoints,
@@ -56,7 +55,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
     HybridKDATokenToKVPool,
     KDAReplayLayer,
 )
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -388,11 +386,6 @@ class KDAReplayWorkspace:
         producer_dtype = (
             torch.float32 if self.metadata.layout.max_window > 1 else torch.bfloat16
         )
-        # PyTorch's out_dtype overload accepts a dtype, not None. Bind the
-        # optional FP32 output request once; BF16 uses its ordinary GEMM.
-        self._gate_mm_options = (
-            {"out_dtype": torch.float32} if producer_dtype == torch.float32 else {}
-        )
         # Resolve once, before workspace allocation/capture. The inner loop
         # calls the selected implementation directly, without per-layer search.
         self.recurrent_kernel = resolve_kda_buffered_recurrent(
@@ -504,15 +497,11 @@ class KDAReplayWorkspace:
             dtype=torch.int64,
             device=device,
         )
-        self._producer_stream = torch.cuda.Stream(device=device, priority=-1)
-        self._forks = {
-            layer: StreamFork(self._producer_stream) for layer in self.layer_ids
-        }
         self._views: dict[tuple[int, int], tuple] = {}
 
     @property
     def nbytes(self) -> int:
-        """Allocated tensor bytes, excluding LCM fields and CUDA event overhead."""
+        """Allocated tensor bytes, excluding the cache-owned LCM fields."""
         meta = self.metadata
         return sum(
             t.nbytes
@@ -599,8 +588,8 @@ class KDAReplayWorkspace:
         raw_qkv is [B,T,C], f_a [B*T,rank], f_b_weight [H*K,rank], beta logits
         [B,T,H], A_log FP32 [H], dt_bias FP32 [H*K]. Metadata preparation must
         have validated the group before this call. The conv producer captures
-        raw candidates; gate GEMM overlaps it using the existing StreamFork
-        protocol. All outputs have stable, preallocated storage on both paths.
+        raw candidates; disjoint conv/gate CTA ranges share one launch. All
+        outputs have stable, preallocated storage on eager and captured paths.
         """
         conv_out, payload, q, k, v, gate, out, history_conv, history_inputs = (
             self._layer_views(layer_id, bs)
@@ -616,37 +605,31 @@ class KDAReplayWorkspace:
             raise ValueError("buffered raw/gate input geometry is inconsistent")
         meta = self.metadata.layer(layer_id, bs)
         conv, state = self._state[layer_id]
-        with self._forks[layer_id].scope(enable=True, overlap=True) as fork:
-            with fork.branch():
-                torch.mm(
-                    f_a,
-                    f_b_weight.t(),
-                    out=gate.view(-1, self.heads * self.key_dim),
-                    **self._gate_mm_options,
-                )
-            buffered_conv(
-                raw_qkv,
-                conv_weight,
-                conv,
-                meta.conv_read,
-                meta.width,
-                meta.ok,
-                conv_out,
-                payload,
-                history_out=history_conv,
-            )
-            if history_inputs is not None:
-                buffered_history_gate(
-                    f_a,
-                    f_b_weight,
-                    A_log,
-                    dt_bias,
-                    history_inputs[2].view(-1, self.heads * self.key_dim),
-                    num_heads=self.heads,
-                    head_dim=self.key_dim,
-                    local_layers=len(self.layer_ids),
-                    lower_bound=lower_bound,
-                )
+        buffered_producers(
+            raw_qkv,
+            conv_weight,
+            conv,
+            meta.conv_read,
+            meta.width,
+            meta.ok,
+            conv_out,
+            payload,
+            f_a,
+            f_b_weight,
+            A_log,
+            dt_bias,
+            gate.view(-1, self.heads * self.key_dim),
+            history_conv=history_conv,
+            history_gate=(
+                None
+                if history_inputs is None
+                else history_inputs[2].view(-1, self.heads * self.key_dim)
+            ),
+            num_heads=self.heads,
+            head_dim=self.key_dim,
+            local_layers=len(self.layer_ids),
+            lower_bound=lower_bound,
+        )
         history = self._history[layer_id]
         self.recurrent_kernel(
             q,

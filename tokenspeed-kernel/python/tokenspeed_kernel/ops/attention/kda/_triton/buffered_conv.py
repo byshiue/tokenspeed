@@ -159,12 +159,19 @@ def _buffered_conv(
     T: tl.constexpr,
     C: tl.constexpr,
     BLOCK: tl.constexpr,
+    LINEAR_BASE: tl.constexpr,
 ):
-    packed_row = tl.program_id(0).to(tl.int64)
+    if LINEAR_BASE is not None:
+        linear = tl.program_id(0) - LINEAR_BASE
+        packed_row = (linear // triton.cdiv(C, BLOCK)).to(tl.int64)
+        channel_block = linear % triton.cdiv(C, BLOCK)
+    else:
+        packed_row = tl.program_id(0).to(tl.int64)
+        channel_block = tl.program_id(1)
     row, token = packed_row // T, packed_row % T
     if token >= tl.load(WIDTH + row) or not tl.load(OK + row):
         return
-    channel = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    channel = channel_block * BLOCK + tl.arange(0, BLOCK)
     mask = channel < C
     page = tl.load(READ + row).to(tl.int64)
     acc = tl.full((BLOCK,), 0, tl.float32)
@@ -251,6 +258,37 @@ def buffered_conv(raw, weight, state, read, width, ok, out, payload, *, history_
     or FP32 [B,T,2*C/3] replay-order K-after-SiLU and V-before-SiLU scratch.
     Returns None, allocating nothing.
     """
+    batch, width_max, channels = _validate_conv_inputs(
+        raw, weight, state, read, width, ok, out, payload, history_out=history_out
+    )
+    _buffered_conv[(batch * width_max, triton.cdiv(channels, 256))](
+        raw,
+        weight,
+        state,
+        read,
+        width,
+        ok,
+        out,
+        payload,
+        history_out,
+        () if history_out is None else history_out.stride(),
+        raw.stride(),
+        out.stride(),
+        payload.stride(),
+        state.stride(),
+        weight.stride(),
+        width_max,
+        channels,
+        256,
+        None,
+        num_warps=4,
+    )
+
+
+def _validate_conv_inputs(
+    raw, weight, state, read, width, ok, out, payload, *, history_out
+):
+    """Shared storage contract for standalone and fused producer launches."""
     if raw.ndim != 3 or min(raw.shape) < 1:
         raise ValueError("raw conv input must be nonempty [B,T,C]")
     batch, width_max, channels = raw.shape
@@ -301,27 +339,7 @@ def buffered_conv(raw, weight, state, read, width, ok, out, payload, *, history_
         for t in (raw, weight, state, read, width, ok, out, payload, *extra)
     ):
         raise ValueError("conv tensors must share one GPU")
-    _buffered_conv[(batch * width_max, triton.cdiv(channels, 256))](
-        raw,
-        weight,
-        state,
-        read,
-        width,
-        ok,
-        out,
-        payload,
-        history_out,
-        () if history_out is None else history_out.stride(),
-        raw.stride(),
-        out.stride(),
-        payload.stride(),
-        state.stride(),
-        weight.stride(),
-        width_max,
-        channels,
-        256,
-        num_warps=4,
-    )
+    return batch, width_max, channels
 
 
 @triton.jit

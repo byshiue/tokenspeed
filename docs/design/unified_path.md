@@ -513,9 +513,11 @@ an alternate serving path.
 The experimental `KDAReplayWorkspace` composes that metadata with one
 width-parameterized conv/gate/recurrent forward. Conv preparation validates
 the current endpoint's source and every possible acceptance destination once
-per group. The four-tap conv producer consumes BF16 inputs and captures raw candidates while
-computing conv outputs; gate GEMM uses preallocated output on the existing
-`StreamFork` protocol, joined before recurrence. The workspace retains raw
+per group. The four-tap conv producer consumes BF16 inputs and captures raw
+candidates while computing conv outputs. Independent conv and gate CTAs share
+one launch and preallocated outputs; recurrence follows on the same stream.
+The gate CTAs are issued first to reduce the launch tail. There is no cross-CTA
+communication or producer stream/event state. The workspace retains raw
 candidates per local layer but shares conv/gate/output scratch across layers.
 Each layer must consume its output before the following layer reuses it.
 These are per-round tensors, not private persistent request state.
@@ -524,14 +526,21 @@ Multi-token windows keep separate representations for verification and accepted
 history. Verify rounds the conv/gate producers to BF16. History consumes
 replay-order FP32 K, pre-SiLU V, and log-decay; keeping V before SiLU preserves
 the replay's fused projection subtraction. The conv producer writes the extra
-K/V scratch in the same launch, while a separate gate producer uses the batched
-accepted replay's gate tiling. Its scratch is shared across layers and included
-in the recipe budget, not added to persistent request state.
+K/V scratch in the same launch. With at least 16 packed token rows, gate CTAs
+compute both the raw verify dot and the replay dot with bias as the initial MMA
+accumulator. Adding bias to the rounded raw dot is not equivalent. Smaller
+row counts retain the separate scalar history-gate launch: fusing that reduction
+with MMA changes its FP32 rounding. Both use accepted replay's gate tiling.
+The scratch is shared across layers and included in the recipe budget, not
+added to persistent request state.
 
-Two register-local recurrence phases start from one reconstructed committed
-state; only the history phase supplies the FP32 K/U/D entries. There is no second
-reconstruction or post-acceptance replay. Width one
-retains ordinary decode's BF16 producer/state arithmetic through the same
+Two register-local recurrence chains start from one reconstructed committed
+state. Their independent updates are interleaved per token to expose instruction
+overlap; each chain retains its own operation order and only the history chain
+supplies the FP32 K/U/D entries. The static maximum window is unrolled, with
+live width guarding every token's reads and stores. There is no second
+reconstruction or post-acceptance replay. Width one retains ordinary decode's
+BF16 producer/state arithmetic through the same
 forward and commit. The static scratch dtype follows the maximum window and
 is included in recipe accounting before graph capture. Native verification
 outputs remain BF16; changing the producer precision does not change weights,
@@ -544,7 +553,9 @@ output use a balanced tree that pairs adjacent logical keys at each level,
 regardless of tile or warp layout. Products and additions round separately;
 normalization uses round-to-nearest square root/division, and Q is scaled before
 the output dot. State decay rounds before the correction FMA. Every value row
-follows the same rule. Layout conversions preserve that arithmetic, and no
+follows the same rule. Gluon places four adjacent keys in each lane, performs
+two local pair levels and five warp-shuffle levels with explicit rounded adds.
+This preserves the logical tree without repeated layout conversions. No
 global compiler optimization is disabled. Other head dimensions/vendors and
 ordinary decode retain their existing arithmetic.
 

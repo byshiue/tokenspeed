@@ -699,6 +699,9 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # n
     prepare_positions,
     refresh_decode_inputs,
 )
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_producers import (  # noqa: E402
+    buffered_producers,
+)
 from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noqa: E402
     capture_replay_payload,
 )

@@ -6,6 +6,15 @@ Passing a reference test does not mean buffered replay is available in serving.
 
 ## Current validation status
 
+M70 optimizes the committed shared-arithmetic implementation (`5fc562dd`)
+without changing its numerical contract. The working patch uses warp-local
+verify reductions, token-interleaved recurrence and fused conv/gate producers.
+Final-source validation passes 197 kernel tests, 240 runtime tests plus 117
+subtests (three existing skips), and all 1656 real-input layer/cases. The CUDA-
+graph KDA-only comparison reaches frozen-original latency at L8/B4/T4; see M70
+below for repeated measurements and scope. This is not a full-model performance,
+AR or AIME pass. Those gates remain open.
+
 M69 integrates replay-order producers and ordered reconstruction with a
 user-approved shared verify arithmetic contract into the working tree. Local
 validation passes: 187 kernel tests, 240 runtime tests plus 117 subtests (three
@@ -4093,3 +4102,93 @@ No full model, AR, AIME, new NSYS or performance measurement is claimed here.
 Earlier M61/M67/M68 numbers do not apply to the new arithmetic contract. Next
 measure the three arms in the same KDA benchmark, then validate fixed L8/C4
 real-model token/acceptance behavior and current-source AIME.
+
+### M70: recover shared buffered KDA performance
+
+This stage starts from `5fc562dd51a495b5dfdf5f9636fd99bf0632dfb3` on
+`kda-buffered-replay`. It is a working-tree optimization, not a new committed
+revision. The local M70 runbook retains each command, source patch, added file,
+fixture hash, environment and result; failed attempts are kept separately.
+All final runs use one Python manifest, SHA256
+`7accc1efab0a825b19f4e52406acd18149ab7b187e5258edff7756931ff7213b`, and
+confirm unchanged source during execution.
+
+The changes target work introduced by exact buffered replay:
+
+- Gluon verify reductions keep the same adjacent-key balanced tree. Four
+  adjacent keys per lane allow two local pair levels followed by five explicit
+  rounded warp-shuffle additions, avoiding repeated layout conversions.
+- Independent verify/history recurrences are interleaved per token. Static
+  window unrolling exposes instruction overlap; live width still guards reads
+  and stores. Each chain retains its arithmetic and only history writes K/U/D.
+  Native B4 uses the measured BV8/four-warp geometry.
+- Independent conv/raw-capture and gate CTAs share a launch, with heavier gate
+  CTAs first. Verification receives the BF16-rounded raw dot. Replay keeps its
+  own bias-initialized MMA accumulator; adding bias to the raw result is not
+  equivalent. Below 16 packed rows, history retains its separate scalar kernel
+  because fusing that reduction changes FP32 rounding.
+- The workspace calls the fused producer directly and no longer needs its
+  producer stream or per-layer events. Scratch allocation and LCM accounting
+  do not grow. T1 and T4 retain one workspace entry.
+
+No scheduler, ownership, acceptance, sampling, commit/flush policy, weights or
+GDN implementation changes are included. The frozen old verify is still an
+independent reference, not replaced by the new shared contract.
+
+Measurements use a persistent two-node GB300 allocation, the cached CUDA 13 /
+Torch 2.13 / Triton 3.8.10.post20260906 / FlashInfer 0.6.18 environment and driver
+580.167.08. Each run uses one GPU. Inputs are saved real-NVFP4 TP8 rank 0/4
+activations, L8/B4/T4, 69 layers, H12/D128. A cycle has one empty-history window
+and one reconstructed-history/flush window, accepting [1,2,3,4] then [4,3,2,1].
+It includes producers and accepted commit, with no timed reset or profiler.
+CUDA graph is enabled: five warmups, nine alternating candidate samples,
+16 replays per sample and 18 original bracket samples. Old producer work is
+serialized; the benchmark does not model its runtime StreamFork overlap.
+
+Before optimization, the committed buffered implementation takes 3650.816 us
+on the first node and 3664.768 us on the second, versus frozen original
+2107.892 / 2095.169 us. Final repeated timings are:
+
+| Saved rank / node | Frozen original (us) | Optimized buffered (us) | Reduction from committed buffered |
+| --- | ---: | ---: | ---: |
+| 0 / first | 2107.904–2108.096 | 2101.758–2101.888 | 42.43% |
+| 4 / second | 2094.786–2095.168 | 2094.464–2094.720 | 42.84–42.85% |
+
+Each range covers two independent benchmark runs. The optimized medians are
+0.003–0.294% below their original brackets: effectively parity, not a material
+speedup over original. The shared-unbuffered control remains 2443–2447 us.
+These are two-window graph times, not individual-kernel or E2E latency.
+Recurrence alone remains slower: 769–770 us without history and 864–866 us
+with history/flush per 69-layer window, versus about 702 us for original
+verify. Producer fusion and saved accepted replay also contribute to parity.
+
+Correctness on final source:
+
+- **197 kernel tests pass**, including the existing independent explicit FP32
+  arithmetic reference and ten parameterized fused-producer cases. The latter
+  cover B1/B4/B16, T1/T4, both gate forms, strided input, partial widths,
+  padding/invalid state and repeated CUDA graph execution in one test function.
+- **240 runtime tests and 117 subtests pass**, with three existing skips.
+  Workspace sizing/pointers, cache lifecycle, graph metadata, accepted commit,
+  mixed execution and shared GDN regressions remain covered.
+- **All 1656 saved real-input layer/cases pass** across eight ranks. Producers,
+  new-pair verify output, graph/eager, accepted conv/state, next verify and flush
+  are exact. Rejected history is poisoned and state is carried between windows.
+  B4 rows are assembled from C1 snapshots, not a fresh model rollout. Relative
+  to frozen verify, the existing M69 difference remains 15167 / 122093568 BF16
+  elements, maximum absolute difference 0.00048828125; it is not hidden or
+  relabeled as exact original-output recovery.
+
+Rejected experiments include raw-dot-plus-bias reuse and small-row scalar
+fusion (accepted-history differences), tile/warp choices that fail equality,
+slower normalization layouts and producer tiles, and ineffective stage changes.
+The first static-loop and interleaving attempts fail compilation and remain in
+the record. No tolerance, acceptance rule or compiler-specific value-row mask
+is used to obtain the final result.
+
+This closes the measured local KDA latency gap, not the full-model gate.
+Current-source AR/token trajectory, AIME, broader capacity/concurrency timing,
+and E2E performance with runtime stream overlap remain separate next steps.
+Repository-wide pre-commit, explicit new-file hooks and diff checks pass.
+Both reserved nodes pass the final GPU-process and service-port idle check.
+This stage leaves the validated changes uncommitted for review.

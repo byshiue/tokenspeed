@@ -57,28 +57,55 @@ def _verify_add(left, right, language: tl.constexpr):
 
 @triton.jit
 def _verify_sum(value, language: tl.constexpr):
-    # A source-level sum otherwise inherits its tree from the register layout.
     language.static_assert(value.shape[-1] == 128)
-    for level in language.static_range(7):
-        paired = language.reshape(value, value.shape[:-1] + [value.shape[-1] // 2, 2])
-        if language == gl:
-            # Gluon split needs each logical pair in one thread. Layout
-            # conversion changes ownership, never the arithmetic pairing.
-            if len(value.shape) == 1:
-                paired = gl.convert_layout(
-                    paired,
-                    gl.BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [0, 1]),
-                )
-            else:
-                paired = gl.convert_layout(
-                    paired,
-                    gl.BlockedLayout(
-                        [1, 1, 2], [1, 32, 1], [gl.num_warps(), 1, 1], [1, 0, 2]
-                    ),
-                )
-        left, right = language.split(paired)
-        value = _verify_add(left, right, language)
-    return language.sum(value, axis=-1)
+    if language == gl:
+        # Keep four adjacent keys in each lane. The first two tree levels
+        # are register-local; ascending XOR shuffles combine adjacent groups.
+        # This is the same seven-level tree without seven layout conversions.
+        if len(value.shape) == 1:
+            layout: gl.constexpr = gl.BlockedLayout([4], [32], [gl.num_warps()], [0])
+        else:
+            layout: gl.constexpr = gl.BlockedLayout(
+                [1, 4], [1, 32], [gl.num_warps(), 1], [1, 0]
+            )
+        value = gl.convert_layout(value, layout)
+        for level in gl.static_range(2):
+            paired = gl.reshape(value, value.shape[:-1] + [value.shape[-1] // 2, 2])
+            left, right = gl.split(paired)
+            value = _verify_add(left, right, gl)
+        value = gl.inline_asm_elementwise(
+            """{
+                .reg .f32 other;
+                shfl.sync.bfly.b32 other, $1, 1, 31, -1;
+                add.rn.f32 $0, $1, other;
+                shfl.sync.bfly.b32 other, $0, 2, 31, -1;
+                add.rn.f32 $0, $0, other;
+                shfl.sync.bfly.b32 other, $0, 4, 31, -1;
+                add.rn.f32 $0, $0, other;
+                shfl.sync.bfly.b32 other, $0, 8, 31, -1;
+                add.rn.f32 $0, $0, other;
+                shfl.sync.bfly.b32 other, $0, 16, 31, -1;
+                add.rn.f32 $0, $0, other;
+            }""",
+            constraints="=f,f",
+            args=(value,),
+            dtype=gl.float32,
+            is_pure=True,
+            pack=1,
+        )
+        # Every lane has the same sum; gather one lane to drop the key axis.
+        indices = gl.full(value.shape[:-1] + [1], 0, gl.int32, value.type.layout)
+        return gl.reshape(
+            gl.gather(value, indices, len(value.shape) - 1), value.shape[:-1]
+        )
+    else:
+        for level in language.static_range(7):
+            paired = language.reshape(
+                value, value.shape[:-1] + [value.shape[-1] // 2, 2]
+            )
+            left, right = language.split(paired)
+            value = _verify_add(left, right, language)
+        return language.sum(value, axis=-1)
 
 
 @triton.jit

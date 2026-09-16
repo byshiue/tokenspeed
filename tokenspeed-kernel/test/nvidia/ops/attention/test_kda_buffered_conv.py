@@ -31,9 +31,135 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_conv import (
     commit_conv_windows,
     prepare_conv_blocks,
 )
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_gate import (
+    buffered_history_gate,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_producers import (
+    buffered_producers,
+)
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
     fused_kda_verify_conv_update,
 )
+
+
+@pytest.mark.parametrize("batch,width", [(1, 1), (4, 1), (1, 4), (4, 4), (16, 4)])
+@pytest.mark.parametrize("lower_bound", [None, -5.0])
+def test_fused_producers_preserve_conv_and_both_gate_contracts(
+    batch, width, lower_bound
+):
+    torch.manual_seed(7010)
+    heads, dim, rank = 12, 128, 128
+    channels = 3 * heads * dim
+    raw = torch.randn(
+        (batch, width, channels * 2), device="cuda", dtype=torch.bfloat16
+    )[..., ::2]
+    weights = torch.randn((channels, 4), device="cuda", dtype=torch.bfloat16) * 0.2
+    state = torch.randn((batch + 1, channels, 3), device="cuda", dtype=torch.bfloat16)
+    before = state.clone()
+    read = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
+    valid = torch.full((batch,), width, dtype=torch.int32, device="cuda")
+    ok = torch.ones(batch, dtype=torch.bool, device="cuda")
+    if batch >= 4:
+        valid[-1] = 0
+        ok[-2] = False
+        valid[0] = 1
+    dtype = torch.bfloat16 if width == 1 else torch.float32
+    fa = torch.randn((batch * width, rank), device="cuda", dtype=torch.bfloat16) * 0.1
+    fb = torch.randn((heads * dim, rank), device="cuda", dtype=torch.bfloat16) * 0.1
+    a = torch.randn(heads, device="cuda")
+    bias = torch.randn(heads * dim, device="cuda")
+    outputs = []
+    for _ in range(2):
+        outputs.append(
+            (
+                torch.full(
+                    (batch, width, channels), float("nan"), dtype=dtype, device="cuda"
+                ),
+                torch.full(
+                    (batch, width, channels),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device="cuda",
+                ),
+                torch.empty((batch * width, heads * dim), dtype=dtype, device="cuda"),
+                (
+                    None
+                    if width == 1
+                    else torch.full(
+                        (batch, width, 2 * heads * dim), float("nan"), device="cuda"
+                    )
+                ),
+                (
+                    None
+                    if width == 1
+                    else torch.empty((batch * width, heads * dim), device="cuda")
+                ),
+            )
+        )
+    expected, actual = outputs
+    buffered_conv(
+        raw,
+        weights,
+        state,
+        read,
+        valid,
+        ok,
+        expected[0],
+        expected[1],
+        history_out=expected[3],
+    )
+    expected[2].copy_(torch.nn.functional.linear(fa, fb))
+    if width > 1:
+        buffered_history_gate(
+            fa,
+            fb,
+            a,
+            bias,
+            expected[4],
+            num_heads=heads,
+            head_dim=dim,
+            local_layers=69,
+            lower_bound=lower_bound,
+        )
+
+    def run():
+        buffered_producers(
+            raw,
+            weights,
+            state,
+            read,
+            valid,
+            ok,
+            actual[0],
+            actual[1],
+            fa,
+            fb,
+            a,
+            bias,
+            actual[2],
+            history_conv=actual[3],
+            history_gate=actual[4],
+            num_heads=heads,
+            head_dim=dim,
+            local_layers=69,
+            lower_bound=lower_bound,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        for tensor in actual:
+            if tensor is not None:
+                tensor.fill_(float("nan"))
+        graph.replay()
+        for index, (got, ref) in enumerate(zip(actual, expected, strict=True)):
+            if ref is not None:
+                if index == 2:
+                    got, ref = got.bfloat16(), ref.bfloat16()
+                torch.testing.assert_close(got, ref, atol=0, rtol=0, equal_nan=True)
+        torch.testing.assert_close(state, before, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
