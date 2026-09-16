@@ -79,3 +79,5 @@ but packing, communication and unequal-batch padding can outweigh that gain.
 No speedup is claimed until the complete operation and full model are measured.
 
 See [the DEP runbook](../recipes/kimi-k3-dep-o-proj-tp.md) for commands.
+Standalone redistribution measurements and their limits are recorded in
+[the performance notes](kimi-k3-o-proj-performance.md).

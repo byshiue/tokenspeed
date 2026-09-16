@@ -27,6 +27,7 @@ NVFP4 mixed-precision model. Run with 16 ranks to exercise four TP4 subgroups.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -287,16 +289,16 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
     if rows == 0:
         return {}
 
+    packed = send.view(size * rows, shard)
+
     def pack():
-        send.zero_()
-        send[:, : inputs.shape[0]].copy_(
-            inputs.reshape(inputs.shape[0], size, shard).permute(1, 0, 2)
-        )
+        nonlocal packed
+        packed = triton_pack_projection_input(inputs, send)
 
     def exchange_inputs():
         all_to_all_single(
             recv,
-            send.view(size * rows, shard),
+            packed,
             exchange.parallel.tp_group,
             backend=None,
         )
@@ -315,7 +317,9 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
     return {name: measure(call, iterations, True) for name, call in stages.items()}
 
 
-def profile_projection(exchange, linear, baseline, k: int, world: int):
+def profile_projection(
+    exchange, linear, baseline, k: int, world: int, baseline_label: str
+):
     """Capture a short warmed baseline/TP4 graph comparison for NSYS."""
     inputs = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
     counts = [8] * world
@@ -331,14 +335,18 @@ def profile_projection(exchange, linear, baseline, k: int, world: int):
     dist.barrier()
     torch.cuda.cudart().cudaProfilerStart()
     for name, graph in (
-        ("baseline_projection", local_graph),
+        (baseline_label, local_graph),
         ("tp4_projection", tp_graph),
     ):
         with torch.cuda.nvtx.range(name):
             for _ in range(20):
                 graph.replay()
     torch.cuda.synchronize()
+    control_group = pg_manager.get_process_group("gloo", list(range(world)))
+    dist.barrier(group=control_group)
     torch.cuda.cudart().cudaProfilerStop()
+    # Keep later GPU work out of the profiler-stop window on every rank.
+    dist.barrier(group=control_group)
 
 
 @torch.no_grad()
@@ -349,6 +357,8 @@ def main():
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--layer", type=int, choices=(0, 3))
+    parser.add_argument("--reference-module", type=Path)
+    parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
@@ -363,6 +373,13 @@ def main():
     )
     os.environ[ENV_NAME] = "4"
     initialize_projection_parallelism(mapping)
+    reference_module = None
+    if args.reference_module is not None:
+        spec = importlib.util.spec_from_file_location(
+            "projection_reference", args.reference_module
+        )
+        reference_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(reference_module)
     shapes = [(128, 256, None), (7168, 12288, None)]
     if args.model:
         shapes = [
@@ -392,6 +409,14 @@ def main():
         exchange.workspace = ProjectionWorkspace(
             512, k, torch.bfloat16, torch.device("cuda")
         )
+        reference_exchange = None
+        if reference_module is not None:
+            reference_exchange = reference_module.KimiOutputProjection(
+                exchange.parallel, k
+            )
+            reference_exchange.workspace = reference_module.ProjectionWorkspace(
+                512, k, torch.bfloat16, torch.device("cuda")
+            )
         patterns = [
             [1] * world,
             [8] * world,
@@ -416,6 +441,9 @@ def main():
             )
             expected = baseline(x)[0] if counts[rank] else x.new_empty((0, n))
             actual = exchange.forward(x, linear, counts)
+            if reference_exchange is not None:
+                prior = reference_exchange.forward(x, linear, counts)
+                torch.testing.assert_close(actual, prior, rtol=0, atol=0)
             if x.shape[0]:
                 reference = x.float() @ reference_weight.T
                 delta = actual.float() - expected.float()
@@ -487,6 +515,27 @@ def main():
                     record[f"tp4_us_graph_{graph}"] = measure(
                         feature, args.iterations, graph
                     )
+                if reference_exchange is not None:
+                    variants = {
+                        "reference": lambda: reference_exchange.forward(
+                            x, linear, counts
+                        ),
+                        "optimized": feature,
+                    }
+                    samples = []
+                    for repeat in range(args.repeats):
+                        order = (
+                            ("reference", "optimized")
+                            if repeat % 2 == 0
+                            else ("optimized", "reference")
+                        )
+                        samples.append(
+                            {
+                                name: measure(variants[name], args.iterations, True)
+                                for name in order
+                            }
+                        )
+                    record["matched_graph_us"] = samples
                 # Component measurements use balanced rows, so every rank
                 # participates in the same timing collectives.
                 if len(set(counts)) == 1:
@@ -496,7 +545,20 @@ def main():
             if rank == 0:
                 print(json.dumps(record), flush=True)
         if args.profile:
-            profile_projection(exchange, linear, baseline, k, world)
+            profile_baseline = (
+                baseline
+                if reference_exchange is None
+                else lambda inputs: reference_exchange.forward(
+                    inputs, linear, [8] * world
+                )
+            )
+            label = (
+                "tp1_projection"
+                if reference_exchange is None
+                else "reference_tp4_projection"
+            )
+            profile_projection(exchange, linear, profile_baseline, k, world, label)
+        del reference_exchange
         del baseline, linear, exchange, reference_weight
         torch.cuda.empty_cache()
     dist.barrier()
