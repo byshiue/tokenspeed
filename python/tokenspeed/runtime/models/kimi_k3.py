@@ -3207,12 +3207,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
             # One scratch pair for sequential attention layers, allocated before
             # memory profiling/capture rather than one large pair per layer.
             weight = next(self.parameters())
-            workspace = ProjectionWorkspace(
-                max_tokens=max_num_tokens,
-                max_input_size=max(exchange.input_size for exchange in exchanges),
-                dtype=weight.dtype,
-                device=weight.device,
-            )
+            max_input_size = max(exchange.input_size for exchange in exchanges)
+            workspace = exchanges[0].workspace
+            if workspace is None:
+                workspace = ProjectionWorkspace(
+                    max_tokens=max_num_tokens,
+                    max_input_size=max_input_size,
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+                workspace.initialize_a2a(exchanges[0].parallel, max_input_size)
+            elif max_num_tokens > workspace.max_tokens:
+                raise RuntimeError("Cannot grow a prepared projection workspace")
             for exchange in exchanges:
                 exchange.workspace = workspace
         routed_hidden_size = (
