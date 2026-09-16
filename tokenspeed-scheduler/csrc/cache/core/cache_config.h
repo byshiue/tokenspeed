@@ -60,6 +60,10 @@ struct CacheGroupConfig {
     // Cyclic owners of this group's virtual blocks; the pool balances new
     // children across them by request load. 1 keeps the group replicated.
     std::int32_t shard_count{1};
+    // Maximum accepted-token distance behind the endpoint at which a live
+    // state may still be read. This extends request retention, not prefix
+    // matching or publication. Zero is the eager-state contract.
+    std::int32_t max_state_lag_tokens{0};
 
     // A State group keeps one recurrent-state checkpoint per block instead of
     // a token history: the mamba-style group (GDN linear attention, conv

@@ -408,6 +408,7 @@ class KimiK3Recipe(CacheRecipe):
         protected_pages = max_live_requests * math.ceil(
             depth * limits["decode_input_tokens"] / page_tokens
         )
+        specs = {spec.group_id: spec for spec, _ in self.groups()}
         parents = 0
         for group_id, packing in layout.group_packing:
             if group_id == FULL_ATTENTION:
@@ -426,7 +427,9 @@ class KimiK3Recipe(CacheRecipe):
                     page_tokens, (1 + depth) * limits["decode_input_tokens"]
                 )
                 child_pages = max_live_requests * (
-                    2 + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
+                    2
+                    + math.ceil((page_tokens - 1 + growth_tokens) / page_tokens)
+                    + math.ceil(specs[group_id].max_state_lag_tokens / page_tokens)
                 )
             parents += math.ceil(child_pages / packing)
         return parents

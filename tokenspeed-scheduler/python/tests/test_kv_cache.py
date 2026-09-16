@@ -43,6 +43,7 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.disable_prefix_cache = True
 
     full = ts.CacheGroupConfig(
+        max_state_lag_tokens=0,
         group_id="full",
         block_granularity=cfg.prefix_granularity,
         total_pages=cfg.num_device_pages,
@@ -50,6 +51,7 @@ def _make_config() -> ts.SchedulerConfig:
         family=ts.CacheGroupFamily.History,
     )
     swa = ts.CacheGroupConfig(
+        max_state_lag_tokens=0,
         group_id="swa",
         block_granularity=cfg.prefix_granularity,
         total_pages=cfg.num_device_pages,
@@ -265,6 +267,7 @@ def test_accepted_state_prompts_can_prefill_and_start_decode(
         cfg.overlap_schedule_depth = overlap_depth
         cfg.cache_groups = [
             ts.CacheGroupConfig(
+                max_state_lag_tokens=0,
                 group_id="state",
                 block_granularity=block_granularity,
                 total_pages=usable_blocks + 1,
@@ -316,6 +319,7 @@ def test_decode_reuses_only_materialized_state_boundary(
     cfg.overlap_schedule_depth = 0
     cfg.cache_groups = [
         ts.CacheGroupConfig(
+            max_state_lag_tokens=0,
             group_id="state",
             block_granularity=state_granularity,
             total_pages=33,

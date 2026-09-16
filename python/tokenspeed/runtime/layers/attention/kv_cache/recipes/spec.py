@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import plan
@@ -68,8 +68,22 @@ class CacheGroupSpec:
     # Number of cyclic owners of this group's virtual blocks. One keeps the
     # same block IDs on every rank; local field geometry is independent of it.
     shard_count: int = 1
+    # A live state may lag accepted progress by this many tokens. This is
+    # retention only: prefix reuse still needs one materialized snapshot.
+    # Explicit even for eager-state/history consumers, which declare zero.
+    max_state_lag_tokens: int = field(kw_only=True)
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.max_state_lag_tokens, bool)
+            or not isinstance(self.max_state_lag_tokens, int)
+            or not 0 <= self.max_state_lag_tokens <= 2**31 - 1
+            or (self.family != "state" and self.max_state_lag_tokens != 0)
+        ):
+            raise ValueError(
+                f"group {self.group_id!r}: max_state_lag_tokens must be a "
+                "non-negative int32 and zero for history groups"
+            )
         if (
             isinstance(self.shard_count, bool)
             or not isinstance(self.shard_count, int)
@@ -236,10 +250,15 @@ def compute_cache_group_page_counts(
         protected_pages = max_live_requests * _ceil_div(
             overlap_schedule_depth * decode_input_tokens, block_granularity
         )
-        # A state group holds two rolling checkpoints per request (input and
-        # output), whatever the prompt or chunk width.
+        # Add the maximum whole-block growth caused by a lagging state to
+        # the eager-state rolling input/output budget. Model recipes that
+        # budget a larger prefill working set apply the same extra lookback.
         if spec.family == "state":
-            total = max_live_requests * 2 + NULL_PAGES
+            total = (
+                max_live_requests
+                * (2 + _ceil_div(spec.max_state_lag_tokens, block_granularity))
+                + NULL_PAGES
+            )
         elif spec.retention == "full_history":
             full_pages = _ceil_div(max_total_tokens, block_granularity)
             total = full_pages + max_live_requests + protected_pages + NULL_PAGES
@@ -686,6 +705,7 @@ def _layer_group_spec(
         # Snapshot-state groups have no rows: one CacheBlock holds one
         # recurrent-state checkpoint taken every `block_tokens` tokens.
         return CacheGroupSpec(
+            max_state_lag_tokens=0,
             group_id=group_id,
             retention=retention,
             sliding_window_tokens=window,
@@ -693,6 +713,7 @@ def _layer_group_spec(
             checkpoint_granularity=block_tokens,
         )
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=group_id,
         retention=retention,
         rows_per_page=block_tokens,

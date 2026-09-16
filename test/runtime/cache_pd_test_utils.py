@@ -141,6 +141,7 @@ def layout(
     specs = tuple(
         (
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id=entry.group_id,
                 retention=entry.retention,
                 sliding_window_tokens=entry.sliding_window_tokens,
@@ -150,6 +151,7 @@ def layout(
             )
             if entry.family == "state" and entry.retention == "full_history"
             else CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id=entry.group_id,
                 retention=entry.retention,
                 rows_per_page=entry.prefix_granularity,

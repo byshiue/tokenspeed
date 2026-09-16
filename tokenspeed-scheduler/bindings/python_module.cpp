@@ -112,18 +112,19 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t total_pages, tokenspeed::CacheGroupConfig::Retention retention,
                std::optional<std::int32_t> sliding_window_tokens, tokenspeed::CacheGroupFamily family,
                std::int32_t cache_blocks_per_lcm_block, tokenspeed::CacheTransferPolicy transfer_policy,
-               std::int32_t shard_count) {
+               std::int32_t shard_count, std::int32_t max_state_lag_tokens) {
                 new (self) tokenspeed::CacheGroupConfig{
                     std::move(group_id), block_granularity,     total_pages, cache_blocks_per_lcm_block,
                     retention,           sliding_window_tokens, family,      transfer_policy,
-                    shard_count,
+                    shard_count,         max_state_lag_tokens,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"),
             nb::arg("retention") = tokenspeed::CacheGroupConfig::Retention::FullHistory,
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("family") = tokenspeed::CacheGroupFamily::History,
             nb::arg("cache_blocks_per_lcm_block") = 1,
-            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1)
+            nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
+            nb::kw_only(), nb::arg("max_state_lag_tokens"))
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -133,6 +134,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
         .def_rw("family", &tokenspeed::CacheGroupConfig::family)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
+        .def_rw("max_state_lag_tokens", &tokenspeed::CacheGroupConfig::max_state_lag_tokens)
         .def("validate", &tokenspeed::CacheGroupConfig::Validate);
 
     scheduler_config.def(nb::init<>())

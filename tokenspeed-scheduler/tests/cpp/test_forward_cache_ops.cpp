@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -554,6 +555,35 @@ TEST(SchedulerConfigValidateTest, RejectsNonPositiveSlidingWindowWithGroupId) {
     for (const std::int32_t window : {0, -1}) {
         config.cache_groups[0].sliding_window_tokens = window;
         ExpectRejectedNamingGroup(config, "nonpositive_window");
+    }
+}
+
+TEST(SchedulerConfigValidateTest, StateLagIsNonNegativeAndStateOnly) {
+    for (CacheGroupFamily family : {CacheGroupFamily::History, CacheGroupFamily::State}) {
+        for (std::int32_t lag : {-1, 0, 12}) {
+            SCOPED_TRACE(::testing::Message() << "family=" << static_cast<int>(family) << " lag=" << lag);
+            CacheGroupConfig group{.group_id = "lag-contract",
+                                   .block_granularity = 128,
+                                   .total_pages = 4,
+                                   .family = family,
+                                   .max_state_lag_tokens = lag};
+            const bool valid = lag >= 0 && (family == CacheGroupFamily::State || lag == 0);
+            BlockPool pool(3, {1});
+            const std::array specs{
+                CacheGroupSpec{.kind = family == CacheGroupFamily::State ? AttnKind::kMambaState : AttnKind::kFull,
+                               .block_granularity = 128,
+                               .max_state_lag_tokens = lag}};
+            if (valid) {
+                EXPECT_NO_THROW(group.Validate());
+                EXPECT_NO_THROW(MakeCoordinator(specs, 128, pool, /*host_pool=*/nullptr,
+                                                /*stream_device_cache_to_host=*/true));
+            } else {
+                EXPECT_THROW(group.Validate(), std::invalid_argument);
+                EXPECT_THROW(MakeCoordinator(specs, 128, pool, /*host_pool=*/nullptr,
+                                             /*stream_device_cache_to_host=*/true),
+                             std::runtime_error);
+            }
+        }
     }
 }
 

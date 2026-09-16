@@ -45,6 +45,7 @@ def _spec(
 
     if family == "state":
         return CacheGroupSpec(
+            max_state_lag_tokens=0,
             group_id=group_id,
             retention=retention,
             family="state",
@@ -52,6 +53,7 @@ def _spec(
             sliding_window_tokens=sliding_window_tokens,
         )
     return CacheGroupSpec(
+        max_state_lag_tokens=0,
         group_id=group_id,
         retention=retention,
         family=family,

@@ -446,6 +446,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_row_geometry_shape(self):
         spec = CacheGroupSpec(
+            max_state_lag_tokens=0,
             group_id="kv",
             retention="full_history",
             rows_per_page=16,
@@ -458,6 +459,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
 
     def test_checkpoint_shape(self):
         spec = CacheGroupSpec(
+            max_state_lag_tokens=0,
             group_id="state",
             retention="full_history",
             sliding_window_tokens=None,
@@ -468,9 +470,50 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             _ = spec.page_size
 
+    def test_state_lag_validation_roundtrip_and_capacity(self):
+        state = CacheGroupSpec(
+            group_id="state",
+            retention="full_history",
+            family="state",
+            checkpoint_granularity=128,
+            max_state_lag_tokens=0,
+        )
+        for lag, extra_blocks in [(0, 0), (1, 1), (60, 1), (128, 1), (257, 3)]:
+            with self.subTest(lag=lag):
+                spec = replace(state, max_state_lag_tokens=lag)
+                self.assertEqual(CacheGroupSpec(**asdict(spec)), spec)
+                counts = _spec.compute_cache_group_page_counts(
+                    [spec],
+                    max_live_requests=3,
+                    max_scheduled_tokens=256,
+                    max_total_tokens=4096,
+                    max_context_len=4096,
+                    decode_input_tokens=1,
+                    overlap_schedule_depth=0,
+                )
+                self.assertEqual(counts, {"state": 3 * (2 + extra_blocks) + 1})
+        for lag in [-1, True, 1.5, 2**31]:
+            with self.subTest(invalid_lag=lag):
+                with self.assertRaisesRegex(ValueError, "max_state_lag_tokens"):
+                    replace(state, max_state_lag_tokens=lag)
+        history = CacheGroupSpec(
+            group_id="history",
+            retention="full_history",
+            rows_per_page=128,
+            entry_stride_tokens=1,
+            max_state_lag_tokens=0,
+        )
+        with self.assertRaisesRegex(ValueError, "zero for history"):
+            replace(history, max_state_lag_tokens=1)
+        missing_lag = asdict(state)
+        del missing_lag["max_state_lag_tokens"]
+        with self.assertRaisesRegex(TypeError, "max_state_lag_tokens"):
+            CacheGroupSpec(**missing_lag)
+
     def test_shapes_are_mutually_exclusive(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="state",
                 retention="full_history",
                 rows_per_page=16,
@@ -483,6 +526,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_missing_shape_raises(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
                 sliding_window_tokens=None,
@@ -491,6 +535,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_partial_row_geometry_raises(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
                 rows_per_page=16,
@@ -500,6 +545,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_checkpoint_requires_state_family(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
                 sliding_window_tokens=None,
@@ -510,6 +556,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
     def test_nonpositive_geometry_raises(self):
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="kv",
                 retention="full_history",
                 rows_per_page=0,
@@ -518,6 +565,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="state",
                 retention="full_history",
                 sliding_window_tokens=None,
@@ -531,6 +579,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         # checkpoint shape and nothing else.
         with self.assertRaisesRegex(ValueError, "checkpoint_granularity"):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="v4.compressor",
                 retention="sliding_window",
                 rows_per_page=16,
@@ -539,6 +588,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
                 family="state",
             )
         spec = CacheGroupSpec(
+            max_state_lag_tokens=0,
             group_id="v4.compressor",
             retention="sliding_window",
             rows_per_page=16,
@@ -554,6 +604,7 @@ class CacheGroupSpecShapeTest(unittest.TestCase):
         # group ever slides out.
         with self.assertRaisesRegex(ValueError, "full_history"):
             CacheGroupSpec(
+                max_state_lag_tokens=0,
                 group_id="state",
                 retention="sliding_window",
                 sliding_window_tokens=256,
@@ -636,17 +687,25 @@ class PoolToCacheGroupsIntegrationTest(unittest.TestCase):
             sliding_window_tokens=None,
             prefix_granularity=16,
         )
+        specs = tuple(
+            replace(spec, max_state_lag_tokens=60) if spec.family == "state" else spec
+            for spec in specs
+        )
         fake_pool = _fake_pool(specs, packing=1)
 
         groups = {g.group_id: g for g in pool_to_cache_groups(fake_pool)}
 
         state = groups["linear_attention"]
         self.assertEqual(state.block_granularity, 16)
+        self.assertEqual(state.max_state_lag_tokens, 60)
+        state.validate()
         self.assertFalse(hasattr(state, "rows_per_page"))
         self.assertFalse(hasattr(state, "entry_stride_tokens"))
         self.assertFalse(hasattr(state, "checkpoint_granularity"))
         full = groups["full_attention"]
         self.assertEqual(full.block_granularity, 16)
+        self.assertEqual(full.max_state_lag_tokens, 0)
+        full.validate()
 
     def test_sharded_group_exports_virtual_capacity_and_packing(self):
         pool_to_cache_groups = self._import_converter()
