@@ -34,6 +34,9 @@ from tokenspeed_kernel.thirdparty.flashinfer.projection_alltoall import (
 from tokenspeed_kernel.thirdparty.flashinfer.projection_alltoall import (
     flashinfer_projection_a2a as _flashinfer_projection_a2a,
 )
+from tokenspeed_kernel.thirdparty.flashinfer.projection_alltoall import (
+    prepare_borrowed_projection_a2a as prepare_borrowed_projection_a2a,
+)
 
 
 @register_kernel(
@@ -55,6 +58,23 @@ def flashinfer_projection_a2a(comm, inputs: torch.Tensor) -> torch.Tensor:
 
 
 logger = logging.getLogger(__name__)
+
+
+@register_kernel(
+    "communication",
+    "projection_a2a_borrowed",
+    name="flashinfer_projection_a2a_borrowed",
+    solution="flashinfer",
+    signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
+)
+def flashinfer_projection_a2a_borrowed(prepared, inputs: torch.Tensor) -> torch.Tensor:
+    """Return borrowed rank-major [P*N,K/P] rows, consumed before the next exchange.
+
+    Equal positive physical rows and serialized same-stream consumers are
+    required on every peer. IPC allocation and JIT must precede graph capture.
+    """
+    return prepared.exchange(inputs)
+
 
 _custom_allreduce = None
 
