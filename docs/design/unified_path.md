@@ -513,12 +513,25 @@ an alternate serving path.
 The experimental `KDAReplayWorkspace` composes that metadata with one
 width-parameterized conv/gate/recurrent forward. Conv preparation validates
 the current endpoint's source and every possible acceptance destination once
-per group. The four-tap BF16 conv producer captures raw candidates while
+per group. The four-tap conv producer consumes BF16 inputs and captures raw candidates while
 computing conv outputs; gate GEMM uses preallocated output on the existing
 `StreamFork` protocol, joined before recurrence. The workspace retains raw
 candidates per local layer but shares conv/gate/output scratch across layers.
 Each layer must consume its output before the following layer reuses it.
 These are per-round tensors, not private persistent request state.
+
+Multi-token windows retain FP32 conv/gate outputs, matching the original
+accepted replay's producer precision. The recurrence rounds these producers
+to BF16 for verification and keeps a second register-local recurrence for
+candidate history. Both start from one reconstructed committed state; only
+the history recurrence supplies the FP32 K/U/D entries. It adds no second
+reconstruction, persistent state field or post-acceptance replay. Width one
+retains ordinary decode's BF16 producer/state arithmetic through the same
+forward and commit. The static scratch dtype follows the maximum window and
+is included in recipe accounting before graph capture. Native verification
+outputs remain BF16; changing the producer precision does not change weights,
+sampling or acceptance rules. Numerical and full-model performance gates are
+required separately.
 
 After all local layer forwards finish, acceptance preparation selects endpoint
 materialization at aligned accepted endpoints or an explicit GPU handoff mask.
@@ -533,6 +546,16 @@ CUDA stream/event implementation overhead. Binding a different pool requires
 a new workspace and recapture; old descriptors must not survive it.
 
 Endpoint materialization shares the forward's FP32 history reconstruction.
+The Triton implementation uses explicit Gluon layouts to keep each tile's
+history axis in registers while distributing value rows across warps. A scalar
+FP32 dot accumulates the history correction without a live expanded `[V,H,K]`
+product; it does not convert operands to TF32 or use tensor cores. Static
+history tiles below eight retain the outer-product sum because the dot's
+compiler contract requires at least eight reduction elements. Native Q/K
+normalization keeps the original full-CTA reduction layout, independently of
+the state layout. These choices change kernel scheduling, not history storage,
+flush decisions, or endpoint ownership. Floating-point
+accumulation order still requires numerical regression checks.
 After a capacity flush its source is `S_e`; otherwise it starts from `S_c`.
 It consumes only accepted rows through `e+a`, never rejected candidates. A
 zero-acceptance handoff may still need to materialize old committed history.
@@ -594,7 +617,7 @@ refresh can overwrite them. Current agentic requests resume through immutable
 prefix checkpoints, and retraction restores reusable checkpoints then recomputes
 the suffix, as before; neither path consumes a lagging live endpoint directly.
 The experimental capacity option binds replay fields before allocation and
-resolves the registered native-BF16 Blackwell recurrence once. Unsupported
+resolves the registered Blackwell recurrence for its producer dtype once. Unsupported
 capacity, width, geometry or hardware fails startup rather than falling back.
 No default capacity is chosen. PD and direct live-endpoint transfer remain
 gated; full-model correctness and Eagle3 no-regression are still required.

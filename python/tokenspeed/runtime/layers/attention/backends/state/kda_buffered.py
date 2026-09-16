@@ -381,10 +381,21 @@ class KDAReplayWorkspace:
         if not conv.is_cuda or conv.dtype != torch.bfloat16:
             raise ValueError("buffered workspace requires BF16 GPU convolution state")
         self.heads, self.value_dim, self.key_dim = recurrent.shape[1:]
+        # Verify rounds preserve replay's FP32 history producers while rounding
+        # to BF16 inside recurrence for outputs. Width one keeps decode's BF16
+        # state arithmetic; both widths use the same forward and commit.
+        producer_dtype = (
+            torch.float32 if self.metadata.layout.max_window > 1 else torch.bfloat16
+        )
+        # PyTorch's out_dtype overload accepts a dtype, not None. Bind the
+        # optional FP32 output request once; BF16 uses its ordinary GEMM.
+        self._gate_mm_options = (
+            {"out_dtype": torch.float32} if producer_dtype == torch.float32 else {}
+        )
         # Resolve once, before workspace allocation/capture. The inner loop
         # calls the selected implementation directly, without per-layer search.
         self.recurrent_kernel = resolve_kda_buffered_recurrent(
-            conv.dtype,
+            producer_dtype,
             head_dim=self.key_dim,
             value_dim=self.value_dim,
             max_window=self.metadata.layout.max_window,
@@ -440,10 +451,10 @@ class KDAReplayWorkspace:
             device=device,
         )
         self.conv_output = torch.empty(
-            (*common, self.channels), dtype=torch.bfloat16, device=device
+            (*common, self.channels), dtype=producer_dtype, device=device
         )
         self.gate_output = torch.empty(
-            (*common, self.heads, self.key_dim), dtype=torch.bfloat16, device=device
+            (*common, self.heads, self.key_dim), dtype=producer_dtype, device=device
         )
         self.output = torch.empty(
             (*common, self.heads, self.value_dim), dtype=torch.bfloat16, device=device
@@ -575,7 +586,10 @@ class KDAReplayWorkspace:
         with self._forks[layer_id].scope(enable=True, overlap=True) as fork:
             with fork.branch():
                 torch.mm(
-                    f_a, f_b_weight.t(), out=gate.view(-1, self.heads * self.key_dim)
+                    f_a,
+                    f_b_weight.t(),
+                    out=gate.view(-1, self.heads * self.key_dim),
+                    **self._gate_mm_options,
                 )
             buffered_conv(
                 raw_qkv,

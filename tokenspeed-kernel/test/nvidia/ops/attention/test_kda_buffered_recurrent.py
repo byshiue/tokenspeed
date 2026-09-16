@@ -34,7 +34,7 @@ import torch.nn.functional as F
 if not torch.cuda.is_available():
     pytest.skip("requires a GPU", allow_module_level=True)
 
-from tokenspeed_kernel._triton import tl, triton  # noqa: E402
+from tokenspeed_kernel._triton import gl, gluon  # noqa: E402
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import (  # noqa: E402
     _input_offset,
     triton_kda_buffered_recurrent,
@@ -44,7 +44,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # n
     commit_positions,
     prepare_positions,
 )
-from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (  # noqa: E402
+from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
     fused_recurrent_kda_pool,
 )
 
@@ -68,7 +68,8 @@ def test_buffered_dispatch_is_resolved_once_and_fails_closed(monkeypatch):
     ):
         with pytest.raises(ValueError):
             resolve_kda_buffered_recurrent(torch.bfloat16, **{**inputs, **changes})
-    for dtype in (torch.float16, torch.float32):
+    assert resolve_kda_buffered_recurrent(torch.float32, **inputs).impl is selected.impl
+    for dtype in (torch.float16, torch.float64):
         with pytest.raises(NoKernelFoundError):
             resolve_kda_buffered_recurrent(dtype, **inputs)
     actual = current_platform()
@@ -98,20 +99,23 @@ def direct(state, query, key, value, decay, beta):
     return torch.stack(outputs) if outputs else value[:0].clone(), state
 
 
-@triton.jit
+@gluon.jit
 def _wide_input_offsets(out):
-    token = tl.arange(0, 4)
-    zero = tl.full((4,), 0, tl.int64)
+    layout: gl.constexpr = gl.BlockedLayout([1], [32], [4], [0])
+    token = gl.arange(0, 4, layout=layout)
+    zero = gl.full((4,), 0, gl.int64, layout=layout)
     offsets = _input_offset(
-        zero, token, zero, token.to(tl.int64), (1, 2**30 + 3, 128, 1)
+        zero, token, zero, token.to(gl.int64), (1, 2**30 + 3, 128, 1)
     )
-    tl.store(out + token, offsets)
+    gl.store(out + token, offsets)
 
 
 @pytest.mark.parametrize("width", [1, 4])
 @pytest.mark.parametrize("extra_capacity", [0, 8, 9, 24, 56])
 @pytest.mark.parametrize("graph_mode", [False, True])
-@pytest.mark.parametrize("input_kind", ["prepared", "softplus", "bounded"])
+@pytest.mark.parametrize(
+    "input_kind", ["prepared", "softplus", "bounded", "dual_softplus", "dual_bounded"]
+)
 def test_buffered_rounds_and_graph_match_sequential(
     width, extra_capacity, graph_mode, input_kind
 ):
@@ -146,7 +150,9 @@ def test_buffered_rounds_and_graph_match_sequential(
     for req in range(2):
         pool[state_tables[req, (ends[req] - 1) // grain]].copy_(states[req])
     native = input_kind != "prepared"
-    dtype = torch.bfloat16 if native else torch.float32
+    dual = input_kind.startswith("dual_")
+    dtype = torch.float32 if dual or not native else torch.bfloat16
+    out_dtype = torch.bfloat16 if native else torch.float32
     if native:
         # Zero-copy packed conv views with non-dense token/head strides.
         packed = torch.empty(
@@ -160,14 +166,16 @@ def test_buffered_rounds_and_graph_match_sequential(
     gate_dtype = torch.float32 if extra_capacity == 9 else dtype
     d = torch.empty((batch, width, heads, dk), device="cuda", dtype=gate_dtype)
     beta = torch.empty((batch, width, heads), device="cuda", dtype=gate_dtype)
-    out = torch.empty((batch, width, heads, dv + 7), device="cuda", dtype=dtype)[
+    out = torch.empty((batch, width, heads, dv + 7), device="cuda", dtype=out_dtype)[
         ..., :dv
     ]
     a_cpu = torch.full((heads,), -9.0 if extra_capacity == 56 else -1.0)
     bias_cpu = torch.randn(heads * dk) * 0.2
     a_log, dt_bias = a_cpu.cuda(), bias_cpu.cuda()
     lower_bound = (
-        (-1e-4 if extra_capacity == 56 else -0.3) if input_kind == "bounded" else None
+        (-1e-4 if extra_capacity == 56 else -0.3)
+        if input_kind.endswith("bounded")
+        else None
     )
     ht = torch.full((batch, columns + 2), -1, dtype=torch.int32, device="cuda")[
         :, :columns
@@ -365,6 +373,25 @@ def test_buffered_rounds_and_graph_match_sequential(
                 inputs[3][..., 1] = 0
         for dest, src in zip((q, k, v, d, beta), raw, strict=True):
             dest.copy_(src)
+        history_inputs = inputs
+        if dual:
+            rounded = [tensor.bfloat16().float() for tensor in raw[:4]]
+            q_ref, k_ref, v_ref, gate_ref = rounded
+            gate_ref = gate_ref + bias_cpu.view(heads, dk)
+            log_ref = (
+                lower_bound * torch.sigmoid(a_cpu.exp()[:, None] * gate_ref)
+                if lower_bound is not None
+                else -a_cpu.exp()[:, None] * F.softplus(gate_ref, threshold=20)
+            )
+            inputs = (
+                q_ref / torch.sqrt(q_ref.square().sum(-1, keepdim=True) + 1e-6),
+                k_ref / torch.sqrt(k_ref.square().sum(-1, keepdim=True) + 1e-6),
+                v_ref,
+                log_ref.exp(),
+                raw[4].float().sigmoid(),
+            )
+            if width == 1:
+                history_inputs = inputs
         before = pool.clone()
         out.fill_(float("nan"))
         if graph_mode:
@@ -384,7 +411,7 @@ def test_buffered_rounds_and_graph_match_sequential(
             torch.testing.assert_close(
                 out[row, :n].float().cpu(), expected, atol=2e-5, rtol=output_rtol
             )
-            if native and step == 0 and n:
+            if native and not dual and step == 0 and n:
                 # Pin native transform semantics to the existing GPU recurrence
                 # as well as the independent CPU equations (before any history).
                 original_pool = states[req].unsqueeze(0).cuda()
@@ -422,7 +449,7 @@ def test_buffered_rounds_and_graph_match_sequential(
                 saw_zero_accept_flush |= a == 0
             else:
                 saw_no_flush = True
-            _, states[req] = direct(states[req], *(x[row, :a] for x in inputs))
+            _, states[req] = direct(states[req], *(x[row, :a] for x in history_inputs))
             ends[req] += a
             materialized = (
                 torch.zeros_like(states[req])

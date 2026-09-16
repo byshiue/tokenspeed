@@ -23,7 +23,7 @@
 import math
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.attention.kda._triton.buffered import _reconstruct_history
 
 
@@ -142,7 +142,7 @@ def prepare_endpoint_commit(
         )
 
 
-@triton.jit
+@gluon.jit
 def _materialize_endpoints(
     DESCRIPTORS,
     GROUPS,
@@ -152,77 +152,85 @@ def _materialize_endpoints(
     FLUSH,
     OK,
     MATERIALIZED,
-    B: tl.constexpr,
-    LAYERS: tl.constexpr,
-    GROUP_COUNT: tl.constexpr,
-    FLAG_BLOCK: tl.constexpr,
-    MAX_B: tl.constexpr,
-    H: tl.constexpr,
-    DK: tl.constexpr,
-    DV: tl.constexpr,
-    ROWS: tl.constexpr,
-    STATE_GRAIN: tl.constexpr,
-    TABLE_STRIDE: tl.constexpr,
-    STATE_STRIDES: tl.constexpr,
-    HK_STRIDES: tl.constexpr,
-    HU_STRIDES: tl.constexpr,
-    HD_STRIDES: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    BH: tl.constexpr,
+    B: gl.constexpr,
+    LAYERS: gl.constexpr,
+    GROUP_COUNT: gl.constexpr,
+    FLAG_BLOCK: gl.constexpr,
+    MAX_B: gl.constexpr,
+    H: gl.constexpr,
+    DK: gl.constexpr,
+    DV: gl.constexpr,
+    ROWS: gl.constexpr,
+    STATE_GRAIN: gl.constexpr,
+    TABLE_STRIDE: gl.constexpr,
+    STATE_STRIDES: gl.constexpr,
+    HK_STRIDES: gl.constexpr,
+    HU_STRIDES: gl.constexpr,
+    HD_STRIDES: gl.constexpr,
+    BK: gl.constexpr,
+    BV: gl.constexpr,
+    BH: gl.constexpr,
 ):
     # Bound empty rounds to a small persistent grid, rather than scheduling
     # every layer/head/state tile only to discover no endpoint was requested.
-    flag = tl.arange(0, FLAG_BLOCK)
+    flag = gl.arange(
+        0, FLAG_BLOCK, layout=gl.BlockedLayout([1], [32], [gl.num_warps()], [0])
+    )
     flag_live = (flag < GROUP_COUNT * MAX_B) & (flag % MAX_B < B)
-    any_work = tl.sum(
+    any_work = gl.sum(
         (
-            tl.load(MATERIALIZED + flag, flag_live, False)
-            & tl.load(OK + flag, flag_live, False)
-        ).to(tl.int32),
+            gl.load(MATERIALIZED + flag, flag_live, False)
+            & gl.load(OK + flag, flag_live, False)
+        ).to(gl.int32),
         0,
     )
     if any_work == 0:
         return
     for work in range(
-        tl.program_id(0), LAYERS * H * B * tl.cdiv(DV, BV), tl.num_programs(0)
+        gl.program_id(0), LAYERS * H * B * gl.cdiv(DV, BV), gl.num_programs(0)
     ):
-        tile = work % tl.cdiv(DV, BV)
-        row = ((work // tl.cdiv(DV, BV)) % B).to(tl.int64)
-        layer_head = work // (B * tl.cdiv(DV, BV))
-        layer, head = layer_head // H, (layer_head % H).to(tl.int64)
-        group = tl.load(GROUPS + layer).to(tl.int64)
+        tile = work % gl.cdiv(DV, BV)
+        row = ((work // gl.cdiv(DV, BV)) % B).to(gl.int64)
+        layer_head = work // (B * gl.cdiv(DV, BV))
+        layer, head = layer_head // H, (layer_head % H).to(gl.int64)
+        group = gl.load(GROUPS + layer).to(gl.int64)
         index = group * MAX_B + row
-        if tl.load(MATERIALIZED + index) & tl.load(OK + index):
-            end = tl.load(END + row).to(tl.int64)
-            endpoint = end + tl.load(ACCEPTED + row)
-            checkpoint = tl.where(
-                tl.load(FLUSH + index), end, tl.load(CHECKPOINT + index)
+        if gl.load(MATERIALIZED + index) & gl.load(OK + index):
+            end = gl.load(END + row).to(gl.int64)
+            endpoint = end + gl.load(ACCEPTED + row)
+            checkpoint = gl.where(
+                gl.load(FLUSH + index), end, gl.load(CHECKPOINT + index)
             )
-            desc = DESCRIPTORS + layer.to(tl.int64) * 6
-            state_ptr = tl.load(desc).to(tl.pointer_type(tl.float32))
-            hk = tl.load(desc + 1).to(tl.pointer_type(tl.float32))
-            hu = tl.load(desc + 2).to(tl.pointer_type(tl.float32))
-            hd = tl.load(desc + 3).to(tl.pointer_type(tl.float32))
-            history_table = tl.load(desc + 4).to(tl.pointer_type(tl.int32))
-            state_table = tl.load(desc + 5).to(tl.pointer_type(tl.int32))
-            src = tl.load(
+            desc = DESCRIPTORS + layer.to(gl.int64) * 6
+            state_ptr = gl.load(desc).to(gl.pointer_type(gl.float32))
+            hk = gl.load(desc + 1).to(gl.pointer_type(gl.float32))
+            hu = gl.load(desc + 2).to(gl.pointer_type(gl.float32))
+            hd = gl.load(desc + 3).to(gl.pointer_type(gl.float32))
+            history_table = gl.load(desc + 4).to(gl.pointer_type(gl.int32))
+            state_table = gl.load(desc + 5).to(gl.pointer_type(gl.int32))
+            src = gl.load(
                 state_table + row * TABLE_STRIDE + (checkpoint - 1) // STATE_GRAIN,
                 checkpoint > 0,
                 0,
-            ).to(tl.int64)
-            dst = tl.load(
+            ).to(gl.int64)
+            dst = gl.load(
                 state_table + row * TABLE_STRIDE + (endpoint - 1) // STATE_GRAIN
-            ).to(tl.int64)
-            kk = tl.arange(0, BK).to(tl.int64)
-            vv = (tile * BV + tl.arange(0, BV)).to(tl.int64)
+            ).to(gl.int64)
+            state_history_layout: gl.constexpr = gl.BlockedLayout(
+                [1, 1, 4], [1, 1, 32], [gl.num_warps(), 1, 1], [2, 0, 1]
+            )
+            state_layout: gl.constexpr = gl.SliceLayout(1, state_history_layout)
+            kk = gl.arange(0, BK, layout=gl.SliceLayout(0, state_layout)).to(gl.int64)
+            vv = (
+                tile * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, state_layout))
+            ).to(gl.int64)
             mask = (vv[:, None] < DV) & (kk[None, :] < DK)
             feature = (
                 head * STATE_STRIDES[1]
                 + vv[:, None] * STATE_STRIDES[2]
                 + kk[None, :] * STATE_STRIDES[3]
             )
-            state = tl.load(
+            state = gl.load(
                 state_ptr + src * STATE_STRIDES[0] + feature, mask & (checkpoint > 0), 0
             )
             state = _reconstruct_history(
@@ -245,10 +253,11 @@ def _materialize_endpoints(
                 DK,
                 DV,
                 BH,
+                state_history_layout,
             )
             # Each program owns a disjoint state tile, safe even when src == dst.
             # The accepted range ends at endpoint; rejected K/U/D entries are unread.
-            tl.store(state_ptr + dst * STATE_STRIDES[0] + feature, state, mask)
+            gl.store(state_ptr + dst * STATE_STRIDES[0] + feature, state, mask)
 
 
 def materialize_endpoints(

@@ -29,7 +29,7 @@ use the same operation.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -218,30 +218,36 @@ def validate_recurrent_blocks(
         )
 
 
-@triton.jit
-def _history_offset(TABLE, row, token, table_stride: tl.constexpr, rows: tl.constexpr):
-    block = tl.load(TABLE + row * table_stride + token // rows).to(tl.int64)
+@gluon.jit
+def _history_offset(TABLE, row, token, table_stride: gl.constexpr, rows: gl.constexpr):
+    block = gl.load(TABLE + row * table_stride + token // rows).to(gl.int64)
     return block, token % rows
 
 
-@triton.jit
+@gluon.jit
 def _multiply(left, right):
     return left * right
 
 
-@triton.jit
-def _input_offset(row, token, head, feature, strides: tl.constexpr):
+@gluon.jit
+def _sigmoid(value):
+    # Same expression as tl.sigmoid; Gluon does not export that wrapper.
+    return 1 / (1 + gl.exp(-value))
+
+
+@gluon.jit
+def _input_offset(row, token, head, feature, strides: gl.constexpr):
     # Widen before multiplying: a strided producer view can span more than
     # signed-int32 element offsets even though its logical T is small.
     return (
         row * strides[0]
-        + token.to(tl.int64) * strides[1]
+        + token.to(gl.int64) * strides[1]
         + head * strides[2]
         + feature * strides[3]
     )
 
 
-@triton.jit
+@gluon.jit
 def _reconstruct_history(
     state,
     HK,
@@ -254,78 +260,115 @@ def _reconstruct_history(
     length,
     kk,
     vv,
-    HISTORY_TABLE_STRIDE: tl.constexpr,
-    ROWS: tl.constexpr,
-    HK_STRIDES: tl.constexpr,
-    HU_STRIDES: tl.constexpr,
-    HD_STRIDES: tl.constexpr,
-    DK: tl.constexpr,
-    DV: tl.constexpr,
-    BH: tl.constexpr,
+    HISTORY_TABLE_STRIDE: gl.constexpr,
+    ROWS: gl.constexpr,
+    HK_STRIDES: gl.constexpr,
+    HU_STRIDES: gl.constexpr,
+    HD_STRIDES: gl.constexpr,
+    DK: gl.constexpr,
+    DV: gl.constexpr,
+    BH: gl.constexpr,
+    STATE_HISTORY_LAYOUT: gl.constexpr,
 ):
     # S' = S * prod(D) + U^T @ (K * suffix(D)). Shifting before the reverse
     # product gives an exclusive suffix without division, including zero D.
     # Forward and endpoint handoff use exactly the same FP32 reconstruction.
-    hh = tl.arange(0, BH).to(tl.int64)
-    for offset in range(tl.cdiv(length, BH)):
+    # Keep the history axis in registers. Only value rows are split across
+    # warps; key lanes remain contiguous for field loads and recurrence sums.
+    history_layout: gl.constexpr = gl.SliceLayout(0, STATE_HISTORY_LAYOUT)
+    correction_layout: gl.constexpr = gl.SliceLayout(2, STATE_HISTORY_LAYOUT)
+    kk_h = gl.convert_layout(kk, gl.SliceLayout(0, history_layout))
+    vv_u = gl.convert_layout(vv, gl.SliceLayout(1, correction_layout))
+    hh = gl.arange(0, BH, layout=gl.SliceLayout(1, history_layout)).to(gl.int64)
+    for offset in range(gl.cdiv(length, BH)):
         history_index = offset * BH + hh
         position = checkpoint + history_index
         live = history_index < length
-        block = tl.load(
+        block = gl.load(
             HISTORY_TABLE + row * HISTORY_TABLE_STRIDE + position // ROWS, live, 0
-        ).to(tl.int64)
+        ).to(gl.int64)
         token_row = position % ROWS
-        hk = tl.load(
+        hk = gl.load(
             HK
             + block[:, None] * HK_STRIDES[0]
             + token_row[:, None] * HK_STRIDES[1]
             + head * HK_STRIDES[2]
-            + kk[None, :] * HK_STRIDES[3],
-            live[:, None] & (kk[None, :] < DK),
+            + kk_h[None, :] * HK_STRIDES[3],
+            live[:, None] & (kk_h[None, :] < DK),
             0,
         )
         next_live = live & (hh + 1 < BH) & (history_index + 1 < length)
-        next_block = tl.load(
+        next_block = gl.load(
             HISTORY_TABLE + row * HISTORY_TABLE_STRIDE + (position + 1) // ROWS,
             next_live,
             0,
-        ).to(tl.int64)
-        next_decay = tl.load(
+        ).to(gl.int64)
+        next_decay = gl.load(
             HD
             + next_block[:, None] * HD_STRIDES[0]
             + ((position + 1) % ROWS)[:, None] * HD_STRIDES[1]
             + head * HD_STRIDES[2]
-            + kk[None, :] * HD_STRIDES[3],
-            next_live[:, None] & (kk[None, :] < DK),
+            + kk_h[None, :] * HD_STRIDES[3],
+            next_live[:, None] & (kk_h[None, :] < DK),
             1,
         )
-        suffix = tl.associative_scan(next_decay, 0, _multiply, reverse=True)
-        first_decay = tl.load(
+        # Scan lowering currently requires a blocked, not sliced, encoding.
+        # The extra key warp bits replicate the 128-element key vector, so
+        # this encoding still keeps all eight history values thread-local.
+        scan_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 4], [1, 32], [1, gl.num_warps()], [1, 0]
+        )
+        next_decay_scan = gl.convert_layout(next_decay, scan_layout)
+        suffix = gl.associative_scan(next_decay_scan, 0, _multiply, reverse=True)
+        suffix = gl.convert_layout(suffix, next_decay.type.layout)
+        first_decay = gl.load(
             HD
             + block[:, None] * HD_STRIDES[0]
             + token_row[:, None] * HD_STRIDES[1]
             + head * HD_STRIDES[2]
-            + kk[None, :] * HD_STRIDES[3],
-            (hh[:, None] == 0) & live[:, None] & (kk[None, :] < DK),
+            + kk_h[None, :] * HD_STRIDES[3],
+            (hh[:, None] == 0) & live[:, None] & (kk_h[None, :] < DK),
             1,
         )
-        product = tl.sum(tl.where(hh[:, None] == 0, suffix * first_decay, 0), 0)
-        hu = tl.load(
+        product = gl.sum(gl.where(hh[:, None] == 0, suffix * first_decay, 0), 0)
+        product = gl.convert_layout(product, kk.type.layout)
+        block_u = gl.convert_layout(block, gl.SliceLayout(0, correction_layout))
+        token_u = gl.convert_layout(token_row, gl.SliceLayout(0, correction_layout))
+        live_u = gl.convert_layout(live, gl.SliceLayout(0, correction_layout))
+        hu = gl.load(
             HU
-            + block[None, :] * HU_STRIDES[0]
-            + token_row[None, :] * HU_STRIDES[1]
+            + block_u[None, :] * HU_STRIDES[0]
+            + token_u[None, :] * HU_STRIDES[1]
             + head * HU_STRIDES[2]
-            + vv[:, None] * HU_STRIDES[3],
-            (vv[:, None] < DV) & live[None, :],
+            + vv_u[:, None] * HU_STRIDES[3],
+            (vv_u[:, None] < DV) & live_u[None, :],
             0,
         )
-        state = state * product[None, :] + tl.sum(
-            hu[:, :, None] * (hk * suffix)[None, :, :], 1
-        )
+        if BH >= 8:
+            # A scalar FP32 FMA dot avoids keeping the expanded [V,H,K] product
+            # live. This changes accumulation/rounding; it uses no tensor cores
+            # or reduced-precision operand conversion.
+            fma_layout: gl.constexpr = gl.BlockedLayout(
+                [1, 4], [1, 32], [gl.num_warps(), 1], [1, 0]
+            )
+            accumulator = gl.convert_layout(state * product[None, :], fma_layout)
+            left = gl.convert_layout(hu, gl.DotOperandLayout(0, fma_layout, 0))
+            right = gl.convert_layout(
+                hk * suffix, gl.DotOperandLayout(1, fma_layout, 0)
+            )
+            state = gl.convert_layout(
+                gl.dot_fma(left, right, accumulator), state.type.layout
+            )
+        else:
+            # The compiler's FP32 dot requires K >= 8. Small static history
+            # tiles retain the same explicit FP32 outer-product reduction.
+            state = state * product[None, :] + gl.sum(
+                hu[:, :, None] * (hk * suffix)[None, :, :], 1
+            )
     return state
 
 
-@triton.jit
+@gluon.jit
 def _buffered_recurrent(
     Q,
     K,
@@ -347,53 +390,60 @@ def _buffered_recurrent(
     FLUSH,
     OK,
     OUT,
-    Q_STRIDES: tl.constexpr,
-    K_STRIDES: tl.constexpr,
-    V_STRIDES: tl.constexpr,
-    D_STRIDES: tl.constexpr,
-    BETA_STRIDES: tl.constexpr,
-    OUT_STRIDES: tl.constexpr,
-    TRANSFORM_INPUTS: tl.constexpr,
-    LOWER_BOUND: tl.constexpr,
-    H: tl.constexpr,
-    DK: tl.constexpr,
-    DV: tl.constexpr,
-    T: tl.constexpr,
-    ROWS: tl.constexpr,
-    STATE_GRAIN: tl.constexpr,
-    HISTORY_TABLE_STRIDE: tl.constexpr,
-    STATE_TABLE_STRIDE: tl.constexpr,
-    STATE_STRIDES: tl.constexpr,
-    HK_STRIDES: tl.constexpr,
-    HU_STRIDES: tl.constexpr,
-    HD_STRIDES: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    BH: tl.constexpr,
+    Q_STRIDES: gl.constexpr,
+    K_STRIDES: gl.constexpr,
+    V_STRIDES: gl.constexpr,
+    D_STRIDES: gl.constexpr,
+    BETA_STRIDES: gl.constexpr,
+    OUT_STRIDES: gl.constexpr,
+    TRANSFORM_INPUTS: gl.constexpr,
+    FP32_PRODUCERS: gl.constexpr,
+    LOWER_BOUND: gl.constexpr,
+    H: gl.constexpr,
+    DK: gl.constexpr,
+    DV: gl.constexpr,
+    T: gl.constexpr,
+    ROWS: gl.constexpr,
+    STATE_GRAIN: gl.constexpr,
+    HISTORY_TABLE_STRIDE: gl.constexpr,
+    STATE_TABLE_STRIDE: gl.constexpr,
+    STATE_STRIDES: gl.constexpr,
+    HK_STRIDES: gl.constexpr,
+    HU_STRIDES: gl.constexpr,
+    HD_STRIDES: gl.constexpr,
+    BK: gl.constexpr,
+    BV: gl.constexpr,
+    BH: gl.constexpr,
 ):
-    row = tl.program_id(0).to(tl.int64)
-    head, tile = tl.program_id(1), tl.program_id(2)
-    head = head.to(tl.int64)
-    width = tl.load(VALID + row)
-    if width == 0 or not tl.load(OK + row):
+    row = gl.program_id(0).to(gl.int64)
+    head, tile = gl.program_id(1), gl.program_id(2)
+    head = head.to(gl.int64)
+    width = gl.load(VALID + row)
+    if width == 0 or not gl.load(OK + row):
         return
-    end = tl.load(END + row).to(tl.int64)
-    checkpoint = tl.load(CHECKPOINT + row)
-    length = tl.load(LENGTH + row)
-    flush = tl.load(FLUSH + row)
-    kk = tl.arange(0, BK).to(tl.int64)
-    vv = (tile * BV + tl.arange(0, BV)).to(tl.int64)
+    end = gl.load(END + row).to(gl.int64)
+    checkpoint = gl.load(CHECKPOINT + row)
+    length = gl.load(LENGTH + row)
+    flush = gl.load(FLUSH + row)
+    state_history_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 4], [1, 1, 32], [gl.num_warps(), 1, 1], [2, 0, 1]
+    )
+    state_layout: gl.constexpr = gl.SliceLayout(1, state_history_layout)
+    kk = gl.arange(0, BK, layout=gl.SliceLayout(0, state_layout)).to(gl.int64)
+    vv = (tile * BV + gl.arange(0, BV, layout=gl.SliceLayout(1, state_layout))).to(
+        gl.int64
+    )
     mask = (vv[:, None] < DV) & (kk[None, :] < DK)
     src_column = (checkpoint - 1) // STATE_GRAIN
-    src = tl.load(
+    src = gl.load(
         STATE_TABLE + row * STATE_TABLE_STRIDE + src_column, checkpoint > 0, 0
-    ).to(tl.int64)
+    ).to(gl.int64)
     state_feature = (
         head * STATE_STRIDES[1]
         + vv[:, None] * STATE_STRIDES[2]
         + kk[None, :] * STATE_STRIDES[3]
     )
-    state = tl.load(
+    state = gl.load(
         STATE + src * STATE_STRIDES[0] + state_feature, mask & (checkpoint > 0), 0
     )
     # Absolute positions use LCM's sliding residency, not a private dense ring.
@@ -417,58 +467,105 @@ def _buffered_recurrent(
         DK,
         DV,
         BH,
+        state_history_layout,
     )
     if flush:
-        dst = tl.load(
+        dst = gl.load(
             STATE_TABLE + row * STATE_TABLE_STRIDE + (end - 1) // STATE_GRAIN
-        ).to(tl.int64)
+        ).to(gl.int64)
         # Only previously accepted history is flushed, never current candidates.
         # The destination must be request-writable, not a published snapshot.
-        tl.store(STATE + dst * STATE_STRIDES[0] + state_feature, state, mask)
+        gl.store(STATE + dst * STATE_STRIDES[0] + state_feature, state, mask)
     if TRANSFORM_INPUTS:
-        a_scale = tl.exp(tl.load(A_LOG + head).to(tl.float32))
-        bias = tl.load(DT_BIAS + head * DK + kk, kk < DK, 0).to(tl.float32)
+        a_scale = gl.exp(gl.load(A_LOG + head).to(gl.float32))
+        bias = gl.load(DT_BIAS + head * DK + kk, kk < DK, 0).to(gl.float32)
+    # Two register states share one checkpoint/history reconstruction. Only
+    # the FP32-producer state supplies accepted history; verification keeps
+    # the original BF16 producer rounding. T=1 has no second recurrence.
+    history_state = state
     for token in range(width):
-        q = tl.load(Q + _input_offset(row, token, head, kk, Q_STRIDES), kk < DK, 0).to(
-            tl.float32
+        q = gl.load(Q + _input_offset(row, token, head, kk, Q_STRIDES), kk < DK, 0).to(
+            gl.float32
         )
-        k = tl.load(K + _input_offset(row, token, head, kk, K_STRIDES), kk < DK, 0).to(
-            tl.float32
+        k = gl.load(K + _input_offset(row, token, head, kk, K_STRIDES), kk < DK, 0).to(
+            gl.float32
         )
-        v = tl.load(V + _input_offset(row, token, head, vv, V_STRIDES), vv < DV, 0).to(
-            tl.float32
+        v = gl.load(V + _input_offset(row, token, head, vv, V_STRIDES), vv < DV, 0).to(
+            gl.float32
         )
-        d = tl.load(D + _input_offset(row, token, head, kk, D_STRIDES), kk < DK, 0).to(
-            tl.float32
+        d = gl.load(D + _input_offset(row, token, head, kk, D_STRIDES), kk < DK, 0).to(
+            gl.float32
         )
-        beta = tl.load(
+        beta = gl.load(
             BETA
             + row * BETA_STRIDES[0]
-            + token.to(tl.int64) * BETA_STRIDES[1]
+            + token.to(gl.int64) * BETA_STRIDES[1]
             + head * BETA_STRIDES[2]
-        ).to(tl.float32)
+        ).to(gl.float32)
+        if FP32_PRODUCERS and T > 1:
+            history_k = k
+            history_v = v
+            history_gate = d + bias
+            history_layout: gl.constexpr = gl.BlockedLayout(
+                [1], [32], [gl.num_warps()], [0]
+            )
+            history_k = gl.convert_layout(history_k, history_layout)
+            history_k /= gl.sqrt(gl.sum(history_k * history_k, 0) + 1e-6)
+            history_k = gl.convert_layout(history_k, kk.type.layout)
+            if LOWER_BOUND is not None:
+                history_log_decay = LOWER_BOUND * _sigmoid(a_scale * history_gate)
+            else:
+                history_log_decay = -a_scale * gl.where(
+                    history_gate < 20.0, gl.log(1 + gl.exp(history_gate)), history_gate
+                )
+            history_d = gl.exp(history_log_decay)
+        if FP32_PRODUCERS:
+            q = q.to(gl.bfloat16).to(gl.float32)
+            k = k.to(gl.bfloat16).to(gl.float32)
+            v = v.to(gl.bfloat16).to(gl.float32)
+            d = d.to(gl.bfloat16).to(gl.float32)
         if TRANSFORM_INPUTS:
-            # Consume the serving split producers directly: BF16 conv(+SiLU)
-            # Q/K/V and raw f_b gate. Keep normalized K, correction and decay
-            # in FP32; no per-layer prepared-input tensors or launches are needed.
-            q /= tl.sqrt(tl.sum(q * q, 0) + 1e-6)
-            k /= tl.sqrt(tl.sum(k * k, 0) + 1e-6)
+            # Verification consumes BF16 conv(+SiLU) and raw f_b gate.
+            # Normalization and recurrence remain FP32. Producer rounding
+            # happens in registers, without another tensor or launch.
+            # Match the original full-CTA normalization tree. Recurrence
+            # state/history retain the register-local value/key layout.
+            normalization_layout: gl.constexpr = gl.BlockedLayout(
+                [1], [32], [gl.num_warps()], [0]
+            )
+            q_norm = gl.convert_layout(q, normalization_layout)
+            k_norm = gl.convert_layout(k, normalization_layout)
+            q_norm /= gl.sqrt(gl.sum(q_norm * q_norm, 0) + 1e-6)
+            k_norm /= gl.sqrt(gl.sum(k_norm * k_norm, 0) + 1e-6)
+            q = gl.convert_layout(q_norm, kk.type.layout)
+            k = gl.convert_layout(k_norm, kk.type.layout)
             raw_gate = d + bias
             if LOWER_BOUND is not None:
-                log_decay = LOWER_BOUND * tl.sigmoid(a_scale * raw_gate)
+                log_decay = LOWER_BOUND * _sigmoid(a_scale * raw_gate)
             else:
-                log_decay = -a_scale * tl.where(
-                    raw_gate < 20.0, tl.log(1 + tl.exp(raw_gate)), raw_gate
+                log_decay = -a_scale * gl.where(
+                    raw_gate < 20.0, gl.log(1 + gl.exp(raw_gate)), raw_gate
                 )
-            d = tl.exp(log_decay)
-            beta = tl.sigmoid(beta)
+            d = gl.exp(log_decay)
+            beta = _sigmoid(beta)
         state *= d[None, :]
-        correction = beta * (v - tl.sum(state * k[None, :], 1))
+        correction = beta * (v - gl.sum(state * k[None, :], 1))
+        state += correction[:, None] * k[None, :]
+        out = gl.sum(state * q[None, :], 1) * (DK**-0.5)
+        gl.store(OUT + _input_offset(row, token, head, vv, OUT_STRIDES), out, vv < DV)
+        if FP32_PRODUCERS and T > 1:
+            history_state *= history_d[None, :]
+            correction = beta * (
+                history_v - gl.sum(history_state * history_k[None, :], 1)
+            )
+            history_state += correction[:, None] * history_k[None, :]
+            k = history_k
+            d = history_d
         block, token_row = _history_offset(
             HISTORY_TABLE, row, end + token, HISTORY_TABLE_STRIDE, ROWS
         )
         if tile == 0:
-            tl.store(
+            gl.store(
                 HK
                 + block * HK_STRIDES[0]
                 + token_row * HK_STRIDES[1]
@@ -477,7 +574,7 @@ def _buffered_recurrent(
                 k,
                 kk < DK,
             )
-            tl.store(
+            gl.store(
                 HD
                 + block * HD_STRIDES[0]
                 + token_row * HD_STRIDES[1]
@@ -486,7 +583,7 @@ def _buffered_recurrent(
                 d,
                 kk < DK,
             )
-        tl.store(
+        gl.store(
             HU
             + block * HU_STRIDES[0]
             + token_row * HU_STRIDES[1]
@@ -495,9 +592,6 @@ def _buffered_recurrent(
             correction,
             vv < DV,
         )
-        state += correction[:, None] * k[None, :]
-        out = tl.sum(state * q[None, :], 1) * (DK**-0.5)
-        tl.store(OUT + _input_offset(row, token, head, vv, OUT_STRIDES), out, vv < DV)
 
 
 @register_kernel(
@@ -510,7 +604,9 @@ def _buffered_recurrent(
         min_arch_version=ArchVersion(10, 0),
         max_arch_version=ArchVersion(10, 99),
     ),
-    signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.bfloat16, torch.float32}
+    ),
     priority=Priority.SPECIALIZED,
     traits={"head_dim": frozenset({128}), "recurrent_layout": frozenset({"v_major"})},
     tags={"nvidia", "cuda_graph", "buffered_replay"},
@@ -555,11 +651,16 @@ def triton_kda_buffered_recurrent(
             output. Prepared inputs are FP32 normalized Q/K and decay factors.
         value/out: [B,T,H,V] input and caller-owned output with positive strides.
         beta: [B,T,H] update weights (already sigmoid in the prepared case).
-        transform_inputs: True consumes BF16 conv(+SiLU) Q/K/V and BF16/FP32
-            raw f_b gate and beta logits. Apply Q/K normalization, gate/decay
-            and beta transforms inside the recurrence. False consumes prepared
-            FP32 inputs for the reference/benchmark contract. This is an input
-            representation, not a standard/speculative execution mode.
+        transform_inputs: True consumes conv(+SiLU) Q/K/V, raw f_b gate and
+            beta logits, and writes BF16 verification outputs. BF16 Q/K/V use
+            their supplied precision throughout. FP32 Q/K/V require an FP32
+            gate: round producers to BF16 for verification, while T>1 uses
+            their unrounded values for accepted history, matching replay's
+            producer precision. T=1 retains BF16 state arithmetic. Both states
+            live only in registers and share one history reconstruction.
+            False consumes prepared FP32 inputs and writes FP32 outputs for
+            reference/benchmark callers. This selects input representation,
+            not a separate standard/speculative execution path.
         A_log/dt_bias: Contiguous FP32 [H]/[H*K] gate parameters when transforming;
             otherwise both must be None. No transformed-input workspace is built.
         lower_bound: Optional nonpositive log-decay bound for transformed inputs;
@@ -587,7 +688,7 @@ def triton_kda_buffered_recurrent(
         Follow with commit_positions after acceptance, before metadata reuse.
         This primitive neither grants publication provenance nor commits conv.
         Backing validation precedes recurrence in the same order for eager
-        and CUDA graphs. Registration covers native BF16 Blackwell inputs;
+        and CUDA graphs. Registration covers BF16/FP32 native Blackwell producers;
         direct prepared-FP32 calls remain the independent test contract.
     """
     if query.ndim != 4 or value.ndim != 4 or history_key.ndim != 4:
@@ -610,7 +711,11 @@ def triton_kda_buffered_recurrent(
         raise ValueError(
             "transform_inputs must explicitly select the input representation"
         )
-    input_dtype = torch.bfloat16 if transform_inputs else torch.float32
+    input_dtype = query.dtype if transform_inputs else torch.float32
+    if input_dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("native producers must be BF16 or FP32")
+    output_dtype = torch.bfloat16 if transform_inputs else torch.float32
+    fp32_producers = transform_inputs and input_dtype == torch.float32
     data = (
         (query, (batch, width, heads, key_dim), (input_dtype,)),
         (key, query.shape, (input_dtype,)),
@@ -618,14 +723,18 @@ def triton_kda_buffered_recurrent(
         (
             decay,
             query.shape,
-            (torch.bfloat16, torch.float32) if transform_inputs else (torch.float32,),
+            (
+                (torch.bfloat16, torch.float32)
+                if transform_inputs and not fp32_producers
+                else (torch.float32,)
+            ),
         ),
         (
             beta,
             (batch, width, heads),
             (torch.bfloat16, torch.float32) if transform_inputs else (torch.float32,),
         ),
-        (out, value.shape, (input_dtype,)),
+        (out, value.shape, (output_dtype,)),
     )
     for tensor, shape, dtypes in data:
         if (
@@ -723,10 +832,10 @@ def triton_kda_buffered_recurrent(
         and key_dim == value_dim == 128
     )
     value_tile = 8 if narrow_tile else 32
-    # Measured native 12-head shapes favor a smaller value tile. For longer
-    # histories, B2/B3 and larger batches lose to the extra programs; L64/B4
-    # also regresses near flush. Keep their wider tile. This static choice
-    # leaves four warps and FP32 history reconstruction unchanged.
+    # Native 12-head shapes use measured static value tiles. With explicit
+    # register-local history, L64 batches through B4 favor BV16 in the
+    # rotating-layer working set. Larger batches keep BV32; this selection
+    # never inspects per-request history lengths or changes the math.
     if (
         transform_inputs
         and width == 4
@@ -735,7 +844,7 @@ def triton_kda_buffered_recurrent(
         and (
             (capacity == 16 and batch <= 4)
             or (capacity == 32 and batch in (1, 4))
-            or (capacity == 64 and batch == 1)
+            or (capacity == 64 and batch <= 4)
         )
     ):
         value_tile = 16
@@ -770,6 +879,7 @@ def triton_kda_buffered_recurrent(
         beta.stride(),
         out.stride(),
         transform_inputs,
+        fp32_producers,
         lower_bound,
         heads,
         key_dim,

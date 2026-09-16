@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (
     commit_positions,
     prepare_positions,
 )
-from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
     fused_recurrent_kda_pool,
 )
 

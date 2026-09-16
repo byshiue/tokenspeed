@@ -210,10 +210,13 @@ def _buffered_conv(
 
 
 def buffered_conv(raw, weight, state, read, width, ok, out, payload):
-    """Compute BF16 four-tap conv+SiLU and capture raw candidates in one launch.
+    """Compute four-tap conv+SiLU and capture BF16 raw candidates in one launch.
 
-    ``raw/out/payload`` are positive-stride BF16 [B,T,C] tensors with distinct
-    storage roles; ``weight`` BF16 [C,4], ``state`` BF16 [blocks,C,3] oldest-first.
+    ``raw/payload`` are positive-stride BF16 [B,T,C] tensors with distinct
+    storage roles; ``out`` has the same shape and is BF16 or FP32. FP32 output
+    retains the accumulator for accepted history; the recurrence rounds it to
+    BF16 for verification without another producer launch. ``weight`` is BF16
+    [C,4], ``state`` BF16 [blocks,C,3] oldest-first.
     ``read/width`` are contiguous int32 [B], ``ok`` bool [B]. The caller must
     run prepare_conv_blocks first and keep all metadata unchanged. Padding and
     invalid rows neither read state nor write output/payload. No state changes
@@ -224,7 +227,6 @@ def buffered_conv(raw, weight, state, read, width, ok, out, payload):
     batch, width_max, channels = raw.shape
     for tensor, shape in (
         (raw, raw.shape),
-        (out, raw.shape),
         (payload, raw.shape),
         (weight, (channels, 4)),
         (state, (state.shape[0], channels, 3)),
@@ -237,6 +239,14 @@ def buffered_conv(raw, weight, state, read, width, ok, out, payload):
             raise ValueError(
                 "conv fields require declared BF16 shapes and positive strides"
             )
+    if (
+        out.shape != raw.shape
+        or out.dtype not in (torch.bfloat16, torch.float32)
+        or any(s <= 0 for s in out.stride())
+    ):
+        raise ValueError(
+            "conv output requires matching BF16/FP32 shape and positive strides"
+        )
     for tensor, dtype in ((read, torch.int32), (width, torch.int32), (ok, torch.bool)):
         if (
             tensor.shape != (batch,)

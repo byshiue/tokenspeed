@@ -43,7 +43,8 @@ def kda_buffered_workspace_bytes(
 ) -> int:
     """Tensor-storage budget for buffered decode, outside the LCM arena.
 
-    Count BF16 raw candidates per layer plus shared conv/gate/output scratch,
+    Count BF16 raw candidates/output plus shared conv/gate scratch (FP32 for
+    multi-token windows, BF16 for width one),
     int64 conv pointers and int32 group indices, and the metadata owner's raw
     table stacks/position buffers. Geometry is per rank and startup-fixed;
     max_bs is runtime capacity, not the capture ladder. CUDA stream/event
@@ -66,11 +67,14 @@ def kda_buffered_workspace_bytes(
     ):
         raise ValueError("positive buffered workspace geometry required")
     channels = heads * (2 * key_dim + value_dim)
+    producer_itemsize = 4 if max_window > 1 else 2
     activations = (
         max_bs
         * max_window
-        * ((layers + 1) * channels + heads * (key_dim + value_dim))
-        * 2
+        * (
+            (layers * channels + heads * value_dim) * 2
+            + (channels + heads * key_dim) * producer_itemsize
+        )
     )
     descriptors = layers * (8 + 4 + 6 * 8)
     raw_groups = 2 * groups

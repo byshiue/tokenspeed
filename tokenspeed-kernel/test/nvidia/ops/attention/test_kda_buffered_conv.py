@@ -31,7 +31,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.buffered_conv import (
     commit_conv_windows,
     prepare_conv_blocks,
 )
-from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
     fused_kda_verify_conv_update,
 )
 
@@ -40,7 +40,10 @@ from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
     "width,heads,dim", [(1, 2, 16), (4, 2, 16), (1, 12, 128), (4, 12, 128)]
 )
 @pytest.mark.parametrize("captured", [False, True])
-def test_buffered_conv_reordering_acceptance_and_graph(width, heads, dim, captured):
+@pytest.mark.parametrize("output_dtype", [torch.bfloat16, torch.float32])
+def test_buffered_conv_reordering_acceptance_and_graph(
+    width, heads, dim, captured, output_dtype
+):
     torch.manual_seed(710)
     layers, groups, requests, batch, cols, grain = 5, 2, 3, 4, 32, 8
     channels = 3 * heads * dim
@@ -68,7 +71,7 @@ def test_buffered_conv_reordering_acceptance_and_graph(width, heads, dim, captur
         device="cuda",
     )
     payload = payload_storage[:, :batch, :, :channels]
-    out = torch.empty_like(raw)
+    out = torch.empty_like(raw, dtype=output_dtype)
     weights = (
         torch.randn((layers, channels, 4), device="cuda", dtype=torch.bfloat16) * 0.2
     )
@@ -190,7 +193,10 @@ def test_buffered_conv_reordering_acceptance_and_graph(width, heads, dim, captur
             for row, req in enumerate(order):
                 w, a = widths[row], counts[row]
                 torch.testing.assert_close(
-                    out[layer, row, :w], expected[layer][row, :w], atol=0, rtol=0
+                    out[layer, row, :w].bfloat16(),
+                    expected[layer][row, :w],
+                    atol=0,
+                    rtol=0,
                 )
                 torch.testing.assert_close(
                     payload[layer, row, :w], raw[layer, row, :w], atol=0, rtol=0

@@ -1211,7 +1211,7 @@ def test_buffered_workspace_forward_commit_and_budget(
     recurrence keeps M8's FP32 tolerance and BF16 output half-ULP allowance.
     Poisoning rejected raw candidates checks that commit only consumes acceptance.
     """
-    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_kda_verify_conv_update,
     )
 
@@ -1464,6 +1464,7 @@ def test_buffered_workspace_forward_commit_and_budget(
         # Run the rounding oracle before commit changes the conv input windows.
         meta.prepare(batch, for_handoff=False)
         conv_cpu, gates_cpu = [], []
+        history_conv, history_gate = [], []
         for index, layer in enumerate(layers):
             view = meta.layer(layer, batch)
             conv_cpu.append(
@@ -1489,6 +1490,30 @@ def test_buffered_workspace_forward_commit_and_budget(
                 .cpu()
                 .float()
             )
+            if width > 1:
+                # Original accepted replay uses unrounded FP32 convolution
+                # and gate producers, unlike verification. Compute these
+                # independently from raw inputs and accepted conv windows.
+                window = torch.cat(
+                    (windows[index, order], raw_cpu[index, :requests].transpose(1, 2)),
+                    dim=-1,
+                ).float()
+                weight_cpu = weights[index].cpu().float()
+                conv32 = torch.stack(
+                    [
+                        torch.nn.functional.silu(
+                            (window[..., token : token + 4] * weight_cpu).sum(-1)
+                        )
+                        for token in range(width)
+                    ],
+                    dim=1,
+                )
+                history_conv.append(conv32.view(requests, width, 3, heads, dim))
+                history_gate.append(
+                    (f_a[index].cpu().float() @ f_b[index].cpu().float().t()).view(
+                        batch, width, heads, dim
+                    )[:requests]
+                )
         query, key, value = torch.stack(conv_cpu).unbind(3)
         query = query / (query.square().sum(-1, keepdim=True) + 1e-6).sqrt()
         key = key / (key.square().sum(-1, keepdim=True) + 1e-6).sqrt()
@@ -1499,7 +1524,19 @@ def test_buffered_workspace_forward_commit_and_budget(
             )
         ).exp()
         beta_cpu = beta[:, :requests].cpu().float().sigmoid()
+        if width > 1:
+            _, history_key, history_value = torch.stack(history_conv).unbind(3)
+            history_key /= (history_key.square().sum(-1, keepdim=True) + 1e-6).sqrt()
+            history_decay = (
+                -0.3
+                * torch.sigmoid(
+                    a_log.cpu().exp()[:, None] * (torch.stack(history_gate) + bias_cpu)
+                )
+            ).exp()
+        else:
+            history_key, history_value, history_decay = key, value, decay
         candidate, previous = states[:, order].clone(), states.clone()
+        history_candidate = candidate.clone()
         expected_outputs = []
         for token in range(width):
             candidate *= decay[:, :, token, :, None, :]
@@ -1512,9 +1549,19 @@ def test_buffered_workspace_forward_commit_and_budget(
                 torch.einsum("lbhvk,lbhk->lbhv", candidate, query[:, :, token])
                 / dim**0.5
             )
+            history_candidate *= history_decay[:, :, token, :, None, :]
+            history_correction = beta_cpu[:, :, token, :, None] * (
+                history_value[:, :, token]
+                - torch.einsum(
+                    "lbhvk,lbhk->lbhv", history_candidate, history_key[:, :, token]
+                )
+            )
+            history_candidate += (
+                history_correction[..., None] * history_key[:, :, token, :, None, :]
+            )
             for row, req in enumerate(order):
                 if counts[row] == token + 1:
-                    states[:, req].copy_(candidate[:, row])
+                    states[:, req].copy_(history_candidate[:, row])
         if captured:
             graph.replay()
         else:

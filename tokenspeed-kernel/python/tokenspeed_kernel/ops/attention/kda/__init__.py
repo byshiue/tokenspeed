@@ -768,7 +768,9 @@ def resolve_kda_buffered_recurrent(
     """Resolve buffered recurrence once at pool binding; never fall back.
 
     Args:
-        dtype: Native convolution output dtype (BF16 in the initial solution).
+        dtype: Native producer dtype: BF16 for ordinary decode, FP32 when
+            preserving unrounded accepted-history producers. Verification
+            outputs remain BF16 in either case.
         head_dim/value_dim: Key/value dimensions of the V-major state slab.
         max_window: Fixed target width, one for decode or four for EAGLE3.
         capacity: Logical history entries, including candidate space. Initial
