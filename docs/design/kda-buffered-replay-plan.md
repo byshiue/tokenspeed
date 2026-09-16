@@ -48,6 +48,187 @@ M24 已用实际 cache recipe 的 strides/packing 完成 cache-hint 隔离实验
 70 种实际 C4 history/alignment 模式上，checkpoint streaming 的加权 recurrence
 收益只有 0.43%，不构成完整模型性能达标，也未合入。下一步直接分析并优化
 重建 kernel 的计算/调度成本，保留现有精度、状态协议和完整模型验收门槛。
+M25 的新 NSYS 再次复现 matched-prefill 场景的退步，同时保留未复现的 capture。
+M26 的显式 register layout／FP32 scalar dot 候选在 70 种实际 C4 metadata
+模式上降低 recurrence 微基准耗时 12.79%，并通过 reference 和 bitwise 对照；
+部分热缓存控制用例仍有退步，不能视为 E2E 收益。M27 修正最小 history tile
+的编译限制，并让 forward 与 endpoint 共用重建 helper；隔离的 109 项 kernel
+测试、201 项 runtime 测试和 77 个 subtest 通过。候选已接入 rebase 后的工作区，
+冻结的接入版本随后通过直接 GPU 回归：109 项 kernel 测试、201 项 runtime
+测试和 527 项共享 cache/scheduler 测试；匹配的 scheduler 构建通过 490 项 C++
+和 153 项 Python binding 测试。独立 endpoint 微基准仍有 L64 长 history
+退步，不能据此宣称整体加速。首次完整模型启动因旧 FlashMLA 缺少新 API
+而失败，未产生性能样本；按当前依赖版本建立隔离环境后，两节点模型注册检查
+通过。首轮新实现完成 75 条 E2E 计时请求，无错误或抢占；30 个计时批次的
+输出与 M20 L64 一致。同 GPU 的原始 baseline 随后完成：C1 请求延迟基本
+持平（-0.09%），C4 请求／整个批次延迟仍增加 8.48%／13.51%，三轮均有
+C4 退步。C4 acceptance 从 3.67 降为 3.405；请求统计推算的较慢分组轮数
+从 70 增至 82，不将其当作直接测量的 GPU round 数。下一步优先分离验证输出
+与 accepted history 的精度问题；独立重启、本版本 AIME 和性能验收仍未完成。
+M28 的隔离实验通过 18 个单层快照与 90 个 accepted endpoint 检查。M29 将
+BF16 验证输出与 FP32 history producer 合并到一次 recurrence，共享 history
+重建，不增加持久 state 或 accepted replay。18 个快照的 140 个接受组合及
+40 个 T1/T4 多轮数值用例通过，容差不变；接入代码和 scratch 预算已更新。
+接入回归随后发现并修正 T1 的 GEMM 可选参数错误；修正版通过 157 项 kernel、
+201 项 runtime 和 527 项共享 cache/scheduler 测试。新一轮原版／新版 E2E
+对照已启动。首轮新版完成 75 条计时请求，无错误或抢占；C1/C4 延迟中位数为
+1461.59/1791.41 ms，acceptance 为 2.58/3.23，未恢复历史观测的 acceptance。
+同 GPU 原版首轮随后完成：新版 C1/C4 请求延迟增加 38.00%/11.51%，
+整个批次延迟增加 38.00%/10.98%。随后完成两次独立重启／实现，共 300 条
+计时请求，所有配对的 C1/C4 请求延迟仍增加 37.81–38.37%/11.22–12.30%，
+未通过性能门槛。随后完成的 C4 NSYS 中，新版 prefill 分组由 1+1+2 变成 4，
+acceptance 回到 3.64，未复现原有 decode 退步；B4 graph 中位数反而降低
+2.07–2.18%，但 recurrent kernel 从约 8.06 us 增至 17.86 us。此结果完整保留，
+不能替代重复的无 profiler 性能验收。固定 C1 NSYS 对照已启动，用于检查稳定
+复现的较大退步并避开多请求 prefill 分组。该 C1 对照随后完成并复现退步：
+新旧 capture 分别匹配各自全部 30 条无 profiler C1 输出，acceptance 为
+3.59/2.58；实际目标 graph 数为 72/100。新版单轮中位数增加 3.67–3.92%，
+decode 区间增加 44.16–46.16%。rank 0 的 415.917 ms 增量中，按原版均值
+核算的额外轮数项为 358.125 ms；这不是因果分摊，但说明不能只依靠 kernel
+微基准改善来推导整体达标。下一步保留固定容差与状态协议，验证短 history
+重建候选并追踪 acceptance 差异；AIME 尚待验证。局部 state 误差降低不能
+直接推导为模型性能或精度改善。M30 短 history 候选通过数值与实际 endpoint
+writer 检查，但较长的短 history 和混合请求出现 kernel 退步，未接入。
+按用户最新要求，下一阶段固定 L64/C1，优先定位 acceptance 差异，暂不运行
+容量 sweep。先对照冻结原版、当前未启用 buffered replay、当前 L64 三组结果，
+区分 rebase 与 buffered 路径的影响，再沿相同 token 前缀寻找最早的 state、
+verify output 或 target/draft logits 差异。不同生成轨迹下的后续张量不能当作
+同输入对照；数学等价也不能代替浮点执行一致性的验证。
+三组对照现已完成：原版与当前未启用 buffered replay 的代码，各 4 次输出逐
+token 一致，acceptance length/rate 为 3.59/0.8638；当前 L64 的 4 次输出也
+保持一致，但为 2.58/0.5253，首次生成 token 差异位于 index 11。该 case 的
+差异因此收敛到启用 buffered replay 后的路径。M32 的同源 on/off 张量对照
+复现上述输出与 AR：prefill 的已采集字段在 8 个 rank、两次运行中全部一致，
+首次 verify 在 history 为空、输入与初始 state 相同时已出现 KDA 输出差异。
+Q 缩放位置和 FMA/reduction 顺序参与了分歧，局部调整尚未做到全部逐位一致。
+M33 隔离实验保留新 history/state 管理，仅复用原 verify 输出：1,035 个
+fixture/graph 检查通过，完整模型四次运行的 acceptance length/rate 回到
+3.70/0.8986；新的未启用 buffered 控制仍复现 3.59/0.8638。但诊断组与控制组
+的输出仍从 index 11 起不同，因此 AR 回升不等于结果一致。另有 1,104 个
+真实 layer fixture 确认 PDL 开关在该对照中不改变 verify 数值。M34 的 552 个
+同输入 layer fixture 中，原 replay 均逐位复现保存的下一轮 state；新实现的
+history 生成阶段和重建阶段各自引入差异，state 最大绝对差异分别为
+9.54e-7 与 1.91e-6，均在既定容差内，但不是逐位一致。M35 进一步确认，
+同一组原 replay K/U/decay 按原顺序逐 token 做 FMA，可在全部 552 个样本
+上逐位复现原 state；交给当前批量重建算法则产生最大 2.86e-6 的差异。
+因此 verify 算术、系数生成与 state 重建顺序需要分别控制，不能只对齐
+producer 就宣称消除 state 差异。下一步以同输入验证约束算术候选，再跑
+完整模型的 AR 对照。M36 的单 kernel 候选把 verify 与 history 更新分成两个
+内部循环，共用一次重建，不再需要 M33 的额外 verify launch 与 state scratch。
+552 个空 history、2,208 个非空 history 样本的 verify 输出均逐位匹配原版，
+graph 与无效行检查通过；四种短 history 的局部耗时约持平至快 4%，不代表
+完整模型收益。M37 已将候选扩展到现有 T1/T4 与各输入类型；修正小 history
+分支的 layout 转换后，161 项 kernel、201 项 runtime 和 77 个 subtest 通过。
+M38 在新 GPU allocation 上准备同一 L64/C1 完整模型对照，先用保存的真实
+tensor 验证最终 wrapper，再比较未启用 buffered replay 与候选版本的 AR。
+M38 随后完成：2,760 个真实 tensor 用例通过；完整模型候选的 acceptance
+length/rate 为 3.11/70.33%，比 M29 的 2.58/52.53% 改善，但仍低于
+同 GPU 控制组的 3.59/86.38%。每组四次输出一致，两组首次差异仍在
+generated index 11；三次重复的请求延迟中位数仍增加 17.58%。因此对齐
+verify 尚未修复 AR，也未通过性能门槛，候选不接入正式代码。下一步继续
+固定 L64/C1，单独检查候选的 history 系数生成与 state 重建，不扩展容量 sweep。
+M39 已在当前候选上完成该检查：552 个样本的 verify 输出逐位匹配原版，
+但候选系数按原顺序逐 token FMA 后的 state 仍有最大 9.54e-7 差异；
+原版系数交给当前重建算法仍有最大 2.86e-6 差异。下一步分别隔离 FP32
+conv 累加、gate 归约与 key normalization，再验证重建顺序；不能把局部
+容差通过当作 AR 已恢复，也不能将慢速诊断 replay 直接当作正式实现。
+M40–M43 继续固定同一组 552 个真实输入，逐项隔离 conv 顺序、gate、
+normalization 的 reduction/FMA、state update 的 FMA，以及 SiLU 与 projection
+相减的融合边界。对齐后，K/U/decay 与按原顺序重建的 endpoint 均逐位匹配
+原 replay，verify 输出也保持一致。但这仍是首个 T4 window 的隔离诊断：
+gate 当时使用原版输出，重建使用 serial reference。M44 后续通过原 descriptor
+gate kernel 的单层独立计算，在全部 552 个样本保持系数与 endpoint 逐位一致。
+M45 的分页、批量读取／逐 token 更新重建也通过这批真实样本及 260 个边界
+用例，包含 CUDA graph；局部重建成本约持平到增加 10%，并非性能达标。
+M46 的直接指针 gate 已去掉临时 CPU descriptor，独立计算仍在全部 552 个
+样本上逐位匹配。M47 已在私有候选中接入实际 producer/重建路径，补入
+预分配 history scratch 与显存预算；最终修正版通过 163 项 kernel、201 项
+runtime 测试及 77 项 subtest（3 项原有 skip）。M48 的 552 个首窗口样本
+与 M49 的 2,760 个连续窗口层级检查均精确匹配原版，包含 CUDA graph；
+多轮测试只在起点载入一次 state，之后由候选自行维护 history 和 conv state。
+前两轮回归发现并修复了注册、prepared 分支以及测试地址清单的接入遗漏，
+没有放宽精度门槛。M50 的真实完整模型 L64/C1 对比已完成：修正版与原版
+四次生成均逐 token 一致，AR 同为 0.8638、acceptance length 同为 3.59，
+在这个固定场景下消除了此前的 AR 差异。但总延迟中位数仍增加 9.01%
+（1140.08 vs. 1045.84 ms），性能验收没有通过，候选尚未接入正式代码。
+M51 的同条件 timeline 已完成：双方仍逐 token 一致、AR 相同，且每个 rank 都是
+72 轮目标 decode。新版单轮 graph 中位数增加 9.78–10.09%，主要可见开销是
+逐层 history reconstruction 与独立 history gate。完整 profile 区间还包含一次
+约 79 ms 的迟到 rank／allreduce 等待，不能将其等同于稳定 kernel 开销，也不能
+替代 M50 的无 profiler 结果。M52 随后完成 L8/16/32/64、8 个 rank 的真实输入
+连续状态检查，覆盖容量 flush 与 state-page 边界：26,496 个层级 verify 对照
+和 24,288 个 accepted endpoint 对照均逐位一致，graph/eager 一致且未重置参考
+state。M53 已按原有协议启动原版／L8／L16 的六次独立启动对比；首轮原版
+完成全部 75 条计时请求，C1/C4 总延迟中位数为 1045.39/1580.175 ms。
+首轮 L8 随后完成：C1 的 15 个批次仍逐 token 一致，但 C4 的 15 个批次
+输出均不同，AR 中位数从 0.8898 降到 0.7985，整个批次延迟增加 13.61%。
+这还不是六次启动的最终结论，也不能把包含 acceptance 差异的延迟归因于 kernel。
+两边均关闭 mixed batch；下一项 AR 排查固定 L8/C4，补入同版本关闭 buffering
+的控制，区分上游改动与 replay，并比较相同输入和 state 下的多请求数值计算。
+不将 C1 的恢复推广到 C4。随后 L16 第一轮因部分请求复用到 51840 而非预定的
+51328 cached tokens，被工作量一致性检查中止；所有样本保留，不补跑替换，
+六次启动对比未完成。结束服务并确认节点空闲后，M55 开始固定 L8/B4 的同输入
+数值诊断，比较 producer、verify、accepted state 与下一轮 flush。它使用真实
+C1 张量构造 B4 并重新计算原版 B4 对照，不等同于完整模型 AR 验证。
+M55 随后完成全部 1656 个层级用例：producer、accepted state 与 flush state
+均逐位一致，但首次 verify 的 40,697,856 个元素中有 2448 个不同，替换成
+原版 producer 后差异仍在。问题在这些样本中收敛到 B4 verify recurrence，
+尚未证明其解释完整模型 AR。M56 确认 B4 单 warp 的 normalization 线程布局
+不同；M57 只对齐这个布局后，差异元素从 2448 减少到 877，但仍未逐位一致，
+不接入正式代码。producer、accepted/flush state 与 graph/eager 仍一致。
+下一步固定同一 L8/B4，继续对照剩余归约/FMA 指令顺序，再验证完整模型 AR。
+M58 随后确认原版编译结果在 projection、state update 和 output dot 中采用
+不同的乘加融合位置。M59 的隔离诊断显式复现这些舍入位置后，全部 1656 个
+L8/B4 层级用例均逐位一致，包括 accepted state、下一轮 verify/flush 和
+graph/eager。它定位了这批同输入差异，但尚未证明完整模型 AR 已恢复；其中
+依赖编译器结果的 value-row 特判不作为正式实现接入。M60 已完成 C1 连续状态
+及共享回归：C1 与 163 项 kernel 测试通过；runtime 的两项失败随后在未修改
+代码上复现，原因是测试继承双节点启动并选择了不安全的默认端口。恢复原有
+单节点测试方式后，201 项 runtime 测试与 77 项 subtest 通过（3 项原有 skip）。
+M61 已完成同一份源码的 buffering off、L8 on 与算术对齐诊断版对照，固定 C4、
+真实 NVFP4 TP8 和 CUDA graph，不扩展容量性能 sweep。首次尝试在产生 C4 样本前
+被 gateway 拒绝：该接口不支持批量 input IDs。失败记录保留；revision 2 恢复
+runbook 的四个并发单请求，重新核对源码和进程归属后复用已加载的控制组，
+从清空 cache、重新 prime 开始。三组各四批请求的 prefill 都是 1+1+2，cache
+工作量一致；未对齐的 L8 稳定复现 AR 差异，对齐 verify 算术后，四批的全部
+输出 token、AR 与 acceptance length 组合恢复到控制组。控制组和诊断版每批
+各有两条请求 AR 为 0.881、两条为 0.8986；未对齐 L8 为 0.716 / 0.881。
+结合同输入 state/verify 对照，这定位了该固定场景的 verify 浮点执行差异，
+不是 replay state 协议错误的证据。八个 worker 的实际诊断 kernel 调用已核对。
+下一步须把依赖编译器的特判换成可维护的正式实现，再通过同输入与端到端回归；
+诊断版尚未接入，不能将这次 AR 恢复等同于性能验收或其他配置已通过。
+M62–M64 随后各完成同一套 1656 个 L8/B4 用例，尝试去掉编译结果特判。
+改用 Triton 自动布局使 verify 与 accepted state 的一致性更差；把 verify
+循环改成固定 T，或仅把 verify 输入存储改为 BF16，则所有逐层指标与 M57
+完全相同，仍有 877 个首次 verify 元素不同。三种方案均不接入，也不据此
+重跑完整模型或宣称性能收益。Gluon 与 Triton 使用相同的 sum/reduce 定义，
+两边也都启用乘加融合；后续应检查编译后的算术与向量分组，而不是假定存在
+不同的归约默认开关。不得为消除差异而悄悄修改原版对照或放宽验收条件。
+M65 的离线编译对照进一步确认，原版按 value row 不同的乘加融合依赖 SLP
+向量化；关闭另外两项向量算术优化没有同样效果。原版和候选的未改动 PTX
+均精确复现。该检查没有运行 GPU，也不是数值或性能通过：关闭 SLP 同样会
+改变原版算术，不能以同时改动两边替代对冻结原版的验证。下一项有界实验是
+在重建与 verify 之间加入保持数值的寄存器边界，先检查编译输出，再决定是否
+进入既有数值与 AR 验证；尚无该候选结果。
+M66 随后完成这个寄存器边界实验：未改动的两组控制 PTX 均精确复现，但加入
+边界后仍未恢复原版 output dot 的 FMA，候选在离线编译阶段被拒绝，没有新
+GPU 数值、AR 或性能结果。按已说明的取舍，下一步先请用户确认是否允许为
+unbuffered/buffered 定义共享且明确的 verify 浮点运算顺序。若确认，验证须
+保留冻结原版、共享算术的 unbuffered、共享算术的 buffered 三组；不能用改变
+后的 unbuffered 取代原始性能/精度对照，也不能声称输出逐位恢复原版。该方向
+尚未获确认或实现，现有验收门槛不作隐式变更。
+用户随后指定先测试现有算术对齐诊断版，并将范围限制在 KDA、不跑 E2E。
+M67 已完成 L8/B4/T4、69 层、TP8 每 rank 形状、CUDA graph 开启的局部对照。
+八个 rank 的 1656 个 layer/case 与新 benchmark 的输出和 accepted state 均
+逐元素通过。对齐版 KDA core 比未对齐版耗时低 5.82–5.92%，但仍比冻结原版
+高 36.67–37.10%。计时包含 producers、verify/history 与 accepted commit，
+平均一个无 history 窗口和一个 flush 窗口；不代表稳态 L8 分布或端到端性能。
+因此对齐本身在此处没有性能惩罚，但 buffered 路径尚未达到不慢于原版的目标。
+本次没有改写共享算术契约或采用诊断版，也没有新的 AR/AIME 测试。
+M54 的 history-gate token tile 实验暂缓，仅完成 CPU 准备，尚无 GPU 结果。
+不得因局部 kernel 变快而放宽逐位对照、AR 或重复端到端性能门槛。
+不得将诊断版的重复计算与临时 scratch 当成生产实现或性能达标。所有观测
+同步、诊断拷贝与重复计算均不计入性能收益，当前版本 AIME 尚未验证。
 PD/任意 live endpoint 交接仍受限，尚未选择默认容量。各阶段 commit、环境和验证证据见
 [implementation record](kda-buffered-replay-progress.md)。下文保留完整方案与验收要求。
 
@@ -183,7 +364,8 @@ checkpoint。完成后通过 ring 指针推进回收历史空间，不搬移剩�
 不支持时启动报错，不静默退回另一套 decode 路径。
 
 实验性接入阶段必须显式传入正容量；省略参数维持现有部署行为，并非用 `0`
-切换实现。目前注册限定 NVIDIA Blackwell、BF16 输入、FP32 state、128 维
+切换实现。目前注册限定 NVIDIA Blackwell、BF16 模型输入、BF16/FP32 conv producer、
+FP32 state、128 维
 head、`T_max=1/4`、`2*T_max <= L <= 64`，并拒绝 PD。这个范围是初始验证
 边界，不是性能推荐；扩大范围需要补充对应验证。
 

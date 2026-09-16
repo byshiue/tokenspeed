@@ -4,6 +4,47 @@ This record tracks implementation of [the buffered replay plan](kda-buffered-rep
 It separates reference results from kernel tests and real-model measurements.
 Passing a reference test does not mean buffered replay is available in serving.
 
+## Current validation status
+
+The working implementation remains M29R2 and has not passed the Eagle3
+no-regression gate. Later arithmetic candidates are private experiments, not
+adopted changes. Current-version AIME and the broader performance/lifecycle
+gates remain open; earlier results below apply only to their recorded source.
+
+M47R3 restores full-model L64/C1 tokens and acceptance in M50: both paths have
+AR 0.8638 and acceptance length 3.59. Latency still increases 9.01%, so that
+result is not a performance pass. M51 traces the remaining same-trajectory
+cost to history reconstruction and history-gate work, with a separate late-
+rank outlier retained in the profile. C1 recovery does not establish C4.
+
+The active AR investigation is now fixed at L8/C4. M53's first L8 run retains
+C1 outputs but changes every measured C4 batch. Its later L16 run stops on a
+cache-hit/workload mismatch; the six-startup comparison is incomplete and
+the partial samples are not replaced. M55 isolates B4 verify differences
+despite exact producers and accepted/flush state. M58/M59 attribute those
+same-input differences to normalization ownership and projection/update/dot
+contraction. An explicit diagnostic reproduces the original compiler's
+rounding in all 1656 B4 cases; C1 carried-state, 163 kernel tests and 201
+runtime tests plus 77 subtests pass (three existing skips).
+
+M61 revision 2 completes the real NVFP4 TP8, CUDA-graph-enabled L8/C4
+comparison on the same base source. Unchanged buffering reproduces the AR
+gap; aligning only verify arithmetic restores all output-token and acceptance
+multisets to the unbuffered control. All twelve batches have the same 1+1+2
+prefill grouping and cache workload. This supports verify arithmetic as the
+cause in this fixed case, following the same-input state/verify checks above.
+The diagnostic's compiler-specific value-row masks are not a portable
+production fix. No performance, current AIME or broader-capacity pass follows.
+The first attempt produces no C4 sample because the gateway rejects batched
+input IDs; the recorded recovery uses four concurrent scalar-input requests.
+Details, retained failures and remaining implementation work follow below.
+
+M62–M64 test three alternatives to the compiler-specific diagnostic. Inferred
+Triton layouts worsen verify and accepted-state equality; a static verify
+window and BF16 verification input storage leave all M57 per-layer metrics
+unchanged. None is adopted. The remaining work is a maintainable verify
+arithmetic implementation, not another capacity sweep or a relaxed AR gate.
+
 ## Source and milestones
 
 Baseline: `2e4b540743878959eb51793ce01d74b5898b0e38` (upstream main).
@@ -2289,3 +2330,1637 @@ Full runtime and GPU checks were not rerun: the local CPU environment cannot
 satisfy the kernel package's accelerator requirement.
 Earlier full-model accuracy and performance results do not validate this
 rebased revision.
+
+### M25–M27: explicit-layout history reconstruction
+
+M25 repeated the original-versus-buffered full-model NSYS comparison with real
+93-layer Kimi-K3 NVFP4, TP8, EAGLE3, C4, CUDA graphs and overlap enabled.
+The matched-prefill capture reproduced the slowdown: the rank-0 B4 graph
+median increased from 15.249 to 16.207 ms, and the buffered run had 13 B2 tail
+rounds instead of one. A separate capture grouped prefill differently and did
+not reproduce the overall slowdown; both observations are retained. Six
+clearly named reports and a checksum-verified ZIP were delivered. Profiling
+does not replace M20's unprofiled performance gate.
+
+M26 tested reconstruction alternatives on one GB300 using the M24 real-stride,
+rotating 69-layer cache fixture. This is a recurrence microbenchmark, not a
+full model. Cache-policy changes, candidate-loop unrolling and several layout
+variants were rejected after numerical differences or regressions. Keeping
+history in registers and using a scalar FP32 dot became useful only after
+restoring the original full-CTA Q/K normalization layout. No TF32 operand
+conversion or tensor-core computation is used.
+
+Across all 70 recorded C4 history/alignment patterns, the BV16 candidate
+reduced weighted recurrence time from 17.2557 to 15.0489 microseconds per call
+(12.79%). All 210 checks across current and two candidate variants passed the
+unchanged independent references and complete-arena/BF16-output bitwise checks.
+Values still come from replicated single-layer snapshots. Some separate
+warm-cache long-history controls regressed 5.21–8.57%; those results remain in
+the record. Neither result establishes E2E performance.
+
+The first broad kernel run passed 95 tests but failed to compile 14
+minimum-history cases: the scalar dot requires at least eight reduction
+elements. M27 retains the original FP32 outer-product sum for smaller static
+tiles and shares the corrected reconstruction between forward and endpoint
+materialization. All 14 retained failures then pass. The complete frozen-source
+suite passes 109 kernel/reference tests and 201 runtime tests, with 77 subtests
+and three optional-dependency/platform skips. Tests cover T1/T4, eager/graphs,
+acceptance, flush, cache validity and lifecycle behavior without relaxed
+tolerances. The environment is Python 3.12.3, PyTorch 2.13.0+cu130, CUDA 13,
+driver 580.167.08 and tokenspeed-triton 3.8.10.post20260906 on GB300.
+
+The candidate is now integrated as an uncommitted change on rebased commit
+`58318c44`. Registration, public arguments, FP32 persistent fields, native
+BF16 producers, accepted-only stores and the width-parameterized execution
+path are unchanged. The offset-overflow test now invokes the Gluon helper
+directly. The preceding passes used frozen `ad28ea43` runtime/test sources
+with process-local kernel injection; they do not validate this rebased
+integration. Direct integrated-source regression, a matching scheduler build,
+endpoint timings and full-model EAGLE3/AIME validation are still pending.
+No default capacity is selected. Local M25–M27 runbooks retain commands,
+source hashes, failed attempts and complete measurement samples.
+
+The independent rebased scheduler build subsequently passes 490 C++ tests and
+153 Python binding tests. Its staged extension is separate from the serving
+venv and all earlier binaries. A paired endpoint-only benchmark covers 20
+synthetic 69-layer cases at L8/L16/L32/L64 and B1/B4, including inactive and
+mixed rows. Every before/after field comparison is bitwise equal to the frozen
+writer. L8/L16 active cases improve, but L64 long-history materialization
+regresses 11.33–14.27%. Empty-round cost stays around 1.3–1.4 microseconds.
+This regression is retained: sharing a faster forward reconstruction does not
+guarantee a faster batched writer. The integrated implementation remains a
+candidate for full-model measurement, not a no-regression result or a default.
+
+The first direct rebased-source kernel run stops at collection: two tests still
+import the removed `thirdparty.triton.fla_kda_recurrent` module. A repository
+search identifies four such references across buffered tests and their
+microbenchmark. They now import the relocated `_triton.recurrent` module;
+assertions and numerical tolerances are unchanged. The failed source snapshot
+and collection report are retained separately from the corrected candidate.
+
+The corrected, frozen rebased source now passes direct GPU validation without
+prototype injection: 109 kernel tests; 201 runtime tests with 77 subtests and
+three optional-dependency/platform skips; and 527 shared cache/scheduler tests
+with 317 subtests, including GDN checks. This uses the newly built matching
+scheduler, not the earlier native binary. The source patch SHA256 is
+`5e6f8e8290153a8f65e143961ec361e4135fdc956fecfbdf5f757bfc7822ba6c`.
+Real-model comparison has started in the fixed order candidate, original
+baseline, independent candidate restart, independent baseline restart. Each
+uses the unchanged C1/C4 protocol, real NVFP4 TP8 weights, EAGLE3 and CUDA
+graphs/overlap enabled. This first attempt subsequently failed before model
+loading: the rebased registry imports the DeepSeek V4.1 adapter, which requires
+a FlashMLA API absent from the historical serving environment. All eight
+ranks exited. No smoke response or performance sample completed, and the
+failed logs remain separate from subsequent runs.
+
+A separate dependency overlay now supplies the current repository's pinned
+FlashMLA and DeepSelect versions, both `1.0.0.post20260910`; the historical
+venv, cached image and native objects are unchanged. Both nodes pass the full
+model-registry import and required-symbol checks. Original and candidate use
+the same overlay. A new cohort has started with the same immutable candidate,
+matching scheduler, input and fixed C1/C4 protocol. The earlier GPU suites
+used the preceding optional-package environment, not this repaired overlay.
+The first candidate run subsequently completes the full unprofiled protocol:
+75 measured requests across 30 batches, plus six warmup batches, with no
+request errors or preemption. All eight ranks select buffered recurrence at
+capacity 64 and target width four; graph and overlap settings are confirmed
+from startup records. C1/C4 median client latency is 1,058.983 / 1,742.155 ms;
+whole-batch latency is 1,059.094 / 1,836.072 ms. Median acceptance remains
+3.75 / 3.405. All 30 measured output multisets match M20 L64, including their
+multiplicities. This checks the frozen continuation, not general model accuracy.
+
+The owned candidate server is stopped only after its complete results are
+validated, and both nodes are checked idle before the original baseline
+starts. That same-GPU baseline and the independent repeats are still pending.
+Historical latency is not substituted for this cohort's baseline, and neither
+an EAGLE3 no-regression result nor a new AIME score is claimed.
+
+The first original-baseline startup then stops before loading weights because
+two control ports are still busy. It produces no measurement; the failed
+attempt and completed candidate remain separate. Subsequent process/socket
+checks find no surviving model process or occupied port. The local launch
+helper now checks the runtime's exact bind/listen contract as well as GPU
+idleness before starting another server. Its occupied/released-port test
+passes. An explicitly recorded baseline recovery uses a new case label with
+unchanged source, dependencies, ports and measurement protocol. This corrects
+the experiment setup, not the model, and does not relax the repeat requirement.
+
+The recovered original baseline completes the same 75-request protocol on the
+same eight GPUs, also without errors or preemption. The first completed pair
+does **not** meet the EAGLE3 no-regression goal:
+
+| Median latency | Original | M27 candidate | Change |
+| --- | ---: | ---: | ---: |
+| C1 request | 1,059.933 ms | 1,058.983 ms | -0.09% |
+| C4 request | 1,605.961 ms | 1,742.155 ms | +8.48% |
+| C4 whole batch | 1,617.570 ms | 1,836.072 ms | +13.51% |
+
+C4 batch medians are higher in all three rounds. C1's sub-one-percent
+difference is unresolved variation under the preregistered rule, not a
+demonstrated speedup. Each implementation has one completed server restart;
+the interrupted four-case sequence and independent-repeat requirement remain
+explicit in the report. Both owned servers are stopped after validation and
+the nodes independently checked idle. Source, dependencies and protocol are
+unchanged during the recovery, and no measured sample is replaced.
+
+Median C4 acceptance falls from 3.67 to 3.405. The source's rounded statistics
+uniquely imply 69/70 accounted rounds for the original request groups, versus
+69/82 for the candidate, with 30 requests in each group. These are not NSYS
+round counts or isolated kernel timings: request windows also include overlap
+with other requests' prefill. No corresponding original/candidate output batch
+is identical, although every candidate batch still matches M20 L64. The next
+numerical investigation should separate accepted-history precision from the
+verification-output contract; M23's producer difference is a lead, not yet a
+causal acceptance result. Current-source AIME and final performance acceptance
+remain open. The local report retains all metrics, failures and source hashes.
+
+## M28–M29: preserve accepted-history precision in one recurrence
+
+The M27 full-model regression remains the latest performance result. This
+phase tests the producer-precision lead; it does not establish that precision
+caused the acceptance change.
+
+M28 separates BF16 verification from FP32 accepted-history producers using
+two existing recurrence calls. All 18 saved real-model single-layer fixtures
+pass, with 90 accepted-prefix checks against original replay at unchanged
+FP32 tolerances (atol 2e-5, rtol 2e-4). The actual endpoint writer also passes;
+its maximum absolute state difference is 7.62939453125e-6. Verification output
+is bitwise unchanged on these fixtures, and eager/graph storage agrees.
+This intentionally duplicated computation is an isolation tool, not a
+production implementation or performance measurement.
+
+M29 implements one recurrence launch. It reconstructs committed history once,
+then carries BF16-producer verification and FP32-producer history recurrences
+in registers. Conv and gate retain FP32 output; verification rounds them to
+BF16 in the kernel. T1 retains ordinary decode's BF16 state arithmetic through
+the same forward/commit. No persistent state, eager accepted replay or
+output-only route is added. Shared scratch accounting now includes the wider
+producer buffers; raw candidates and verification outputs remain BF16.
+
+All 18 fixture producer-rounding checks pass bitwise. The single-pass prototype
+passes all 18 fixtures and 140 accepted-prefix checks, now including mixed
+acceptance, original replay and the actual endpoint writer. Its maximum
+endpoint error is again 7.62939453125e-6. Forty parameterized T1/T4 multi-round
+cases pass at unchanged tolerances: softplus/bounded gates, five capacities,
+eager/graphs, rejected-history poisoning, repeated flush, request reordering,
+physical-page reuse and slot reuse. These use compact or synthetic arenas,
+not a new full-model acceptance measurement.
+
+The implementation and references are integrated as uncommitted changes on
+`58318c44`. The prototype used the frozen M27 source and matching scheduler;
+direct integrated-source suites are still required. The new persistent
+eight-GB300 allocation uses the same cached CUDA 13/PyTorch 2.13.0+cu130
+environment, driver 580.167.08, tokenspeed-triton 3.8.10.post20260906 and
+FlashMLA/DeepSelect 1.0.0.post20260910. Both nodes pass registry, dependency
+and healthy/full NVLink checks. Local M28/M29 runbooks retain exact source,
+script and fixture hashes, commands, terminal outcomes and environment details.
+
+No new E2E performance or AIME result is claimed. Direct kernel/runtime/shared
+cache regressions, repeated real NVFP4 TP8 EAGLE3 timings, a matching timeline
+and current-source AIME remain open. Buffered replay is still experimental;
+no default capacity is selected.
+
+The first frozen M29 integration passes all 157 kernel tests, but runtime
+validation reports seven T1 failures: PyTorch rejects an explicit
+`out_dtype=None` in the unchanged-BF16 gate case. The other 194 runtime tests
+and 77 subtests pass; three optional/platform tests skip. This is an API
+integration bug, not a numerical-tolerance failure. The gate's optional FP32
+output argument is now bound once at workspace construction; BF16 uses the
+ordinary GEMM call. Both widths still execute the same forward/commit.
+The failed snapshot and logs remain immutable. Corrected-source regressions
+must complete before any full-model measurement.
+
+The corrected frozen source now passes direct validation without prototype
+injection: 157 kernel tests; 201 runtime tests with 77 subtests and three
+optional/platform skips; and 527 shared cache/scheduler tests with 317
+subtests. Its patch SHA256 is
+`5ac8a1d86b599ccba80d0f513bb568006c44a47c1057415f163dbf38b35e0d35`.
+Both nodes are independently idle afterward. Full repository hooks pass
+after the T1 repair; no commit or push is made.
+
+The real full-model comparison is now running against the frozen original,
+with real NVFP4 weights, TP8, EAGLE3, CUDA graphs and overlap enabled. It uses
+the same fixed C1/C4 protocol and two independent restarts per implementation.
+The first candidate has completed all 75 timed requests across 30 batches,
+without errors or preemption. C1/C4 client-latency medians are
+1461.59/1791.41 ms; median acceptance is 2.58/3.23. The completed-source audit
+confirms all eight ranks use L64/T4 and the expected 11,408,460-byte workspace
+per rank. Only shared producer scratch grows: 196,608 bytes per rank.
+
+This precision change has not restored the acceptance observed in earlier
+runs. Its output multisets differ from both the historical original and the
+BF16-history implementation in all 30 measured batches. Those historical
+cohorts are used only to examine output and acceptance changes, not latency.
+The same-GPU original and independent restart measurements are still running;
+there is no new no-regression pass or AIME score. The controller preserves
+all samples and only stops each owned server after validating its full run.
+
+A separate short NSYS pair is prepared for the same frozen sources and GPU
+cohort. It retains real NVFP4 TP8, EAGLE3, C4, CUDA graphs and the fixed
+continuation. A completion guard prevents it from overlapping the unprofiled
+comparison. The CPU preparation test passes; no new capture exists yet.
+
+The first same-GPU original has now completed all 75 timed requests without
+errors or preemption. The paired result is a performance failure, not noise:
+
+| Median metric | Original | M29 L64 | Change |
+| --- | ---: | ---: | ---: |
+| C1 request latency | 1059.12 ms | 1461.59 ms | +38.00% |
+| C4 request latency | 1606.49 ms | 1791.41 ms | +11.51% |
+| C1 whole-batch latency | 1059.23 ms | 1461.71 ms | +38.00% |
+| C4 whole-batch latency | 1618.70 ms | 1796.48 ms | +10.98% |
+| C1 acceptance | 3.59 | 2.58 | lower |
+| C4 acceptance | 3.67 | 3.23 | lower |
+
+All three rounds are slower at both concurrencies. The rounded request
+statistics imply 71 versus 99 accounted verify rounds at C1, and 69/70 versus
+79 at C4. These are not measured graph replay counts, and they do not isolate
+the cause of the regression. Each implementation has one completed restart
+in this pair; the preregistered second pair is running. No samples are dropped
+or replaced. Six CPU checks pass for the separate NSYS capture/analysis flow;
+GPU capture, AIME and the overall no-regression gate remain open.
+
+The second candidate restart also completes all 75 measured requests without
+errors or preemption. C1/C4 medians are 1459.62/1786.74 ms; median acceptance
+remains 2.58/3.23. Output multisets match the first candidate in 29 of 30
+batches. The remaining C4 batch takes 2972.08 ms, with prefill times of
+1683.88–1831.21 ms and acceptance of 3.64/3.70. Its outputs differ, and all
+four requests remain in the timing statistics. Logs alone do not establish
+why this batch differs. The final original restart is now running; no new
+GPU capture or AIME result is claimed.
+
+Both original restarts are now complete as well. All four same-GPU pairings
+fail the no-regression gate: C1 client latency increases 37.81–38.37%, C4
+11.22–12.30%; whole-batch latency increases 37.81–38.36% and 10.73–11.80%.
+All 300 measured requests across 120 batches finish without errors or
+preemption. Original output multisets match across both restarts in all 30
+batches; candidate output multisets match 29 of 30. Candidate r2's unusual
+C4 batch remains included, producing a 2952.51 ms request p95.
+
+The controller exits successfully after validating and stopping each owned
+server and independently checking both nodes idle. A separate matched NSYS
+pair has started with the same frozen sources and GPU cohort. No capture or
+AIME result is available yet. L8/L16 follow-up preparation passes its CPU
+protocol check, but no smaller-capacity model has started. Those tests retain
+the same arithmetic and sampling rules and cannot begin before the requested
+profile package is complete or without enough allocation time.
+
+The first diagnostic capture completes all four requests, but profiler
+shutdown triggers the job launcher's peer-termination behavior while the
+second node is still converting its report. One report survives; the other
+is incomplete and has no recoverable raw trace. This is a capture-infrastructure
+failure, not a model-request or unprofiled-timing failure. Both nodes are idle
+before a separately labeled recovery starts. The recovery disables automatic
+peer termination without changing model arguments, frozen source or validation
+gates. The failed attempt and surviving report remain available; no complete
+paired timeline or new accuracy result is claimed yet.
+
+The recovered C4 pair is now complete on all eight GPUs, packaged and checked.
+Each target decode forward maps to a graph with consistent node counts per
+batch; stop-shutdown event-completeness warnings remain documented. The first
+attempt's surviving single-node report is preserved separately in the ZIP.
+
+This capture does not reproduce the usual lower acceptance and longer decode
+window. Original prefill groups are 1+1+2; the candidate uses one B4 prefill.
+Candidate acceptance is 3.64 for all captured requests, versus 3.23 in its
+uncaptured warmup in the same server. Warmup/capture outputs differ; this
+association does not prove that grouping caused the output difference.
+
+Original executes 70 B4 target graphs and one B2; the candidate executes 71
+B4 graphs. Across eight ranks, the candidate B4 median is 2.07–2.18% lower,
+and its decode window is 0.21–1.34% shorter. At rank 0, B4 medians are
+15.245/14.929 ms and decode windows 1099.619/1097.358 ms. KDA itself is
+slower: the median of per-graph recurrent-launch medians is 8.064/17.856 us,
+and the 69-launch cumulative median is 555.712/1232.575 us. Other kernels
+also change; different outputs, grouping and the recorded upstream rebase
+prevent kernel-only attribution. The broad post-sync CPU interval grows but
+the median graph gap does not. Device flush flags are unobserved; endpoint
+launch counts do not establish active state materialization counts.
+
+The repeated unprofiled E2E gate still fails. The favorable decode capture is
+retained, not substituted for those measurements. One fixed C1 original/new
+pair is now running on the same persistent allocation: C1 is the largest
+repeatable E2E regression and avoids multi-request prefill grouping. Serving
+arguments, graph ladder, sources and inputs are unchanged; only client
+concurrency is one. Three CPU protocol/accounting tests pass. All ten
+non-document worktree changes still match frozen R2; no production edit,
+commit or push is made in this diagnostic phase. Smaller-capacity tests
+remain unsubmitted; current-source AIME and the final performance gate remain open.
+
+The fixed C1 pair is complete and reproduces the regression. Each capture has
+one prefill, matches its own warmup and all 30 corresponding unprofiled C1
+outputs from two restarts. Original/candidate acceptance is 3.59/2.58;
+their output sequences first diverge at zero-based token index 11. This is
+not necessarily the first numerical difference or evidence of its layer.
+
+All eight ranks show 72 original versus 100 candidate target graphs. These
+are directly observed CUDA-graph counts, not the earlier inversion of rounded
+request statistics. Candidate graph medians increase 3.67–3.92%; decode
+windows increase 44.16–46.16%. Rank 0's medians are 12.457/12.920 ms, with
+decode windows 939.422/1355.339 ms. The 415.917 ms difference reconciles as
+358.125 ms for additional graphs at the original mean duration, 42.239 ms
+for changed mean graph duration at the candidate count, and 15.553 ms for
+all inter-graph gaps. This convention is exact accounting, not causal attribution.
+
+KDA recurrent-launch medians increase 5.728/15.344 us, and 69-launch
+cumulative medians increase 394.784/1060.512 us. The original batched replay
+kernel's median is 42.480 us; the candidate does not launch it. The candidate
+endpoint writer launches 100 times, but device flags are not observed and
+these are not 100 proven active materializations. Graph-gap medians increase
+261.664/342.208 us, much less than the broad post-sync CPU interval change.
+
+Both-node request/source/ownership checks, graph correlation and cleanup pass;
+the controller exits successfully. Four clearly named C1 reports, analysis and
+output-reproduction evidence are packaged, readback-checked and delivered.
+The C4 pair remains separate and unchanged. The performance gate still fails;
+additional rounds dominate this C1 accounting, so acceptance must be tracked
+alongside kernel cost. No new AIME score or production-source change is claimed.
+
+### M30: isolated short-history reconstruction validation
+
+An unregistered frozen-source copy tests token-order FP32 K/U/D reconstruction
+only when the existing compile-time history tile is smaller than eight. Long
+tiles retain the current implementation; there is no device-side algorithm
+branch, new state store, producer change, acceptance change or output-only
+route. Earlier long-history serial regressions are not discarded. At L8/T4,
+the unchanged capacity rule flushes positive history on the next forward;
+shorter reconstruction trades against more state writes rather than guaranteeing
+a benefit. Small T1 capacities also need coverage before any adoption.
+
+The CPU AST check passes and verifies unchanged code outside the declared
+helper/registration change. After the C1 package is delivered and both nodes
+are independently idle, the isolated frozen recurrence suite passes all 100
+cases in 246.46 seconds on a GB300 with CUDA 13 and PyTorch 2.13.0+cu130.
+It covers T1/T4, five capacities, prepared/native/dual-producer inputs, both
+gate forms and eager/graph execution across multiple rounds. Existing FP32
+and BF16 tolerances are unchanged. The tested prototype remains separate
+from the frozen M29R2 serving source; no new commit or integration pass is claimed.
+
+A same-GPU recurrence and actual-endpoint-writer experiment follows. Its 18
+fixed geometries cover L8 short histories, B1/B4 and mixed rows, plus longer
+tile controls. It uses actual cache recipe strides and FP32 producers, with
+one recorded layer's values replicated across 69 independent layer fields.
+Shortened histories and rebased positions are synthetic, not recorded L8
+model trajectories. Timing uses balanced original/prototype/prototype/original
+order for single-layer and rotating-layer working sets; reference and writer
+checks must pass first. All outputs, source hashes and compiler resources are
+recorded. This does not establish model acceptance, an E2E speedup or AIME
+accuracy. The M29 acceptance regression remains unresolved; renewed full-model
+performance and the remaining plan gates are still required.
+
+The paired experiment completes on the same GB300. Both variants pass all
+18 geometries across 69 layer fields and 280 combined actual-writer checks;
+maximum endpoint error is 1.90735e-6 and eager/graph storage is bitwise equal.
+Timing confirms a tradeoff, not a generally faster replacement. In the
+rotating-layer L8 cases, history length one improves 6.66% at B1 and 4.82%
+at B4, but length three regresses 4.65%/4.34% and length four regresses
+10.81%/9.13%. The two mixed B4 cases regress 8.39–8.81%. Long-tile controls
+are effectively unchanged in this measurement. Registers decrease from 168
+to 154 for the short tile, with no spills in either variant; that does not
+establish the cause of the timing changes.
+
+Do not adopt the prototype based on its passing numerical gate or its best
+short-history cases. The failed performance hypothesis and all measurements
+are retained. Production remains frozen M29R2; there is no full-model result
+for this prototype and no evidence that its acceptance recovers. The remaining
+small T1-capacity extension is not claimed complete. Next, separate capacity
+effects from arithmetic changes with the prepared, unchanged-source L8/L16
+full-model comparison and matched original restarts on a fresh persistent
+GPU cohort. Keep the existing E2E, AIME and lifecycle requirements intact.
+
+### M31: fixed-capacity acceptance investigation
+
+The user reprioritized acceptance after the obvious kernel issues, asking to
+focus on one capacity and concurrency first. The prepared capacity sweep is
+therefore not submitted. A fresh persistent TP8 allocation is reserved under
+the same binding; the completed, independently idle previous allocation is
+released without deleting any artifacts. The serving source stays frozen M29R2.
+
+L64/C1 is the initial case because its lower acceptance and additional target
+rounds reproduced in both independent unprofiled restarts and NSYS. Three
+full-model controls distinguish the frozen pre-plan original, current source
+without buffered replay, and the same current source with capacity64. Each
+uses identical real weights, graph/overlap settings, frozen input and sampling,
+with one warmup and three repeated continuations. This is a causal-isolation
+control, not a replacement for the repeated performance gate or AIME.
+
+The follow-up compares intermediate results only while token prefixes match,
+starting from prefill state and early verify outputs before following target
+and draft logits. It must identify the earliest numerical difference before
+attributing an acceptance change to rounding or history reconstruction. The
+first differing generated token alone is not enough. No forced acceptance,
+sampling modification or new production arithmetic is part of the initial
+control. Bootstrap checks the cached environment, all eight GPUs and common
+healthy fabric before any model starts. Those checks pass on the new eight
+GB300 GPUs, and the original control starts after an additional case-specific
+idle/preflight check. The fixed three-arm controller is running; results are
+not available yet. The first CPU protocol check caught a stale copied comment;
+the comment was corrected and the check passes before model submission. No
+production code or numerical threshold changed in that preparation.
+
+The original and current-unbuffered controls have now completed. Each produces
+four identical 256-token continuations, and the two sources match token for
+token. Both report acceptance length 3.59 and acceptance rate 0.8638. For this
+case, the source/rebase control does not reproduce the regression; the buffered
+arm is still running. This narrows the next tensor comparison to identical
+current source with and without buffered replay, without establishing which
+operation causes the difference.
+
+A separate read-only observer is prepared for that comparison. Its CPU tests
+cover independent snapshot storage, generation isolation and the common target
+forward seam, including segmented prefill that bypasses the model-runner seam.
+GPU graph validation and instrumented serving have not run yet. Diagnostic
+readbacks invalidate timings, and their output must reproduce the uninstrumented
+control before it can explain that control's acceptance behavior.
+
+All three controls complete and pass source/eight-worker audits on the fresh
+cohort. Buffered L64 reports acceptance length 2.58 and rate 0.5253 in all four
+responses. Its outputs are repeatable within the arm and first differ from both
+unbuffered controls at generated-token index 11 in every cross-request pairing.
+The original/current-unbuffered arms remain identical at 3.59 and 0.8638.
+Thus the source control does not explain this case's gap; enabling buffered
+replay does reproduce it. This is not yet a diagnosis of the first numerical
+difference, an accuracy pass, or a no-regression performance result.
+
+All completed model workers are stopped by their exact owned steps and the
+nodes are idle. The separate observer's GPU graph/storage smoke test starts
+afterward. Four CPU checks pass, including same-prefix exclusion and FP64
+logical-state interpretation; raw test reports are retained. Static inspection
+also finds differing Q-scale placement and FP-contraction settings between
+verify kernels. These are candidates for the matched-input diagnosis, not
+proven explanations of the full-model acceptance change.
+
+The observer's GPU smoke passes on both nodes, including actual runtime hook
+imports, captured replays with changing history lengths and invalid rows,
+stable snapshot pointers, and eager/graph generation isolation. Nodes are idle
+afterward. The instrumented current-source on/off pair is now running with
+unchanged real-model, graph, overlap and sampling settings; all helper hashes
+are recorded before launch. No full-model tensor comparison is available yet.
+
+The instrumented current-unbuffered arm completes after intermittent weight-
+loading I/O waits. Both continuations reproduce the uninstrumented output IDs
+and acceptance length/rate (3.59/0.8638). All eight ranks save 30 forward
+snapshots. A rank-0 self-repeat audit finds bitwise-identical observed fields
+for continuation prefill and the first three verify rounds, including all
+69 KDA layers. Other ranks' phase/count checks pass; their tensor equality has
+not yet been checked by this self-audit. The buffered arm is now running.
+
+Actual snapshots include an in-flight decode after each one-token parent
+prime. A separately versioned post-processor retains and labels those rows
+but excludes them from the continuation's AR interpretation; accepted-token
+snapshots are also checked against HTTP output positions. The running observer
+and controller remain unchanged. Cross-arm tensor diagnosis is still pending.
+
+### M32: first same-input divergence precedes history replay
+
+The instrumented on/off pair now completes on the same frozen M29R2 source,
+eight GB300 GPUs, real full-model NVFP4 TP8, EAGLE3 T4, L64/C1, CUDA graphs
+and overlap enabled. The input, draft revision and sampling remain the M31
+controls described above. Each arm's two continuations reproduce its own
+uninstrumented output IDs and acceptance: 3.59/0.8638 without buffering,
+2.58/0.5253 with buffering. All source and eight-worker audits pass. Snapshot
+readbacks invalidate timing; this is neither a performance nor an AIME result.
+
+All eight ranks are compared by absolute input position and accepted prefix,
+not forward ordinal. Continuation prefill KDA outputs match across all ranks.
+The first verify has identical candidate IDs and empty history, with checkpoint
+equal to the accepted endpoint. Ranks 1 and 4 already differ at KDA layer 0:
+one BF16 output element each, maximum absolute errors 4.65661e-10 and
+3.81470e-6 respectively. Initial recurrent/conv states, raw projections and
+BF16-rounded conv/gate producers are identical at both sites. The first local
+difference on rank 0 is layer 2, also with matching inputs and empty history.
+Thus the earliest observed discrepancy is in verify arithmetic, before any
+history reconstruction can contribute; it is not evidence of an accumulated
+history error. Later layers can receive already-divergent activations.
+
+The first four common verify windows retain identical candidate IDs and
+accepted counts (4,3,2,1), despite differing logits. In the fifth common window,
+the first target choice differs and generates the observed output-token
+divergence at index 11. This ordering does not by itself prove that fixing the
+first tiny kernel difference restores the complete trajectory. A bounded
+same-input scale-placement/FMA ablation is running on the saved first-window
+fixtures. Production source, accepted-state arithmetic and tolerances remain
+unchanged; long-history parity and a fresh uninstrumented AR test are still
+required before claiming a fix.
+
+The first-window arithmetic ablations complete on 207 layer fixtures from
+three ranks, including both ranks with the earliest layer-0 difference.
+Moving Q scaling before the output dot removes that layer-0 discrepancy.
+Explicit state-update and projection-reduction FMA reduce further differences,
+but do not eliminate them: 16 BF16 output elements still differ across the
+207 fixtures. Changing compiler contraction, value-tile width or the equivalent
+two-dimensional layout does not establish complete parity. The original
+compiled projection contracts selected local multiply-adds that the buffered
+kernel does not. One intermediate Gluon layout experiment fails compilation;
+the corrected run and the failure are both retained. None is adopted.
+
+### M33: separate verify arithmetic from accepted-history arithmetic
+
+A private diagnostic keeps M29R2's candidate history, checkpoint and metadata
+handling, copies the reconstructed pre-verify state to scratch, and replaces
+only attention output with the existing ordinary split-producer verify kernel.
+No accepted length, token, state from another run, or sampling setting is
+substituted. Redundant compute and scratch make its timings unsuitable for
+performance claims; this is not a proposed runtime implementation.
+
+For all 207 first-window fixtures, its output is bitwise equal to ordinary
+verify and its written history is bitwise equal to native M29R2. Captured
+replay, invalid rows and subsequent valid reuse pass the same exact checks.
+An additional 828 fixtures cover recorded histories of length 4,7,9,10;
+native-history bitwise parity, native observed-output reproduction, graph
+replay and invalid-row preservation all pass. The fixed L64/C1 full-model
+comparison uses a fresh current-unbuffered restart followed by the diagnostic;
+its completed results are recorded below. Production code remains unchanged
+by these diagnostics, and the overall Eagle3 no-regression gate remains open.
+
+A CPU-only logit audit also locates the first choice flip. The two leading
+unbuffered target logits are tied at 21.0 in the first differing output
+position; buffered logits become 21.25 and 20.75 and reverse their order.
+Earlier matched windows choose the same targets and accept the same counts.
+This explains where the generated trajectories separate, not whether verify
+alignment alone fixes the later acceptance-rate gap.
+
+The full-model pair completes on the same eight GB300 GPUs, full real NVFP4
+TP8 model, EAGLE3 T4, CUDA graphs and overlap, fixed L64/C1 SWE-smith
+continuation and unchanged sampling used by M31. Both arms run one warmup
+plus three repeated 256-token continuations. The frozen M29R2 unbuffered
+restart reproduces all prior output IDs and 3.59/0.8638 acceptance. The private
+M33 diagnostic produces four identical outputs at 3.70/0.8986. Its source is
+M29R2 plus an uncommitted, retained diagnostic patch; no production commit is
+made. Source, environment, input and eight-worker audits pass, and the exact
+owned model steps are stopped before any subsequent GPU test.
+
+The recovered AR does not mean identical generation: diagnostic output first
+differs from unbuffered at index 11 and from native buffered at index 19.
+Changing verify arithmetic therefore changes the later trajectory and AR in
+this case, but does not restore the original trajectory or establish that
+verify accounts for the whole gap. Continue to isolate accepted-state
+arithmetic on matching inputs; do not infer correctness from AR being higher.
+
+The diagnostic calls ordinary verify with kernel-local PDL disabled. A separate
+post-serving control checks both PDL settings against recorded ordinary outputs
+at the first verify and first differing-output window, on all eight ranks:
+1,104 layer fixtures are bitwise equal in all three comparisons. This removes
+that numerical confound for the tested windows, not a general PDL equivalence
+claim. The nodes are idle after the check.
+
+The model runs themselves complete, but the controller exits with an error in
+final aggregation because a copied assertion still expects three rather than
+the preregistered two arms. A separate post-processor retains the failure and
+rebuilds the aggregate without rerunning inference or replacing any request.
+The original cross-case environment, input and distinct-step checks are also
+verified for the two-arm result. All raw artifacts and helper/source hashes
+are retained. This is an acceptance-isolation result, not a production fix,
+performance pass or current-source AIME validation.
+
+### M34: separate accepted-history generation from reconstruction
+
+This diagnostic uses the saved first T4 verify and its observed next state,
+with all four inputs accepted, from M32's real NVFP4 TP8 model. Capacity stays
+L64 and concurrency stays one. All eight ranks and 69 KDA layers per rank
+are included. The original batched replay processes all 69 local layers
+together, preserving its layer-dependent gate launch rather than treating
+each layer as an isolated serving call.
+
+Source is the same uncommitted M29R2 snapshot on parent
+`58318c4430b88db9159d4a2d8af38e8c3c768daa`; production code is not changed.
+The diagnostic runs on the existing GB300 environment with PyTorch 2.13.0,
+CUDA 13.0 and the recorded kernel dependencies. The fixtures come from the
+same graph-enabled, overlap-enabled EAGLE3 T4 SWE-smith continuation as M31.
+This is a GPU tensor replay, not a fresh full-model, graph or performance test.
+Local artifacts retain allocation, software, source and fixture hashes.
+
+All 552 layer fixtures pass two bitwise reference checks: unmodified original
+replay matches the saved next recurrent/conv state, and the private probe
+preserves native output and K/U/decay writes. The probe only publishes the
+final register-local history state; an AST check also excludes arithmetic edits.
+
+| Same-input comparison | Maximum absolute state difference |
+| --- | ---: |
+| Original replay vs observed next state | 0 |
+| Native history-generation state vs original replay | 9.54e-7 |
+| Sequential unfused native K/U/decay vs history-generation state | 0 |
+| Native endpoint reconstruction vs history-generation state | 1.91e-6 |
+| Native endpoint reconstruction vs original replay | 1.91e-6 |
+
+Every fixed-tolerance check passes with FP32 `atol=2e-5, rtol=2e-4`; no
+nonfinite values occur. The exact sequential reconstruction rules out loss
+when these particular K/U/decay values are written and read back. Differences
+already exist when the values are generated, and the closed-form endpoint
+writer adds a separate floating-point ordering difference. The decay values
+also differ before reconstruction, so changing only state-update FMA cannot
+make the original and native paths identical.
+
+This does not establish the contribution of either error to the full AR gap.
+Next capture original replay coefficients with a bitwise endpoint-fidelity
+check, then test whether reconstruction still differs with identical original
+coefficients. No diagnostic is adopted as a production fix.
+
+### M35: original coefficients still expose reconstruction-order differences
+
+The same L64/C1, real NVFP4 TP8 first-window fixtures and frozen M29R2 source
+are used. This remains a GPU tensor diagnostic in M34's recorded environment,
+not a fresh full-model or performance measurement.
+
+The first original-replay coefficient probe fails its bitwise endpoint
+check. A 69-layer ablation finds that writing K or decay changes the compiler's
+normalization layout from one key per thread to four. No-store and U-only
+variants remain exact. Those failed observations are retained, not treated
+as original coefficients. A separate strided observation buffer preserves
+the original layout and passes endpoint bitwise equality on all eight ranks
+and 69 local layers. Its source AST check passes too; compiled artifacts and
+GPU fidelity, rather than source similarity alone, establish the reference.
+
+The resulting same-input checks separate coefficient generation from how
+the coefficients are applied:
+
+| Comparison across 552 layer fixtures | Maximum absolute difference |
+| --- | ---: |
+| New vs original K | 1.79e-7 |
+| New vs original U | 7.43e-7 |
+| New vs original decay | 8.94e-7 |
+| Original coefficients, sequential FMA vs original state | 0 |
+| Original coefficients, current endpoint writer vs original state | 2.86e-6 |
+
+All fixed FP32 tolerances pass, with no nonfinite values. Applying the original
+coefficients in the original sequential FMA order reproduces the observed
+original state bitwise. Applying those exact same coefficients with the
+current closed-form writer does not. Reconstruction ordering is therefore a
+separate source of floating-point differences even after coefficient parity
+is solved; changing only the producers cannot restore exact state here.
+
+Together with M32/M33, the evidence now distinguishes verify arithmetic,
+accepted-coefficient generation and accepted-state reconstruction. It does
+not assign a fraction of the full AR gap to each: later acceptance is measured
+on different generated trajectories. No new AR, AIME or performance result
+is claimed, and no diagnostic code is adopted. The next candidate must test
+these arithmetic changes on matching inputs before a fresh graph-enabled
+full-model AR comparison. Numerical parity does not waive the original
+Eagle3 no-regression gate or justify a separate serving/cache path.
+
+### M36: align verify without the diagnostic's extra launch and scratch
+
+The private T4 candidate shares one history reconstruction between two
+register-only recurrence loops in the same kernel: original-order BF16
+verification first, FP32 accepted-history generation second. It does not
+repeat verification, allocate a full-state scratch or add a kernel launch.
+The value tile and register layout match ordinary small-batch verify, with
+compiler FMA enabled. Candidate-history arithmetic also changes slightly;
+this is not an output-only substitution with bitwise-unchanged history.
+
+On all eight ranks and 69 local layers, the BV8/FMA candidate matches original
+verify bitwise on 552 empty-history fixtures. The controls remain informative:
+disabling FMA leaves 172 differing BF16 output elements; BV16 with FMA leaves
+22. Candidate K/U/decay comparisons stay within the unchanged FP32 tolerances.
+
+A separate check covers 2,208 fixtures with recorded history lengths 4,7,9,10.
+Every candidate output matches ordinary verify on the native reconstructed
+state bitwise. The native control reproduces observed M32 outputs and history
+before comparison. Candidate eager/graph output and history are bitwise equal;
+width-zero and invalid rows preserve their buffers, and valid reuse passes.
+The copied candidate differs only by a trailing blank line between the two
+artifact directories; both file hashes are retained.
+
+Rank-zero, first-layer hot-cache measurements use 32 launches per CUDA graph,
+nine event samples and a native-before/candidate/native-after sandwich:
+
+| History length | M29R2 before / after, us | Candidate, us |
+| --- | ---: | ---: |
+| 4 | 8.274 / 8.274 | 7.948 |
+| 7 | 8.302 / 8.346 | 8.013 |
+| 9 | 9.150 / 9.184 | 9.068 |
+| 10 | 9.202 / 9.183 | 9.162 |
+
+These recurrence-only timings range from roughly unchanged to 4% faster.
+They exclude producers, accepted commit and the full-model working set;
+they do not satisfy the Eagle3 performance gate. Source remains a private
+uncommitted candidate on the frozen M29R2 environment, GB300, PyTorch 2.13.0
+and CUDA 13.0, using the saved real NVFP4 TP8 SWE-smith continuation. No new
+AR score or AIME result is claimed.
+
+### M37: generalize the candidate before a serving comparison
+
+A separate frozen source copy extends M36's structure to the existing T1/T4,
+native BF16/FP32 and prepared-input contracts. A compile-time phase loop shares
+the recurrence body; only dual-precision multi-token input needs the second
+phase. T1 and prepared inputs retain non-contracted arithmetic. Cache ownership,
+metadata, launch count, persistent state and scratch budgets do not change.
+
+Four new GPU cases compare native BF16/FP32 output with ordinary verify at
+B1/B4 and check that no-flush verification leaves the checkpoint unchanged.
+They run alongside the existing numerical, graph, flush, multi-round and
+runtime regression suites. The generalized source must pass its own checks:
+M36's results do not automatically validate a different compiled kernel.
+No candidate is adopted or marked as a full-model correctness/performance pass.
+
+The first generalized snapshot finishes with 23 failed and 138 passed kernel
+tests; runtime tests do not start. Twenty-two failures are compile errors in
+the small-history reconstruction branch: its sliced reduction is added to
+the new plain 2D state layout without conversion. R2 explicitly converts the
+reduction to the caller's layout before addition; the shared endpoint helper
+uses the same operation, with no conversion needed when layouts already match.
+
+The remaining failure is in a newly added, overly broad bitwise assertion for
+BF16-only B1 input: one of 6,144 output elements differs by 4.77e-7. Both
+FP32-producer B1/B4 exact comparisons pass. R2 makes that distinction explicit:
+the actual dual-FP32 Eagle3 path still requires exact verify output; BF16-only
+input is compared at its established `atol=2e-5, rtol=2e-4` numerical contract.
+This revises the new BF16 assertion, not any pre-existing reference tolerance,
+and does not claim BF16-only bitwise parity. The failed result is retained.
+R2 is frozen separately and reruns the full suites before any serving test.
+
+R2 completes with 161 kernel tests, 201 runtime tests and 77 subtests passed.
+Three existing environment-specific cases are skipped: two optional FLA
+prefill comparisons and one AMD contract. Source identity and idle checks
+pass. This validates the generalized kernel's existing contracts, not full
+model acceptance. A fresh L64/C1 comparison is prepared on another eight-GB300
+cohort in the same dependency environment, with real NVFP4 TP8 weights,
+Eagle3 T4, CUDA graphs and overlap enabled. The final wrapper first rechecks
+saved real tensors against M36; the serving run then compares current
+unbuffered code with this candidate. No production adoption or new accuracy
+score is claimed.
+
+M38's final-wrapper check then passes all 2,760 saved real-tensor cases:
+eight ranks, 69 local layers and five windows with history lengths 0,4,7,9,10.
+Output matches the validated M36 candidate bitwise, history remains within
+fixed tolerances, and eager/graph/invalid-row checks pass. The native control
+still reproduces observed outputs; empty-history output also matches ordinary
+verify directly. A fresh full-model two-arm AR comparison is now running.
+
+### M38: verify-aligned candidate improves AR, but does not restore it
+
+The fresh two-arm comparison completes on the same eight GB300 GPUs: full
+real 93-layer NVFP4 TP8 Kimi-K3, real Eagle3 T4, BF16 activations, FP8 KV,
+CUDA graph sizes 1/2/3/4, padding disabled and overlap enabled. Source is
+parent `58318c4430b88db9159d4a2d8af38e8c3c768daa` plus frozen M29R2 and
+the uncommitted M37R2 candidate; complete patch hashes, dependency versions,
+GPU identities and commands are retained with the private run artifacts.
+
+The same SWE-smith continuation uses 51,936 input tokens, 51,328 prefix-hit
+tokens, 608 new prefill tokens and 256 output tokens. C1 only, temperature
+zero, seed one, ignore EOS; each arm has one warmup and three repeats, with
+cache flush/reprime before each. There is no observer, profiler, forced
+acceptance, state import or sampling change.
+
+| Implementation | Acceptance length | AR | Repeat median request latency |
+| --- | ---: | ---: | ---: |
+| Current unbuffered control | 3.59 | 86.38% | 1045.57 ms |
+| M37R2 one-launch candidate, L64 | 3.11 | 70.33% | 1229.42 ms |
+
+All four responses within each arm are identical. Control output matches
+the earlier original/current controls exactly. Candidate output first differs
+from control at generated index 11 in all 16 cross-arm comparisons. It first
+differs from the earlier native M29 output at index 34 and from the diagnostic
+M33 output at index 19. Both source/eight-worker audits pass, no preemption
+occurs, both model steps are stopped and the nodes are confirmed idle.
+
+The candidate's AR is higher than historical M29's 52.53%, but lower than
+control and M33's diagnostic 89.86%. These runs follow different generated
+trajectories: this does not assign a fraction of the AR gap to verify versus
+history arithmetic. The fresh pair still shows 17.58% higher median request
+latency. This is a narrow AR diagnostic, not independent-restart/C4 performance
+validation, and clearly not a no-regression pass. It has no AIME score.
+
+The candidate remains isolated; root production stays at M29R2. Next compare
+the actual candidate's accepted K/U/decay and endpoint with original replay
+on identical saved inputs, retaining original-probe bitwise fidelity and all
+fixed numerical tolerances. Aligning same-input verify output alone has not
+resolved acceptance, so further capacity sweeps are still deferred.
+
+### M39: accepted-state differences remain in the current candidate
+
+Using the same recorded original first T4 window, the actual M37R2 wrapper
+passes bitwise original verify output on all 552 layer/rank cases. Original
+replay reproduces the recorded next recurrent and conv states exactly, and
+the coefficient observer again preserves the original endpoint bitwise.
+The source-level observer check also passes. Rounded conv/gate values match
+the original BF16 producers in every fixture.
+
+The FP32 accepted path still differs. Candidate versus original K/U/decay
+maximum errors are 1.79e-7 / 9.61e-7 / 8.94e-7. Applying candidate coefficients
+in the original serial FMA order leaves a maximum state difference of 9.54e-7;
+the actual writer differs from that serial result by up to 1.91e-6. Original
+coefficients plus serial FMA match original state exactly, while the same
+original coefficients through the actual writer differ by up to 2.86e-6.
+All unchanged FP32 tolerances pass; no nonfinite values occur.
+
+This is a fixed-input numerical isolation, not another AR run. It confirms
+that coefficient generation and reconstruction ordering remain distinct
+differences in the candidate, without assigning their contributions to later
+acceptance. Next isolate FP32 conv accumulation, gate reduction and key
+normalization while preserving the validated verify arithmetic. Same-input
+GPU evidence must confirm source-level hypotheses. The current candidate
+is not adopted, and the no-regression and current-version accuracy gates
+remain open.
+
+### M40–M41: pin down normalization and history-update arithmetic
+
+The same 552 real first-window fixtures are used throughout, on GB300 with
+the frozen M37R2 source and unchanged original-replay oracle. These are
+private kernel ablations, not serving changes or new acceptance scores.
+Original replay still reproduces recorded state exactly; its coefficient
+observer preserves the endpoint bitwise. Every ablation leaves ordinary
+verify output unchanged.
+
+M40 varies history-only convolution order, original log-decay and one-warp
+key normalization. The latter reduces differing K elements from 673,476 to
+181,283; adding replay-order convolution reduces that to 158,440. Using the
+original gate output removes decay differences, but is diagnostic input,
+not yet a replacement gate implementation. The alternate convolution rounds
+three BF16 elements differently across all fixtures. One comparison exceeds
+the existing FP32 tolerance; that failed attempt and observation are retained.
+It cannot replace the shared verify producer unchanged. Reference tolerances
+are not relaxed.
+
+Compiler inspection then finds that original normalization rounds squared
+keys before summing, while the candidate contracts some squares and additions
+into FMA. M41 forces separately rounded squares only in history normalization.
+With replay-order convolution, K now matches original replay bitwise across
+all 3,391,488 elements. A separate history state-layout change reduces U
+differences further, but does not eliminate them: the best combination still
+differs in 1,742,231 U elements and 37,445,738 serial endpoint elements, with
+maximum errors 5.27e-7 and 9.54e-7 respectively. All existing state/coefficient
+tolerances pass; these are not bitwise matches.
+
+The remaining PTX shows a concrete update-order difference: the candidate
+can fuse old-state times decay into an already rounded correction product,
+whereas original replay fuses correction times key into the rounded decayed
+state. Next isolate that FMA choice without changing verify arithmetic.
+Source/helper hashes, five compiled M41 variants and complete rank results
+are retained with the run artifacts. M38 remains the latest full-model result:
+AR is not recovered and the performance gate is still failed. No new AIME
+result or production adoption is claimed.
+
+### M42–M43: exact accepted coefficients on identical real inputs
+
+M42 explicitly chooses `fma(U, K, rounded(S * D))` for the history update.
+This reduces differing U elements from 1,742,231 to 1,506,635, but leaves
+first-token U differences unchanged. Inspection of original replay reveals
+another fusion boundary: `fma(conv_acc, sigmoid(conv_acc), -projection)`.
+Storing the post-SiLU value first, even in FP32, loses the rounding behavior
+of that fused multiply/subtract.
+
+M43 retains the pre-SiLU value in private diagnostic scratch and uses the
+original fusion boundary when computing U. Combined with the established
+normalization, convolution, gate and state-update controls, all 552 fixtures
+now match original replay bitwise: 3,391,488 elements each for K/U/decay and
+108,527,616 elements for the serial-FMA endpoint. Every ordinary verify
+output remains bitwise unchanged. Original replay versus recorded state,
+observer fidelity, finite checks and unchanged numerical tolerances all pass.
+The GPU runs complete with clean source and pre/post-idle checks; original
+probe source tests also pass.
+
+This establishes an exact arithmetic construction for the saved first T4
+window, not full-model correctness or acceptance recovery. The gate is still
+supplied by the original replay oracle, and state comparison uses a serial
+diagnostic reconstruction instead of the current closed-form writer. M44
+next computes the same gate directly from ordinary model inputs. Actual
+producer/reconstruction integration, graph and multi-round regression, and a
+fresh L64/C1 full-model AR comparison remain required. Diagnostic extra
+launches/scratch are not a production performance result. Root code remains
+M29R2, with M38 still the latest failed AR/performance gate and no new AIME.
+
+### M44–M45: remove oracle inputs and validate paged ordered reconstruction
+
+The existing standalone gate function fails the first exact comparison even
+at the original BT4/BK32/one-warp geometry: 100 of 6,144 values differ, with
+maximum error 3.58e-7. That attempt is retained. Reusing the actual descriptor
+gate kernel for one layer, with only ordinary input pointers and a separate
+output buffer, passes all 552 fixtures. This independently generated gate
+still produces exact K/U/decay and serial endpoint. No original gate or state
+result is supplied to the candidate calculation.
+
+M45 then replaces the diagnostic flat-history reference with a reusable
+paged reconstruction helper. It loads eight history entries together but
+applies them in original token order, using a rounded decay multiply and an
+explicit correction FMA. All 552 real coefficient sets reproduce the original
+endpoint bitwise in eager and CUDA-graph execution. A further 260 synthetic
+cases cover every history length from 0 through 64, four checkpoint offsets,
+permuted pages, interleaved field strides and zero decay. Graph refreshes with
+changed lengths/offsets, including empty history, also match the independent
+one-token-at-a-time reference exactly.
+
+There is a cost to preserving this order. C1 hot-cache reconstruction-only
+measurements use 32 launches per graph and nine event samples:
+
+| History length | Existing before / after, us | Ordered, us |
+| --- | ---: | ---: |
+| 4 | 2.698 / 2.669 | 2.805 |
+| 7 | 2.816 / 2.816 | 2.915 |
+| 9 | 4.016 / 4.043 | 4.003 |
+| 10 | 4.046 / 4.034 | 4.138 |
+| 32 | 6.847 / 6.836 | 7.343 |
+| 63 | 12.008 / 12.037 | 13.151 |
+| 64 | 12.131 / 12.149 | 13.283 |
+
+These are neither recurrence nor full-model timings. Some histories regress;
+that result is retained rather than presented as a speedup. The helper has
+not yet replaced production recurrence/endpoint reconstruction. Next remove
+the candidate gate's CPU-built descriptor, integrate the proven producer
+and reconstruction arithmetic with preallocated workspace, and validate
+multi-round/graph behavior before a fresh L64/C1 AR pair. The current source
+and latest full-model AR/performance status remain unchanged.
+
+M46 removes the private CPU-built gate descriptor: a direct-pointer kernel
+retains the original descriptor kernel's reduction body, static geometry and
+unknown-alignment assumptions. Its independently computed gate, K/U/decay
+and serial endpoint are bitwise equal to original replay on all 552 fixtures;
+verify output is unchanged. Source/pre/post-idle checks and the original-probe
+source test pass. This proves a directly callable arithmetic building block,
+not that pointer alignment alone explained the earlier standalone failure.
+It has not been integrated into the serving workspace or performance-tested.
+
+The next integration should keep these boundaries explicit:
+
+1. Preserve BF16 verify producers and their validated arithmetic. History
+   needs replay-order K and the value **before** SiLU, not a stored post-SiLU
+   value. Build them with the existing conv preparation rather than borrowing
+   reference output or replaying accepted state after sampling.
+2. Compute the independent history gate from normal model inputs. Any shared
+   scratch belongs to the existing workspace, must be preallocated and
+   included in recipe accounting, and needs stable eager/graph views.
+3. Use the same ordered reconstruction in forward and endpoint materialization.
+   Keep scheduler/cache ownership, position validation, flush and commit
+   sequencing unchanged; width one remains the same parameterized path.
+4. Freeze the resulting source, validate real multi-round inputs and existing
+   graph/lifecycle tests, then repeat the same real NVFP4 TP8 L64/C1 serving
+   comparison. Only that run can establish AR recovery. The original C1/C4
+   performance and current-version AIME gates remain separate and open.
+
+### M47: integrate the arithmetic before repeating the AR test
+
+The private candidate now computes replay-order K and pre-SiLU V in the
+existing conv launch, writes a separate history gate from model inputs, and
+uses the ordered reconstruction in both forward and endpoint materialization.
+Verification keeps its original producers and arithmetic. History scratch is
+shared across layers, preallocated, and included in the memory budget: at
+batch 4, width 4 and 12 local 128-dimensional heads, it adds 288 KiB per rank.
+The separate gate launch remains a performance cost to measure.
+
+The first integration regression passed 140 kernel tests and failed 23. These
+failures exposed two integration mistakes: missing kernel registration and
+an unguarded gate-bias reference in the prepared-input specialization. Neither
+failure was a numerical assertion. Revision 2 restores the registration and
+guards that reference, without changing arithmetic or tolerance, and reruns
+the complete kernel/runtime suites. Failed source and results are retained.
+
+Revision 2 passes all 163 kernel tests. The runtime suite passes 189 tests and
+77 subtests, with three existing skips, but 12 workspace cases stop because
+the test's initial pointer snapshot includes the two new scratch buffers
+while its post-round list omits them. Revision 3 adds those buffers to the
+post-round list; kernel and runtime source are unchanged. It reruns both
+suites so that the full 32-round lifecycle checks execute past that assertion.
+
+Revision 3 passes 163 kernel tests and 201 runtime tests, plus 77 subtests,
+with three existing skips. The 32-round workspace cases now complete, including
+graph execution, reordering, flush, endpoint publication and memory accounting.
+This establishes integration regression coverage, not exact real-model state
+or acceptance parity. The next diagnostic uses the frozen revision 3 APIs on
+the saved real inputs before any new serving comparison.
+
+This remains a private, uncommitted candidate on parent `58318c44`; the working
+source and latest full-model AR results are unchanged. Real-input comparisons
+must exercise the integrated producer and recurrence code, including graph
+replay and multiple accepted windows, before another L64/C1 serving pair.
+
+### M48: integrated first-window arithmetic is exact
+
+All eight ranks and 69 KDA layers per rank pass the actual revision 3 API
+comparison on the saved first-window inputs. Independently computed history
+gate, K/U/decay, serial endpoint and the production endpoint writer match
+original replay exactly. Verify output matches the recorded original output.
+Three graph replays per layer, with poisoned output/history buffers, reproduce
+the eager result and leave the checkpoint unchanged. The original coefficient
+observer still matches the unobserved original endpoint exactly.
+
+These 552 checks use the integrated producer and recurrence, not the private
+ablation kernel. They do not run the complete model. M49 carries the next five
+real accepted windows from a single initialized checkpoint, refreshing only
+model inputs and checking state/conv against the original at every endpoint.
+
+### M49: carried state remains exact across the first five windows
+
+The five-window trace passes on all eight ranks: 2,760 layer/window checks.
+History lengths are 0, 4, 7, 9 and 10, with accepted lengths 4, 3, 2, 1 and 1.
+SSM state is initialized once; subsequent windows refresh raw model inputs,
+carry the candidate's history and commit its own convolution state. Verify
+outputs, accepted SSM endpoints and conv state match the original exactly.
+Captured forward matches eager execution, and the captured endpoint writer
+remains exact as positions and acceptance change. Endpoint inspection uses
+separate scratch and cannot reseed the next forward's checkpoint or history.
+
+This closes the initial real-input integration check. It still does not prove
+free-running AR parity: the other model layers are not executed in this
+diagnostic. M50 repeats the uninstrumented full-model L64/C1 control/candidate
+pair with the same input, sampler and CUDA-graph settings as M38.
+
+M50's first full-model attempt fails before measurement: model loading and
+graph capture finish, but the HTTP gateway exits with an address-in-use error.
+No protocol request or new AR result is produced. The exact conflicting
+listener is not recorded. A read-only check finds the host's ephemeral range
+covers the old service ports; checking availability before a long model load
+does not reserve them. The retry assigns the same explicitly checked ports
+outside that range to both arms, without changing model code, inference
+settings or OS networking. The failed run is retained separately and both
+arms will restart from scratch.
+
+### M50: L64/C1 acceptance and generated tokens recover; latency still regresses
+
+The fresh, uninstrumented pair completes successfully after the network-only
+retry. Both arms use eight GB300 GPUs, full 93-layer real NVFP4 weights, TP8,
+the same real EAGLE3 draft (width 4), CUDA graphs and overlap enabled. The
+software stack remains Python 3.12.3, PyTorch 2.13.0+cu130, CUDA 13,
+driver 580.167.08, FlashInfer 0.6.18 and Triton 3.8.10.post20260906.
+No model, sampler or precision setting changes between the arms.
+
+Source is parent `58318c4430b88db9159d4a2d8af38e8c3c768daa`, rebased on
+`eaf66b5b`, plus the previously recorded M29R2 patch. The private candidate
+adds M37R2 and frozen M47 revision 3 patch
+`7f9b5f192d7de2fb2c387fefb3ec0a511270a744f656bf8ae39095b89a941517`.
+There is no new implementation commit or production adoption. Source,
+dependencies and all eight workers pass the run audits; neither arm has a
+preemption or profiler injection.
+
+The workload is the same SWE-smith continuation, revision
+`08e109b4a59eaeebf80e4675cd125d42e7ac99a4`, instance
+`pandas-dev__pandas.95280573.pr_59144`: 51,936 input tokens, 51,328 cached,
+608 new, then 256 generated tokens at temperature 0 and seed 1, ignoring EOS.
+One warmup and three repeats per arm each flush and reprime the cache.
+
+| Fixed C1 result | Unbuffered control | Exact-history candidate |
+| --- | ---: | ---: |
+| Acceptance rate, all four requests | 0.8638 | 0.8638 |
+| Average acceptance length | 3.59 | 3.59 |
+| Median total latency, three repeats | 1045.84 ms | 1140.08 ms |
+| Median prefill latency | 156.50 ms | 157.66 ms |
+| Median decode window, total minus TTFT | 885.30 ms | 976.18 ms |
+
+All four candidate outputs equal all four control outputs token-for-token:
+all 16 cross-arm comparisons have no difference. Their common output SHA is
+`23765e5cce413fa199056442cc666933ea8e983b079c5b25cc26277b3d3dcd2c`, also matching
+the earlier controls. The prior M37R2 result was AR 0.7033 / length 3.11 and
+diverged at token 11. Together with the same-input ablations and exact carried
+state checks, this supports floating-point producer/reconstruction differences
+as the cause of the recovered AR gap in this fixed case. It does not assign a
+fraction of the gap to each individual arithmetic change.
+
+Performance remains a failure: total latency increases **9.01%**, and the
+decode window is about **10.27%** longer. These are three repeats in one fresh
+process per arm, not the broader independent-restart C1/C4 performance gate.
+No current-candidate AIME evaluation has run. AR recovery does not justify
+making buffering the default or claiming the overall goal complete.
+
+Reproduction artifacts are the frozen M47 revision 3 manifest, M48 real-input
+records, M49 carried-window records, the M50 revision 2 runbook and comparison,
+and its separately validated summary. They preserve the failed first attempt
+and the port-only retry. Next profile this exact candidate against the same
+unbuffered control, now without different token trajectories confounding
+latency. Keep exact producer/state/graph checks and this AR protocol as gates
+while reducing the remaining kernel cost; capacity/concurrency expansion and
+current-version accuracy validation remain later steps.
+
+### M51: matched-token profile started after acceptance recovery
+
+A new persistent eight-GB300 cohort has passed source, real-weight, dependency,
+NVLink-fabric and idle checks. The software, full-model NVFP4 TP8 settings,
+EAGLE3 width, CUDA graphs, overlap, input and sampler remain those of M50.
+The control is frozen M29R2 with buffering disabled; the candidate is the
+same frozen M47 revision 3 exact-history implementation. No new production
+commit or source adoption is implied.
+
+Four CPU preparation checks pass, including unchanged generation/model
+arguments, both actual M50 startup logs, all prior correctness/AR prerequisites
+and exact decode-window accounting. The sequential Nsight pair has started:
+one C1 warmup and one captured 256-token continuation per arm, with identical
+flush/reprime setup outside capture. NSYS uses software CUDA/NVTX tracing and
+graph-node attribution on all eight GPUs; no other GPU workload may overlap.
+
+The analysis will check whether both captures reproduce M50's output tokens
+and acceptance, then separate actual verify-round counts, graph spans and
+inter-graph gaps. The target is the remaining 9.01% unprofiled latency increase,
+not the earlier slowdown caused partly by different generated trajectories.
+Reports and any failures are retained, with no automatic replacement requests.
+There is no completed M51 profile, new performance result or AIME score yet.
+
+M51's unbuffered control has since completed its capture and export. All eight
+GPUs contain one prefill forward and 72 target decode graphs. Warmup/capture
+outputs match M50's common token sequence and AR 0.8638 / length 3.59. Both
+nodes are idle after cleanup; the exact-history candidate capture is now
+starting on the same cohort. Its result is still pending, so there is no paired
+M51 performance conclusion yet.
+
+### M52/M53 preparation: exact flush coverage before capacity timing
+
+Two follow-ups are prepared, not submitted. They retain frozen M47 revision 3
+and do not adopt or modify production source. Each passes two CPU protocol
+checks; those checks do not establish GPU correctness or model performance.
+
+M52 extends the saved real-input check to 12 consecutive verify windows, all
+eight rank fixtures and all 69 KDA layers, at capacities 8/16/32/64. Actual GPU
+prepare/validate/commit kernels manage positions; a shifted logical origin
+also crosses a state-page boundary. It compares graph/eager execution from
+candidate-owned state, checks exact original verify output and flush state,
+and poisons rejected history. Original state is loaded only at initialization.
+Endpoint inspection uses a separate pool that cannot repair the next forward.
+Eleven windows have an original following-state reference; the twelfth does
+not, and that missing endpoint check is recorded explicitly. This diagnostic
+uses independent saved rank inputs, not a full TP8 model or free-running AR.
+
+M53 preserves the full unprofiled real-model protocol, with two independent
+restarts each for the pre-plan original, exact-history L8 and exact-history L16.
+Each startup covers C1/C4 with three rounds, one warmup and five measured
+batches per concurrency/round. The fixed order is original/L8/L16/L16/L8/original.
+It compares every candidate restart against both originals and retains all
+timings, acceptance and output differences; C4 is counted by batch, not as
+independent requests. Neither a shorter capacity nor a speedup is assumed.
+The controller requires M51's completed, matching-token profile/package and
+M52's exact GPU checks, idle nodes and enough lease for the complete sequence.
+If the candidate source changes, these prepared runs must be revised before
+submission. Current-source AIME and the broader original goal remain open.
+
+### M51 completed: equal acceptance, but reconstruction still costs more
+
+Both profiles finish with identical output tokens, AR 0.8638 and acceptance
+length 3.59, matching M50. Every GPU records one prefill and 72 target decode
+graphs. Source, dependencies and all eight workers pass audits; both model
+processes stop and the cohort is idle. No implementation source is adopted.
+
+At fixed L64/C1, median target graph time increases 9.78–10.09% across ranks.
+Rank 0 changes from 12.422 to 13.673 ms. Its recurrent kernel median increases
+from 5.568 to 18.368 us per launch; median sums across 69 layers are 385.184
+and 1273.567 us per graph. The candidate's separate history gate adds a
+425.760 us median kernel sum. These operations can overlap: their sums are
+not an additive decomposition of wall time. Removing the old batched accepted
+replay has not offset the exact per-layer reconstruction/producer cost.
+
+The complete profiled rank-0 decode window increases 20.15%, from 948.191 to
+1139.259 ms. This includes a 93.506 ms graph outlier: seven ranks spend about
+79.1 ms in an allreduce while rank 4 has a 79.429 ms gap before submitting that
+graph. The trace supports a late-rank wait, but without CPU sampling or context
+switches it does not establish why that submission was late. All outliers
+remain in the reports and accounting. The profiler result does not replace
+M50's unprofiled +9.01% total-latency regression or establish AIME accuracy.
+
+The paired-report package contains four clearly named reports, validation,
+analysis and the report's warnings/limitations. M52's real-input flush checks
+are the next gate before M53's prepared capacity comparison. Exactness must
+survive the additional checkpoint writes; shorter capacity is not assumed to
+be faster. Current-source AIME and the complete performance goal remain open.
+
+### M52: exact state survives capacity flushes and a state-page boundary
+
+The unchanged M47 revision 3 candidate passes all 32 saved-input cases:
+capacities 8/16/32/64, eight rank fixtures and 12 continuous verify windows
+across 69 KDA layers. All 26,496 layer/window verify comparisons and 24,288
+accepted endpoint comparisons match the original exactly. Graph and eager
+execution agree from the same candidate-owned state snapshot. Conv state,
+flush checkpoints, non-flush preservation and poisoned rejected entries pass.
+
+The fixture starts at logical position 121 to cross a 128-token state page.
+Each rank performs 11/2/1/0 capacity flushes at L8/16/32/64. Original state is
+loaded only at initialization; accepted endpoint inspection writes a separate
+pool and cannot repair the following forward. Only eleven windows have an
+original following-state reference, so no twelfth endpoint comparison is claimed.
+Actual GPU metadata kernels manage positions, validated against the schedule.
+
+Environment/source are unchanged from M51; source audits and final GPU/port
+idle checks pass. This is an isolated real-input diagnostic, not a full TP8
+model or free-running acceptance measurement. No source is adopted or committed.
+It permits the prepared M53 original/L8/L16 independent-restart comparison;
+it does not establish performance, full lifecycle correctness or AIME accuracy.
+
+M53 has now started after these gates and fresh cohort-idle/source checks.
+The fixed sequence is original/L8/L16/L16/L8/original, preserving two separate
+startups per implementation/capacity and the full C1/C4 protocol. Source and
+executable helpers are frozen before submission. No M53 performance or AR
+result exists at startup; the unchanged candidate remains private and disabled
+by default. Do not overlap GPU work or modify the running experiment.
+
+### M54 preparation: isolate history-gate token ownership
+
+While M53 runs, a CPU-only preparation targets the cost identified in M51.
+The candidate's extra history-gate launch replaces the old payload-capture
+launch, leaving rank-0 graph node count unchanged at 2,667. Its duration,
+rather than simply the number of launches, deserves investigation. At C1,
+the exact gate retains an all-layer tile choice but launches only one layer:
+48 programs, each serially processing four token rows.
+
+The private experiment reuses the frozen JIT body and varies only token rows
+per program (1/2/4/8), retaining channel tile 32, one warp, pointer-alignment
+specialization and all expressions. It leaves the rows>=16 tensor-core route
+unchanged. More programs reread more weights, so no benefit is presumed;
+compiler changes can still alter arithmetic, so bitwise equality is required.
+
+The prepared protocol uses all twelve saved windows and 69 layers across
+eight rank fixtures, testing four-row windows and concatenated gate-only
+B2/B3/B4 shapes. Original descriptor-gate output is the oracle; eager and
+poisoned graph replay must agree exactly. Timing follows all rank-local
+correctness checks, traverses 69 distinct layer weights and retains nine
+samples with alternating-order production brackets. It excludes other model
+work and is not an E2E or acceptance test. Two CPU protocol checks and syntax
+checks pass; no GPU run or source adoption has occurred. The controller refuses
+submission before M53 completes and fresh idle/source/lease checks pass.
+
+### M53 first original startup complete; candidate results still pending
+
+The first frozen-original startup completes the full 75 measured requests
+and 30 batches, plus all warmups. Source/worker ownership, native libraries,
+software and launch settings pass validation; there are no preemptions or
+profiler injections. Its measured C1 engine total-latency median is 1045.39 ms,
+AR 0.8638 and acceptance length 3.59. All fifteen C1 outputs match the M50
+control token SHA. C4 engine total-latency median is 1580.175 ms, median
+AR 0.8898 and acceptance length 3.67; two output sequences occur thirty times
+each. C4 has fifteen measured batches, not sixty independent trials.
+
+Whole-batch client medians are 1060.665 ms for C1 and 1620.588 ms for C4.
+The three C4 round medians are 1626.221 / 1616.287 / 1618.972 ms. These values
+are retained with every sample and prefill grouping. The owned original
+server is stopped only after complete validation; the controller will proceed
+to the L8 candidate after both-node idle and port cleanup. There is no paired
+M53 speedup or AR conclusion yet, and the second original startup is still
+required. Experiment executable hashes remain frozen and verified.
+
+### M53 L8 first startup: C1 stays exact; C4 acceptance still differs
+
+L8 revision 1 completes all 75 measured requests without preemption. All
+fifteen C1 batches retain the original tokens, AR 0.8638 and acceptance length
+3.59. Engine total-latency median is 1108.08 ms versus 1045.39 ms for the first
+original startup; client whole-batch median increases 5.81%.
+
+C4 does not retain that equality. Every one of its fifteen measured batch
+output multisets differs from the original. Thirty requests have AR 0.716 /
+length 3.15 and thirty have 0.881 / length 3.64; the original has thirty each
+at 0.881 / 3.64 and 0.8986 / 3.70. Matching acceptance statistics do not imply
+matching tokens: neither candidate C4 sequence matches either original one.
+The C4 median AR is 0.7985 versus 0.8898. Engine total-latency median is
+1732.22 versus 1580.175 ms; client whole-batch median is 1841.186 versus
+1620.588 ms (+13.61%). These are one-startup comparisons, not the completed
+six-startup result or an isolated kernel speed measurement.
+
+Both startup logs explicitly show `enable_mixed_batch=False`, so the mixed
+prefill/decode path is not a supported explanation for this run. The next AR
+diagnostic is fixed at L8/C4: compare same-source buffering-off control, then
+the same inputs/state through verify, history producers and accepted replay.
+The pre-plan original differs in upstream source as well as buffering; a
+same-source control is needed before assigning the C4 regression to replay.
+Saved C1 checks do not cover real B4 arithmetic or request-state association.
+No implementation is changed or adopted on the strength of the C1 result.
+
+The fixed M53 sequence continues unchanged; L16 revision 1 starts after L8
+validation, owned-server shutdown and both-node idle checks. No diagnostic GPU
+work overlaps it. M54 remains prepared only. A separate read-only check of
+M51/current worker startup logs finds all eight workers pinned to 72 NUMA-local
+CPUs; this rules out the simple one-CPU-per-worker explanation for M51's late
+rank, but does not identify the host-delay cause. No CPU sampling was captured.
+
+### M53 interrupted by prefix sharing; M55 isolates B4 arithmetic
+
+The L16 first startup stops at its second C4 warmup: three requests reuse
+51840 cached tokens instead of the protocol's 51328, leaving only 96 new
+tokens each rather than 608. The server logs show a one-request 608-token
+prefill followed by a three-request 288-token prefill. The cache-hit assertion
+correctly rejects this changed workload; the model has not crashed. All
+partial results remain, including the changed-prefix requests. They are not
+replacement performance samples or a completed six-startup comparison.
+The controller is terminal and the audited remaining server is stopped;
+both nodes and strict ports pass idle checks. The other startups are not run.
+
+M55 now fixes capacity 8 and batch 4 to isolate arithmetic. It constructs
+three independent B4 batches from twelve saved real C1 windows per rank and
+uses all 69 layers/eight rank fixtures. Original B4 verify and accepted replay
+are recomputed from those same inputs/state; C1 outputs are not a B4 oracle.
+It compares BF16 conv/gate producers, verify output, history gate, accepted
+conv/state and the following capacity flush. Candidate-owned history feeds
+the next forward; inspection state cannot repair it. Rejected entries are
+poisoned, and two graph replays check the first window. The second window is
+eager, not a claim of full runtime or graph-lifecycle coverage.
+
+A diagnostic substitution of original gate, then original gate and conv,
+separates producer from recurrent arithmetic. In particular, native verify
+uses a BF16 GEMM result while buffered replay uses an FP32 result converted
+to BF16 inside the kernel; C1 equality alone does not establish B4 equality.
+This is a hypothesis, not a confirmed cause. CPU packing/report tests pass;
+the fixed GPU diagnostic is submitted after idle/source gates, without source
+changes. It records every numerical difference instead of stopping at the
+first layer. No full-model AR or performance conclusion follows from it.
+M54 gate timing is deferred while this AR investigation takes priority.
+
+### M55 completed: state replay is exact in these B4 cases, verify is not
+
+All 1656 layer/group cases complete with finite results on the unchanged
+candidate. Conv and verify gate, including the BF16 conversion, match the
+original exactly. The history gate, accepted conv/state for both [1,2,3,4]
+and [4,3,2,1], and the following flush state also match exactly. The endpoint
+inspection pool never feeds the next forward, and poisoned rejected entries
+do not affect reconstruction. Two first-window graph replays match eager.
+
+Nevertheless, 2448 of 40,697,856 first-window verify output elements differ
+across 1273 of the 1656 cases; maximum absolute difference is 3.05e-5.
+Substituting original gate, then both original gate and conv, leaves exactly
+the same difference counts. Next-window verify also differs despite an exact
+reconstructed starting state. This isolates a B4 verify-recurrence numerical
+discrepancy in these inputs, rather than a producer or accepted-state mismatch.
+It does not yet prove that this discrepancy explains the full-model AR gap.
+The prior BF16-versus-FP32 gate-GEMM hypothesis is not supported by this set.
+
+Source/helper checks and final both-node idle checks pass. The controller
+records successful diagnostic execution but numerical inequality, not a
+correctness pass. No model output, AR, performance or AIME result is inferred.
+M56 now observes the compiled original/candidate B4 kernels without changing
+launch arguments or arithmetic, requiring the same first-group results as
+M55. The next candidate must be justified by this compiler evidence and then
+checked in the same full-model source-off/on setting.
+
+### M56/M57: one-warp normalization ownership is a concrete candidate
+
+The compiler observer's first attempt saves both kernels but fails while
+recording a launch argument: the original passes BV by keyword, the candidate
+positionally. The failed run remains. A separately recorded revision fixes
+only argument recording, passes its CPU test for both call forms, and completes
+the observer's numerical-preservation and final idle checks.
+
+Both B4 kernels use BV8, one warp and three stages. Original verify loads
+normalization vectors with four contiguous elements per thread and allows
+reordering for reduction; buffered verify fixes the vector ownership to one
+element per thread. That is a floating-point reduction-order difference, even
+with identical BF16 inputs and starting state. It supplies a specific candidate
+explanation, not yet proof of the full-model AR cause.
+
+M57 changes only that vector layout expression for single-warp verify.
+Four-warp verify, T1 and accepted-history normalization are unchanged. An AST
+check proves the kernel body equals the frozen candidate after reverting the
+one expression. The process-local private candidate now runs the unchanged
+M55 L8/B4 protocol across all ranks/layers, with source/environment records.
+No production source is adopted, no additional state or launch is introduced,
+and no acceptance rule or tolerance changes. C1/shared regressions and a
+same-source full-model off/on comparison remain required after this gate.
+
+M57 subsequently completes all 1656 cases. The one-expression layout change
+reduces first-window differing elements from 2448 to 877, with maximum absolute
+difference falling from 3.05e-5 to 7.63e-6. The two next-window checks still have
+870 and 834 differing elements (maximum 7.63e-6). Producers, accepted/flush
+states and first-window graph/eager comparisons remain exact and finite.
+The candidate therefore does not pass the bitwise verify gate and is not
+adopted. Both nodes are idle after the run. The next investigation stays at
+L8/B4 and compares the remaining normalization/reduction and FMA instruction
+order; reducing the error count is not proof that model AR has recovered.
+
+### M58/M59: separate compiler contraction from state replay
+
+M58 observes the unchanged M57 candidate and original on the same first B4
+group. Results exactly match the prior run. Both compiled kernels retain
+BV8, one warp and three stages, and the normalization now uses the same
+local-pair/warp-butterfly sequence. The remaining recurrence differs in
+floating-point contraction. In the frozen original, projection contracts
+local products for value rows 0,1,2,7 within each eight-value tile, but not
+3–6. Its update contracts the decay product for row 7 and the correction
+product for the others. Only row 7 contracts the output dot. The candidate
+does not reproduce those compiler-dependent distinctions.
+
+M59 explicitly reproduces these three operations in a private diagnostic,
+retaining the same history, producer, launch and metadata paths. These row
+masks are evidence about this compiler result, not a portable production
+contract. Even a bitwise pass would still require a full-model same-source
+off/on comparison to explain AR, and a maintainable implementation before
+adoption. No performance benefit is inferred from this diagnostic.
+
+The first attempt fails during compilation because this Gluon version lacks
+`broadcast_to`; no numerical result is produced. Its artifacts remain.
+After both nodes pass idle checks, a separately registered revision uses the
+inline-assembly operation's documented implicit broadcasting. The CPU AST
+check confirms that only the declared verify substitutions differ from M57.
+Revision 2 completes the unchanged M55 L8/B4 gate: all 1656 cases, including
+40,697,856 first-window verify elements, are bitwise exact. Original-producer
+substitutions, both accepted prefixes, next-window verify/flush, initial-state
+preservation and graph/eager checks all have zero differing/nonfinite elements.
+Source/helper checks and final both-node idle checks pass. This establishes
+the arithmetic cause of the isolated verify discrepancy, not full-model AR.
+
+The same private override now runs M60: the L8 subset of the existing carried
+C1 trace across all eight rank fixtures, then the complete kernel/runtime
+regressions. The C1 checks and 163 kernel tests pass. Runtime completes with
+199 passed, 77 passed subtests, three existing skips and two argument-parsing
+failures. Those tests inherit the two-node fixture launch and automatically
+select a rendezvous port inside the host's ephemeral range; the safety check
+rejects it before SSM executes. The first run remains failed. A separate
+revision reproduces both failures on unmodified source, then restores M47's
+one-node launch for the full runtime suite. No assertions, port checks or
+host settings are changed, and no test is skipped to obtain a pass.
+The unmodified control reproduces precisely those two launcher failures.
+The separately recorded single-node runtime rerun then passes 201 tests and
+77 subtests, with the same three skips. No source/test patch was needed, and
+both nodes are idle afterward. Combined with the retained kernel/C1 results,
+the diagnostic's regression prerequisite is satisfied; the first failed run
+remains part of the record.
+
+M61 registers a comparison of full-model processes
+using identical M47R3 base source with buffering off, unchanged L8 on and the
+arithmetic diagnostic L8 on. Fixed C4, real NVFP4 TP8 and CUDA graph remain.
+One warmup plus three repeated batches per arm record all token and AR
+multisets. Batched API delivery replaces competing HTTP calls only in this
+new AR diagnostic; actual prefill grouping must still be reviewed. It is not
+a replacement for M53 samples or a performance/AIME gate.
+
+Model initialization succeeds, but the first C4 request receives HTTP 400:
+the gRPC gateway does not support batched input IDs. No C4 sample is produced;
+the failed attempt and its frozen helpers are retained. Revision 2 restores
+the prior runbook's four concurrent scalar-input requests with a start barrier.
+It changes neither the gateway nor the model, workload or sampling settings.
+After fresh source and process-ownership checks, it reuses the loaded control
+from cache flush and parent prime; none of the failed request is continued.
+The new control's four batches have identical output/AR multisets: two requests
+at AR 0.881 and length 3.64, two at AR 0.8986 and length 3.70. Its exact owned
+server is stopped and both nodes pass idle checks before unchanged L8 starts.
+The retained control has one extra parent-only request; this recovery is an AR
+diagnostic, not a fresh-process performance comparison. No production code is
+adopted, and no commit or push is made in this stage.
+
+### M61 completed: L8/C4 AR recovery isolates verify arithmetic
+
+Revision 2 completes all three arms, including source/environment and eight-
+worker audits, unchanged helper hashes, and final both-node idle checks.
+Each arm runs one warmup and three repetitions, four concurrent requests per
+batch, 256 output tokens per request. The same-source unbuffered control,
+unchanged buffered L8 and arithmetic-aligned buffered L8 use the same real
+93-layer NVFP4 model, TP8, EAGLE3 T4, CUDA graphs and overlap.
+
+All twelve batches have identical prefill grouping (1+1+2), 51936 input,
+51328 cached and 608 new tokens per request. Every batch in an arm has the
+same joint output-token/AR/acceptance-length multiset. Each table entry below
+describes two requests per batch, not a pooled or weighted acceptance rate.
+
+| Same-source arm | AR values | Acceptance lengths | Output tokens versus control |
+| --- | --- | --- | --- |
+| Buffering off | 0.8810 / 0.8986 | 3.64 / 3.70 | Reference |
+| Unchanged L8 | 0.7160 / 0.8810 | 3.15 / 3.64 | Both output sequences differ |
+| Arithmetic-aligned L8 diagnostic | 0.8810 / 0.8986 | 3.64 / 3.70 | Exact multiset match, all four batches |
+
+All sixteen control/corrected cross-batch comparisons match tokens and
+acceptance jointly. None of the sixteen control/unchanged comparisons match;
+all have the same prefill grouping. The override is confirmed on every GPU
+worker at the actual B4/one-warp launch geometry. No sampler, acceptance rule,
+history representation, flush policy, persistent state or launch geometry is
+changed between the two buffered arms.
+
+Together with M55/M59, this isolates the observed gap to verify's normalization
+reduction and projection/update/output contraction, not an accepted-state
+mismatch in the checked inputs. Mathematical equivalence alone did not preserve
+floating-point execution. Matching prefill groups is not a record of every
+decode scheduling decision; the conclusion remains scoped to this workload,
+one process per arm and the recorded environment.
+
+Next, replace the compiler-specific diagnostic with maintainable arithmetic
+that preserves the checked contract, then repeat same-input, C1/C4 and shared
+regressions before measuring performance. The root implementation is unchanged;
+this is an AR-cause milestone, not an adopted fix, a no-regression performance
+pass or current-version AIME validation.
+
+### M62–M64: three bounded alternatives do not fix verify arithmetic
+
+These experiments retain the M47R3 source snapshot: parent commit
+`58318c4430b88db9159d4a2d8af38e8c3c768daa`, uncommitted patch SHA256
+`7f9b5f192d7de2fb2c387fefb3ec0a511270a744f656bf8ae39095b89a941517`.
+They use the same GB300 environment, Python 3.12.3, PyTorch 2.13.0+cu130 and
+Triton 3.8.10 as the preceding diagnostics. Each completes the unchanged M55
+L8/B4/T4 protocol: eight saved rank fixtures, three groups per rank and 69
+layers, totaling 1656 cases. Original B4 verify and accepted replay are
+recomputed from identical inputs; these are fixture tests, not new TP8 model
+inference, AR measurements or performance samples.
+
+| Candidate | Change from M57 | First verify differing elements | Accepted/flush state |
+| --- | --- | ---: | --- |
+| M62 | Let Triton infer layouts instead of explicit Gluon layouts | 4066 | Also differs; rejected |
+| M63 | Use configured T for register-only verify; mask stores to live width | 877 | Exact |
+| M64 | Load BF16 verification buffers; keep independent FP32 history inputs | 877 | Exact |
+
+M62 mechanically preserves the arithmetic and control flow while removing
+explicit layouts. It changes history ownership too, so the accepted-state
+regression rules it out. M63 and M64 have exactly the same per-layer metric
+dictionaries as M57 across all eight ranks, including the remaining 870/834
+next-verify differences. Their maximum verify error is 7.63e-6. Producers,
+history gates, accepted/flush state, conv state, initial-state preservation
+and first-window graph/eager comparisons remain exact. All three runs are
+finite, complete source/helper checks and finish with both nodes idle.
+
+Each candidate has a CPU scope test. M62 checks the complete mechanical
+transformation; M63 checks the two declared kernel changes and live-store
+coverage; M64 checks its unchanged JIT and four-pointer/stride adapter. M64
+allocates BF16 copies below the frozen wrapper's dtype check solely to isolate
+storage precision. This is neither a supported API nor a performance design.
+No candidate reaches real-model AR or timing, and the working implementation
+remains unchanged. Frozen helpers, source hashes and failed numerical reports
+are retained in each private runbook; no failed sample is replaced.
+
+Read-only inspection narrows the next question. Gluon delegates sum/reduce to
+the same Triton definitions, and both kernels enable floating-point fusion.
+The observed allow_reorder attribute is on a normalization reshape, not a
+different reduction default. The saved LLVM programs pack verify state into
+different vector groups, consistent with the subsequent value-row-dependent
+contraction. This identifies another compiler difference, not yet its causal
+pass. A noinline helper taking register-state tensors is unsupported by this
+compiler. Neither blanket frontend replacement nor a loop-bound or input-
+dtype change provides a maintainable exact replacement for M59's diagnostic.
+The original/control math and the numerical/AR gates remain unchanged.
+
+### M65: offline compilation isolates the role of SLP vectorization
+
+Using the saved M58 TTGIR and the same compiler, SM103 target and launch
+options, M65 recompiles both kernels without loading a model or launching a
+GPU. The first attempt stops on a candidate LLVM-file hash mismatch. Inspection
+finds only debug metadata renumbering: its PTX is byte-identical to M58, as
+are the original kernel's LLVM and PTX. A separately recorded revision requires
+exact LLVM instruction-body equality without debug attachments and exact PTX
+bytes. Both controls pass; the first failure remains recorded.
+
+The revision then separately disables three LLVM optimization options, for
+eight compilations including controls. Disabling extracted-add vectorization
+does not change either PTX. Disabling packed-fop scalarization leaves the
+original PTX unchanged and changes candidate register unpacking without
+changing arithmetic opcode counts. Disabling SLP changes both kernels: the
+original no longer has value-row-dependent projection/output FMA contraction,
+and its state correction consistently uses scalar FMA. Thus the mixed
+contraction observed in M58 depends on SLP in this compilation.
+
+This is not a numerical or performance pass. In particular, turning SLP off
+also changes the original arithmetic; applying it to both paths cannot establish
+equality to the frozen reference. No installed compiler, runtime code, state
+protocol or launch setting is changed. The offline script's recorded per-line
+counters cover scalar FP32 instructions only; a separate count includes packed
+FP32x2 instructions, and neither count is a timing measurement. CPU checks
+cover option isolation/restoration, control reproduction and rejection of a
+changed arithmetic instruction.
+
+The next bounded hypothesis is an identity register boundary between history
+reconstruction and verify. It would add no state buffer or launch, but must
+first show the desired emitted arithmetic, then pass the existing numerical
+and model-AR checks. No such candidate or GPU result is claimed here.
+
+### M66: register boundary does not recover the frozen verify arithmetic
+
+M66 tests that hypothesis by adding a pure four-register bit-copy operation
+before verify's zero-initialized accumulator in the frozen M58 TTGIR. Flush
+and history still consume the original reconstructed state. The CPU scope
+test proves that removing the boundary exactly restores the entire input IR;
+an initial materialization error is caught and corrected before registration.
+No floating-point operation, memory access, control flow or launch is added.
+
+Offline compilation first reproduces both unchanged controls' PTX exactly
+and their LLVM instruction bodies exactly. The boundary then compiles with
+the same shared-memory and scratch requirements. It does not recover the
+desired arithmetic: the output-dot reduction still has eight packed adds and
+no packed FMA, versus seven packed adds and one packed FMA in the original.
+Inspection confirms that its separate product/add sequence remains. These
+static counts include FP32x2; they are not numerical or timing measurements.
+The candidate is rejected before GPU testing, and no runtime source is adopted.
+
+This closes the bounded register-boundary experiment. The next proposal needs
+a user decision: define one explicit verify arithmetic contract shared by
+unbuffered and buffered execution, instead of reproducing the frozen compiler's
+value-row-specific choices. If approved, keep three distinct comparison arms:
+the untouched frozen original, the shared-contract unbuffered path, and the
+shared-contract buffered path. The latter pair isolates replay; the frozen
+original remains the quality, AR and performance reference. Changing the
+contract could change generated tokens and must not be presented as recovery
+of the frozen original's bitwise output. The proposal is not implemented and
+the existing gates are not silently relaxed. Performance and current AIME
+validation remain open.
+
+### M67: isolate the arithmetic-aligned candidate's KDA cost
+
+The next user-directed experiment measures the existing explicit-arithmetic
+candidate, without changing the original numerical contract or running an E2E
+model. Compare unchanged original, unaligned buffered, and aligned buffered
+using the same saved real-model inputs, fixed acceptance, and CUDA graphs.
+
+The fixed scope is L8/B4/T4, 69 KDA layers, 12 heads per TP8 rank and head
+dimension 128. A two-window cycle includes producers, verify/history and
+accepted commit, with a capacity flush in the second window. Separate graphs
+measure recurrence with and without accepted history. Immutable seed pages
+make repeated graphs self-contained, without timed state resets. Producers
+are serialized and fixture pools are dense, so these measurements will not
+represent runtime stream overlap, full-model cache pressure or E2E latency.
+
+Before timing, repeat the existing eight-rank exactness gate. Each benchmark
+arm also checks eager/graph consistency and repeated-cycle state correctness.
+The aligned arm remains bitwise equal to the unchanged original: all 1,656
+layer/cases in the existing eight-rank gate pass, as do the benchmark's output,
+accepted-state, conv-state, graph/eager and repeated-cycle checks. Two CPU
+protocol checks pass. The frozen base is commit
+`58318c4430b88db9159d4a2d8af38e8c3c768daa` plus the recorded M47R3 patch;
+the aligned JIT is unchanged M59R2. The environment is GB300, Torch 2.13.0,
+CUDA 13.0 and tokenspeed-triton 3.8.10.post20260906.
+
+On two separate GPUs, nine repeated candidate samples per scope show aligned
+recurrence taking 10.85–10.88% less time without history and 9.83–9.99% less
+with history/flush than unaligned buffered. KDA-core time, including producers
+and accepted commit, is 1.438–1.448 ms per 69-layer window for aligned versus
+1.528–1.537 ms unaligned and 1.052–1.056 ms original. These are the two GPUs'
+medians, averaging one no-history and one flush window, not a steady-state
+L8 distribution. Original brackets remain stable within 0.04% median drift.
+
+Alignment therefore reduces this local buffered cost by 5.82–5.92%, but the
+aligned path is still 36.67–37.10% slower than original in this workload. This
+does not pass the plan's no-regression goal, nor establish E2E latency, AR or
+AIME accuracy. All raw samples and reproduction details are retained in the
+private M67 report. No production kernel change or candidate adoption is
+included; no benchmark or model service remains running.
