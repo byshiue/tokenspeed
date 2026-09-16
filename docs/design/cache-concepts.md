@@ -392,8 +392,15 @@ seeded at an exact endpoint. The stamps are per-layer cache fields so pipeline
 narrowing, layer fences and page zeroing have the same owner as K/U/decay.
 For the full Kimi-K3 layout they occupy the spare 24th plane. Putting them beside
 K/U/decay would reduce TP8 history packing from six blocks per parent to five.
-The planner preserves exact MLA page strides; TP8/16 parent size is unchanged,
-while smaller TP widths round the parent to whole MLA and history blocks.
+Truncated models without a spare MLA/draft plane put each stamp beside its own
+layer's K/U/decay. Their packing uses the smallest whole-MLA plane width whose
+element-aligned strides fit the padding budget, rather than taking the potentially
+huge LCM of history-plus-stamp payload bytes. No new plane is introduced.
+For example, a 20-layer TP8 FP8-MLA model without draft layers keeps five planes,
+with MLA/history packing of 13/6 blocks per LCM parent instead of failing startup.
+The planner preserves exact MLA page strides. For the full model, TP8/16 parent
+size is unchanged, while smaller TP widths round the parent to whole MLA and
+history blocks.
 Pool accessors expose zero-copy typed views and allocate no private history.
 Replay-dependent groups are not attention KV and do not get paged-attention
 router leaves.

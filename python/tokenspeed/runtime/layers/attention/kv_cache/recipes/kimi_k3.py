@@ -121,6 +121,12 @@ class KimiK3Recipe(CacheRecipe):
         if replay is None:
             return groups
         heads, value_dim, key_dim = self._kda_shapes[1]
+        mla_planes = tuple(
+            field.plane_id
+            for spec, fields in groups
+            if spec.group_id == FULL_ATTENTION
+            for field in fields
+        )
         declarations = []
         for spec, fields in groups:
             if spec.family != "state":
@@ -135,10 +141,13 @@ class KimiK3Recipe(CacheRecipe):
             recurrent_fields = [
                 field for field in fields if field.field_id.endswith(".recurrent_state")
             ]
-            # K3 has one more MLA plane than the 23 layers in each state group.
-            # Put the tiny position stamps in that spare plane: adding them to
-            # a full history plane would reduce TP8 packing from six to five.
-            stamp_plane = f"slot.{len(recurrent_fields)}"
+            # Full K3 has a spare MLA plane; truncated models may not. Without
+            # one, keep each stamp beside its layer's history and let packing
+            # account for the extra bytes without adding a physical plane.
+            state_planes = {field.plane_id for field in recurrent_fields}
+            stamp_plane = next(
+                (plane for plane in mla_planes if plane not in state_planes), None
+            )
             history_fields = []
             for field in recurrent_fields:
                 layer_id = cache_field_layer_id(field.field_id)
@@ -161,7 +170,7 @@ class KimiK3Recipe(CacheRecipe):
                 history_fields.append(
                     CacheFieldSpec(
                         f"layer.{layer_id}.replay_checkpoint",
-                        stamp_plane,
+                        field.plane_id if stamp_plane is None else stamp_plane,
                         (replay.block_tokens,),
                         "int64",
                         exact_page_stride=False,
@@ -367,6 +376,7 @@ class KimiK3Recipe(CacheRecipe):
         # while larger tp shrinks the state and the parent with it.
         plane_quantum = mla_page_bytes
         group_plane_bytes = {}
+        shared_stamps = False
         for spec, fields in groups:
             bytes_by_plane: dict[str, int] = {}
             for field in fields:
@@ -375,13 +385,68 @@ class KimiK3Recipe(CacheRecipe):
                 )
             group_plane_bytes[spec.group_id] = max(bytes_by_plane.values())
             if spec.replay_checkpoint_group is not None:
-                # A history block must divide the plane without rounding its
-                # byte width: MLA indexes pages with an implicit exact stride.
-                # TP8/16 already divide; smaller TP needs a slightly wider
-                # parent, still made of whole, unchanged MLA pages.
+                history_planes = {
+                    field.plane_id
+                    for field in fields
+                    if not field.field_id.endswith(".replay_checkpoint")
+                }
+                shared_stamps |= any(
+                    field.plane_id in history_planes
+                    for field in fields
+                    if field.field_id.endswith(".replay_checkpoint")
+                )
+                # With separate stamps, whole history payloads tile the plane
+                # without padding. TP8/16 already divide; smaller TP needs a
+                # wider parent made of whole, unchanged MLA pages. Shared
+                # stamps use the padded-stride search below instead.
                 plane_quantum = math.lcm(
                     plane_quantum, group_plane_bytes[spec.group_id]
                 )
+        if shared_stamps:
+            # Including a tiny stamp in the payload LCM would make the parent
+            # enormous. Flexible history fields can instead use a padded stride.
+            # Find the smallest whole-MLA plane that keeps every group's strides
+            # element-aligned and stays within the ordinary padding budget.
+            plane_count = len(
+                {field.plane_id for _, fields in groups for field in fields}
+            )
+            payload_bytes = {
+                spec.group_id: sum(field.payload_bytes for field in fields)
+                for spec, fields in groups
+            }
+            element_alignment = {
+                spec.group_id: math.lcm(*(field.element_size for field in fields))
+                for spec, fields in groups
+            }
+            # Unused planes are unavoidable padding at any width. Reject an
+            # impossible budget before searching for an aligned packing.
+            for group_id, size in group_plane_bytes.items():
+                if plane_count * size > payload_bytes[group_id] * (
+                    1 + self.max_padding_fraction
+                ):
+                    raise ValueError(
+                        f"cache group {group_id!r}: unused planes exceed the padding budget"
+                    )
+            plane_bytes = (
+                -(-max(group_plane_bytes.values()) // mla_page_bytes) * mla_page_bytes
+            )
+            while True:
+                packing = {FULL_ATTENTION: plane_bytes // mla_page_bytes}
+                for spec, _ in groups:
+                    group_id = spec.group_id
+                    if group_id == FULL_ATTENTION:
+                        continue
+                    count = plane_bytes // group_plane_bytes[group_id]
+                    while plane_bytes % (count * element_alignment[group_id]):
+                        count -= 1
+                    packing[group_id] = count
+                if all(
+                    plane_count * plane_bytes
+                    <= packing[group_id] * size * (1 + self.max_padding_fraction)
+                    for group_id, size in payload_bytes.items()
+                ):
+                    return packing
+                plane_bytes += mla_page_bytes
         plane_bytes = -(-linear_plane_bytes // plane_quantum) * plane_quantum
         packing = {FULL_ATTENTION: plane_bytes // mla_page_bytes}
         for spec, _ in groups:

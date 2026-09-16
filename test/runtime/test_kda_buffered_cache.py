@@ -173,6 +173,62 @@ def test_replay_geometry_and_capacity_budget(tp, mla_packing):
             assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES
 
 
+@pytest.mark.parametrize("tp", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_replay_stamps_fit_truncated_models(tp, dtype):
+    from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
+
+    for layers in (4, 20):
+        config = KimiLinearConfig(num_hidden_layers=layers)
+        config.linear_attn_config = {
+            **config.linear_attn_config,
+            "kda_layers": [
+                layer
+                for layer in config.linear_attn_config["kda_layers"]
+                if layer <= layers
+            ],
+        }
+        for draft_layers, width in ((0, 1), (1, 4)):
+            recipe = _recipe(
+                8,
+                text_config=config,
+                tp_size=tp,
+                draft_layers=draft_layers,
+                decode_input_tokens=width,
+                kv_cache_dtype=dtype,
+            )
+            layout = _layout(recipe)
+            plan = layout.bind(2)
+            assert len(plan.planes) == layers // 4 + draft_layers
+            for spec, fields in recipe.groups():
+                if spec.replay_checkpoint_group is None:
+                    continue
+                for field in fields:
+                    placed = plan.field(field.field_id)
+                    assert placed.page_stride_bytes % field.element_size == 0
+                    assert (
+                        placed.field_offset_bytes + field.payload_bytes
+                        <= placed.page_stride_bytes
+                    )
+                    if field.field_id.endswith(".replay_checkpoint"):
+                        key = plan.field(
+                            field.field_id.replace("replay_checkpoint", "replay_key")
+                        )
+                        if draft_layers:
+                            assert placed.plane_id == f"slot.{layers // 4}"
+                            assert placed.plane_id != key.plane_id
+                        else:
+                            assert placed.plane_id == key.plane_id
+            for field in plan.fields:
+                if field.field_id.endswith(".latent_kv"):
+                    assert field.page_stride_bytes == 128 * 576 * field.element_size
+            # Do not trade a missing plane for the huge LCM of history+stamp
+            # bytes. TP8 needs just one additional MLA page per existing plane.
+            if tp == 8 and dtype == torch.float8_e4m3fn and not draft_layers:
+                assert dict(layout.group_packing)["full_attention"] == 13
+                assert plan.lcm_block_bytes == layers // 4 * 13 * 128 * 576
+
+
 def test_planning_input_and_serving_factory_are_explicit():
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
         prepare_cache_setup,
