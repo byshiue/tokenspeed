@@ -106,17 +106,20 @@ An aligned endpoint is itself the checkpoint; an extent crossing no boundary
 needs only its final output. Only materialized aligned checkpoints are cached;
 an off-boundary endpoint is never keyed as a complete prefix.
 
-`CacheProgress::materialized_state_boundary_tokens` records the last exact aligned
-boundary produced by local prefill or accepted decode. Publication of the preceding
-forward uses the old record before the next prefill advances it. Decode admission
-retains an aligned accepted endpoint until the conservative publication frontier
-catches up; a later off-boundary endpoint must not erase that evidence. Merely
-crossing a boundary does not advance the record. The coordinator checks this exact
-boundary on admission, finish and retraction; an aligned accepted endpoint remains
-publishable without an internal snapshot.
-`Request::MaterializedStateBoundaryTokens()` resolves that endpoint from
-accepted feedback, not the conservative admission frontier. Capacity and
-retention continue to use their existing conservative token progress.
+`CacheProgress::materialized_state_boundaries` holds the exact aligned checkpoints
+waiting for publication. Local prefill admission records its checkpoint; accepted
+feedback records each aligned endpoint (`TokenSize() - 1`). Recording on feedback
+also preserves endpoints when multiple results land before the next admission.
+Merely crossing a boundary adds nothing to this list.
+
+The list can contain more than one checkpoint. For example, with prefix granularity
+4 and verify width 4, accepting endpoints 4 and then 8 leaves both pending while
+the conservative hash frontier catches up. Replacing 4 with 8 would lose the
+earlier checkpoint. Admission, finish and retraction publish every recorded
+boundary covered by the new hashes, even if the frontier jumps past it. Successful
+admission removes those entries; failed admission leaves them available for retry.
+The list tracks the publication lag, not the request's entire history. Capacity
+and retention continue to use their existing conservative token progress.
 
 One forward means one model dispatch, not one kernel launch. The state backend
 handles checkpoint outputs within it: the example's recurrent scan evaluates
@@ -244,16 +247,18 @@ Every page-holding state carries one bundle, and a transition moves it whole
 to the successor state — so the count, like the pages, cannot be dropped on
 the way from one state to the next.
 
-The bundle follows one rule: **resources and progress land when an admission
-succeeds; a state transition only moves them, never modifies them.** The
+The bundle follows one rule: **admission-owned resources and publication progress
+land only when admission succeeds; a scheduling transition only moves them.** The
 block tables are filled by the coordinator inside `Admit`; the cache progress
-(prefix-hash chain, promotion boundary, materialized state boundary) is
+(prefix-hash chain, promotion boundary, pending state checkpoints) is
 advanced by the scheduler on a copy, handed to that same admission — which
 publishes the newly completed pages — and written back to the request only
 after it succeeds. A failed admission therefore leaves both untouched, and the
 retry re-derives the same completed pages and asks for their publication
 again. Committing progress before admission would record the pages as hashed
-while never publishing them. The scheduling events carry nothing but the
+while never publishing them. Result feedback separately adds evidence of exact
+materialized endpoints to the pending list; it does not advance hashes or consume
+unpublished entries. The scheduling events carry nothing but the
 shape of the next state (chunk size, decode reserve). An intermediate
 prefill chunk produces no token but does write KV, so it reports back with an
 empty `ExtendResult`: the arrival is the point, not the payload. Work this

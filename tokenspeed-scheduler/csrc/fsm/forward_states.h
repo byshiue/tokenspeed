@@ -46,10 +46,26 @@ struct CacheProgress {
     std::uint64_t access_epoch{0};
     // Pending closed-prefix boundary; zero once published or when absent.
     std::int32_t promotion_boundary_tokens{0};
-    // Last exact aligned state boundary produced by local prefill or accepted
-    // decode. Preserve it while conservative hash publication catches up.
-    // A verify window crossing a boundary does not prove that state was written.
-    std::int32_t materialized_state_boundary_tokens{0};
+    // Exact aligned state boundaries awaiting conservative hash publication,
+    // in token order. Crossing a boundary is not evidence of a written state.
+    std::vector<std::int32_t> materialized_state_boundaries;
+
+    void RecordMaterializedStateBoundary(std::int32_t boundary, std::int32_t prefix_granularity) {
+        if (boundary <= 0 || boundary % prefix_granularity != 0 ||
+            boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size())) {
+            return;
+        }
+        if (materialized_state_boundaries.empty() || materialized_state_boundaries.back() < boundary) {
+            materialized_state_boundaries.push_back(boundary);
+        }
+    }
+
+    // Call only after admission published the staged hash range successfully.
+    void DiscardPublishedStateBoundaries(std::int32_t prefix_granularity) {
+        std::erase_if(materialized_state_boundaries, [&](std::int32_t boundary) {
+            return boundary / prefix_granularity <= static_cast<std::int32_t>(prefix_hashes.size());
+        });
+    }
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
@@ -109,7 +125,15 @@ struct ForwardResources {
         FatalCheck(results_in_flight > 0, "a forward result landed for a request with no forward in flight");
         --results_in_flight;
     }
-    void ExtendTokens(const std::vector<std::int32_t>& tokens) { token_container->Extend(tokens); }
+    void ExtendTokens(const std::vector<std::int32_t>& tokens) {
+        token_container->Extend(tokens);
+        if (!tokens.empty()) {
+            // Feedback ends with one not-yet-computed token. Record every
+            // exact accepted endpoint, including when several results land
+            // before the next admission; the conservative frontier is not it.
+            cache_progress.RecordMaterializedStateBoundary(token_container->Size() - 1, prefix_granularity);
+        }
+    }
 };
 
 template <typename State>

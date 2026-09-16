@@ -108,10 +108,9 @@ struct GroupDemand {
     // blocks to Host. Decode publication leaves this false so only sliding
     // windows keep streaming; finish/retract persist the remaining groups.
     bool stream_completed_to_host{false};
-    // Exact snapshot provenance (internal prefill boundary or accepted aligned
-    // endpoint). Allocation and conservative token progress are not proof.
-    // Zero means no known materialized boundary.
-    std::int32_t materialized_state_boundary_tokens{0};
+    // Unpublished exact snapshots (internal prefill boundaries or accepted
+    // aligned endpoints). Allocation and conservative progress are not proof.
+    std::span<const std::int32_t> materialized_state_boundaries{};
 };
 
 struct PrefixMatch {

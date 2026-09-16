@@ -204,17 +204,17 @@ input/output slots; compacting the row or publishing an unwritten intermediate
 checkpoint would break position identity.
 
 Publication requires provenance, not just an allocated block or completed hash.
-The request's cache progress records the last exact aligned boundary materialized
-by local prefill or accepted decode. Decode admission retains this evidence
-while the conservative hash frontier catches up, even after the accepted
-endpoint advances past it. Verification commits only its accepted endpoint:
-crossing a boundary does not prove that its state was written. Admission, finish
-and retraction pass this provenance to the coordinator. A snapshot is publishable
-only when the exact accepted endpoint equals the hashed boundary, or that exact
-boundary has retained materialization provenance. The conservative admission
+The request's cache progress retains every unpublished exact aligned boundary
+materialized by local prefill or accepted decode. New endpoints must not replace
+older records: more than one checkpoint can wait behind the conservative hash
+frontier. Verification commits only its accepted endpoint; crossing a boundary
+does not prove that its state was written. Admission, finish and retraction pass
+the pending boundaries to the coordinator, which publishes each one covered by
+the new hashes before reclaiming its table slot. It does not require a checkpoint
+to equal the newest hashed boundary. Entries are removed only after successful
+admission, so a failed attempt can retry publication. The conservative admission
 frontier (which subtracts the verify width) is not an exact state endpoint.
-Remote endpoint-only landings
-do not claim an internal prefill checkpoint.
+Remote endpoint-only landings do not claim an internal prefill checkpoint.
 
 Snapshot selection and slot addressing are distinct even within this mapping:
 the last internal reusable checkpoint is at

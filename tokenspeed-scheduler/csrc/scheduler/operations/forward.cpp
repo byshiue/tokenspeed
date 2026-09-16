@@ -423,6 +423,15 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
                                      CacheBoundaryKind::kChunk);
     }
     discardUncachedKvEventPages(event_keys);
+    fsm::CacheProgress cache_progress{
+        .prefix_hashes = std::move(match.prefix_hashes),
+        .access_epoch = admission->access_epoch,
+        .promotion_boundary_tokens = admission->promotion_boundary_tokens,
+    };
+    if (source == fsm::PrefillSource::kLocal) {
+        const std::int32_t granularity = coordinator_.PrefixGranularity();
+        cache_progress.RecordMaterializedStateBoundary(after_tokens / granularity * granularity, granularity);
+    }
     return fsm::SchedulePrefillFirstChunkEvent{
         prefill_tokens,
         decode_reserve,
@@ -431,15 +440,7 @@ std::optional<fsm::SchedulePrefillFirstChunkEvent> Scheduler::schedulePrefillFir
         &coordinator_,
         std::move(tables),
         hit_tokens,
-        fsm::CacheProgress{
-            .prefix_hashes = std::move(match.prefix_hashes),
-            .access_epoch = admission->access_epoch,
-            .promotion_boundary_tokens = admission->promotion_boundary_tokens,
-            .materialized_state_boundary_tokens =
-                source == fsm::PrefillSource::kLocal
-                    ? after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity()
-                    : 0,
-        },
+        std::move(cache_progress),
         std::move(admission->load_pairs),
         // The P role holds a completed prompt until its result lands: the
         // remote decode that hands it off carries the bootstrap token.
@@ -486,7 +487,7 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
                                      .completed_boundary_kind = completed.boundary_kind,
                                      .num_computed_tokens = num_computed_tokens,
                                      .stream_completed_to_host = config_.StreamsDeviceCacheToHost(),
-                                     .materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens(),
+                                     .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
                                  });
     reservePrefillDemands(demands, config_.cache_groups, reserve);
     makeSnapshotStatePrefillSparse(demands, config_.cache_groups, coordinator_, first_pos, after_tokens);
@@ -494,8 +495,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         return std::nullopt;
     }
 
-    cache_progress.materialized_state_boundary_tokens =
-        after_tokens / coordinator_.PrefixGranularity() * coordinator_.PrefixGranularity();
+    const std::int32_t granularity = coordinator_.PrefixGranularity();
+    cache_progress.DiscardPublishedStateBoundaries(granularity);
+    cache_progress.RecordMaterializedStateBoundary(after_tokens / granularity * granularity, granularity);
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
 }
@@ -505,10 +507,6 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     const std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    // Verify's conservative publication frontier trails the accepted endpoint.
-    // Remember an exact state boundary until that frontier can publish it;
-    // inspecting only the next round's endpoint would lose this evidence.
-    cache_progress.materialized_state_boundary_tokens = request->MaterializedStateBoundaryTokens();
     std::int32_t num_computed_tokens = 0;
     if (request->Is<fsm::PrefillDone>()) {
         const PrefillInfo previous = request->CurrentPrefillInfo();
@@ -533,7 +531,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 .completed_boundary_kind = completed.boundary_kind,
                 .num_computed_tokens = num_computed_tokens,
                 .stream_completed_to_host = config_.StreamsDeviceCacheToHost() && request->Is<fsm::PrefillDone>(),
-                .materialized_state_boundary_tokens = cache_progress.materialized_state_boundary_tokens,
+                .materialized_state_boundaries = cache_progress.materialized_state_boundaries,
             });
         if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, completed.first_new_prefix_page,
                                       demands)) {
@@ -541,6 +539,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         }
     }
 
+    cache_progress.DiscardPublishedStateBoundaries(coordinator_.PrefixGranularity());
     request->CacheProgressRef() = std::move(cache_progress);
     return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
 }
@@ -668,7 +667,7 @@ void Scheduler::retractVictim(Request& victim, std::vector<WriteBackOperation>& 
             coordinator_.CacheCompletedBlocks(
                 victim.BlockTablesRef(), cache_progress.prefix_hashes, cache_progress.access_epoch,
                 completed.first_new_prefix_page, num_computed_tokens, *completed.boundary_kind,
-                /*stream_completed_to_host=*/false, victim.MaterializedStateBoundaryTokens());
+                /*stream_completed_to_host=*/false, cache_progress.materialized_state_boundaries);
         }
         coordinator_.QueueCachedBlocksForStore(cache_progress.prefix_hashes);
         coordinator_.QueueLatestSnapshotBlocksForStore(cache_progress.prefix_hashes);

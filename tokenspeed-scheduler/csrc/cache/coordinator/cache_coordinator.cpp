@@ -524,7 +524,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
                                             std::uint64_t access_epoch, std::int32_t first_new_prefix_page,
                                             std::int32_t num_computed_tokens, CacheBoundaryKind boundary_kind,
                                             bool stream_completed_to_host,
-                                            std::int32_t materialized_state_boundary_tokens) {
+                                            std::span<const std::int32_t> materialized_state_boundaries) {
     _assert(tables.size() == groups_.size(), "tables/groups size mismatch");
     _assert(first_new_prefix_page >= 0 && static_cast<std::size_t>(first_new_prefix_page) < prefix_hashes.size(),
             "completed page range must be non-empty");
@@ -536,7 +536,7 @@ void CacheCoordinator::CacheCompletedBlocks(std::span<BlockTable> tables, std::s
             .completed_boundary_kind = boundary_kind,
             .num_computed_tokens = num_computed_tokens,
             .stream_completed_to_host = stream_completed_to_host,
-            .materialized_state_boundary_tokens = materialized_state_boundary_tokens,
+            .materialized_state_boundaries = materialized_state_boundaries,
         };
         cacheDeviceCompletedBlocksForGroup(i, demand, access_epoch);
     }
@@ -761,9 +761,26 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, con
     // Prefill can produce an internal snapshot, but speculative decode commits
     // only the accepted endpoint. Never infer a written snapshot from an
     // allocated slot or a completed token hash (including finish/retraction).
-    const std::int32_t boundary_tokens = static_cast<std::int32_t>(demand.prefix_hashes.size()) * prefix_granularity_;
-    if (groups_[group_index].Spec().kind == AttnKind::kMambaState &&
-        demand.materialized_state_boundary_tokens != boundary_tokens) {
+    if (groups_[group_index].Spec().kind == AttnKind::kMambaState) {
+        // A wide verify window may leave multiple exact checkpoints pending,
+        // or move the hash frontier past several in one admission. Publish
+        // each proven checkpoint before retention can reclaim its table slot.
+        for (const std::int32_t boundary : demand.materialized_state_boundaries) {
+            _assert(boundary > 0 && boundary % prefix_granularity_ == 0,
+                    "materialized state boundary must be positive and prefix-aligned");
+            const std::int32_t prefix_page = boundary / prefix_granularity_ - 1;
+            if (prefix_page < demand.new_prefix_hash_begin ||
+                prefix_page >= static_cast<std::int32_t>(demand.prefix_hashes.size())) {
+                continue;
+            }
+            std::vector<CacheKey> keys =
+                keysForGroup(demand.prefix_hashes.subspan(prefix_page, 1), groups_[group_index].Id());
+            // Snapshot state publishes only the endpoint slot, even when
+            // several group pages fit inside one prefix-hash interval.
+            cacheFullBlocksForGroup<Tier>(group_index, *demand.table, std::span<const CacheKey>{keys}.last(1),
+                                          (prefix_page + 1) * pages_per_prefix_hash - 1, access_epoch,
+                                          *demand.completed_boundary_kind, demand.stream_completed_to_host);
+        }
         return;
     }
 
