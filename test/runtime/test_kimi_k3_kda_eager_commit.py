@@ -61,6 +61,7 @@ class _Harness:
             is_draft=False,
             speculative_num_draft_tokens=T,
             max_bs=max_bs,
+            context_len=4096,
             components=(spec,),
             # Stub component(): this backend construction never queries components.
             component=lambda cls: None,
@@ -116,6 +117,8 @@ class _Harness:
             torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
             forward_mode=ForwardMode.DECODE,
             block_tables=delivered,
+            num_extends=0,
+            for_graph_replay=False,
         )
 
     def forward(self, inputs, bs):
@@ -131,6 +134,7 @@ class _Harness:
                     out_cache_loc=None,
                     token_to_kv_pool=self.pool,
                     bs=bs,
+                    save_kv_cache=True,
                     mixed_qkv=inputs["mixed_qkv"].clone(),
                     f_a_out=inputs["f_a_out"],
                     beta_raw=inputs["beta_raw"],
@@ -486,6 +490,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
             forward_mode=ForwardMode.DECODE,
             for_graph_replay=True,
             block_tables=delivered,
+            num_extends=0,
         )
         replay_inputs = captured.inputs(bs, 227 + round_index)
         for name, value in replay_inputs.items():
@@ -520,6 +525,7 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         forward_mode=ForwardMode.DECODE,
         for_graph_replay=True,
         block_tables=delivered,
+        num_extends=0,
     )
     replay_inputs = captured.inputs(bs, 251)
     for name, value in replay_inputs.items():

@@ -54,6 +54,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     scheduler_cache_group_pages,
     should_use_overlap_schedule,
 )
+from tokenspeed.runtime.engine.state_commit import StateCommitValidator
 from tokenspeed.runtime.epd.prefill_hooks import EpdPrefillHooks
 from tokenspeed.runtime.execution.device import (
     DeviceRole,
@@ -241,6 +242,18 @@ class EventLoop:
         self.attn_tp_rank = attn_tp_rank
         self.attn_tp_cpu_group = pg_manager.get_process_group(
             "gloo", server_args.mapping.attn.tp_group
+        )
+        replay_validation = any(
+            group.replay_checkpoint_group is not None for group in cache_groups
+        )
+        self._state_commit_validator = StateCommitValidator(
+            enabled=replay_validation,
+            local_groups=specs.state_commit_group_count,
+            groups=tuple(
+                pg_manager.get_process_group("gloo", group)
+                for group in (mapping.attn.tp_group, mapping.pp_group)
+                if replay_validation and len(group) > 1
+            ),
         )
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
@@ -774,6 +787,11 @@ class EventLoop:
         # Everything below reads host tensors.
         with nvtx_range("commit:sync", color="red"):
             results = pending.result()
+        self._state_commit_validator.validate(
+            results.state_commit_validity,
+            bs=len(forward_op.request_ids) - forward_op.num_extends(),
+            requires_commit=forward_op.num_extends() < len(forward_op.request_ids),
+        )
         self.request_handler.forward_ct += 1
         forward_mode = ForwardMode.from_num_extends(
             forward_op.num_extends(),

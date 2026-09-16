@@ -373,5 +373,57 @@ class TestDecodeHostL2(unittest.TestCase):
         self.assertTrue(args.enable_kvstore)
 
 
+class TestBufferedReplayConfiguration(unittest.TestCase):
+    def test_explicit_capacity_cli_and_startup_constraints(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        self.assertIsNone(
+            parser.parse_args(["--model", "x"]).ssm_replay_buffer_capacity
+        )
+        parsed = parser.parse_args(
+            ["--model", "x", "--ssm-replay-buffer-capacity", "37"]
+        )
+        self.assertEqual(parsed.ssm_replay_buffer_capacity, 37)
+        args = object.__new__(ServerArgs)
+        args.enable_kvstore = False
+        for algorithm, width, capacity, valid in (
+            (None, 4, 2, True),  # Ordinary decode executes width one.
+            ("EAGLE3", 4, 8, True),
+            ("EAGLE3", 4, 37, True),
+            ("EAGLE3", 4, 64, True),
+            ("EAGLE3", 4, 7, False),
+            ("EAGLE3", 4, 0, False),
+            ("EAGLE3", 4, True, False),
+            ("EAGLE3", 4, 65, False),
+            ("EAGLE3", 8, 32, False),
+        ):
+            with self.subTest(algorithm=algorithm, width=width, capacity=capacity):
+                args.speculative_algorithm = algorithm
+                args.speculative_num_draft_tokens = width
+                args.ssm_replay_buffer_capacity = capacity
+                if valid:
+                    args.validate_cache_options()
+                else:
+                    with self.assertRaisesRegex(ValueError, "capacity"):
+                        args.validate_cache_options()
+        args.speculative_num_draft_tokens = 4
+        args.ssm_replay_buffer_capacity = 8
+        for field, value in (
+            ("device", "cpu"),
+            ("mamba_ssm_dtype", "bfloat16"),
+            ("disaggregation_mode", "prefill"),
+            ("disaggregation_mode", "decode"),
+        ):
+            with (
+                self.subTest(field=field, value=value),
+                mock.patch.object(args, field, value),
+            ):
+                with self.assertRaisesRegex(ValueError, "handoff"):
+                    args.validate_cache_options()
+                args.ssm_replay_buffer_capacity = None
+                args.validate_cache_options()  # Unrelated models keep their behavior.
+                args.ssm_replay_buffer_capacity = 8
+
+
 if __name__ == "__main__":
     unittest.main()

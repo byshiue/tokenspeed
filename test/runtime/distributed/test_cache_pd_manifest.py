@@ -64,6 +64,8 @@ def _group_spec(
     # A state group is one checkpoint per block; a history group is rows.
     if family == "state":
         return CacheGroupSpec(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id=group_id,
             retention=retention,
             sliding_window_tokens=sliding_window_tokens,
@@ -72,6 +74,8 @@ def _group_spec(
             checkpoint_granularity=prefix_granularity,
         )
     return CacheGroupSpec(
+        replay_checkpoint_group=None,
+        max_state_lag_tokens=0,
         group_id=group_id,
         retention=retention,
         rows_per_page=prefix_granularity,
@@ -300,8 +304,20 @@ def test_manifest_accepts_reordered_mapping_but_rejects_wrong_keys() -> None:
             )
 
 
-def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
+@pytest.mark.parametrize("state_lag", [0, 60])
+def test_contract_and_manifest_wire_round_trip_has_no_version_field(state_lag) -> None:
     layout = _layout()
+    layout = replace(
+        layout,
+        group_specs=tuple(
+            (
+                replace(spec, max_state_lag_tokens=state_lag)
+                if spec.family == "state"
+                else spec
+            )
+            for spec in layout.group_specs
+        ),
+    )
     manifest = build_cache_block_manifest(
         _op(),
         layout=layout,
@@ -327,6 +343,35 @@ def test_contract_and_manifest_wire_round_trip_has_no_version_field() -> None:
     assert "page_ids" not in manifest_payload["groups"][0]
     assert CacheTransferContract.from_wire_bytes(layout_wire) == layout
     assert CachePDBlockManifest.from_wire_bytes(manifest_wire) == manifest
+    # The peer may use eager state: lag is a local retention bound, not a
+    # different byte layout or permission to transfer an inexact snapshot.
+    validate_cache_peer_layout(layout, _layout())
+    # Until materialized handoff is integrated, neither a locally constructed
+    # contract nor a remote payload may expose request-local replay history.
+    replay = replace(
+        layout.group_specs[0],
+        retention="sliding_window",
+        sliding_window_tokens=state_lag + 1,
+        transfer_policy=None,
+        replay_checkpoint_group="linear-a",
+    )
+    with pytest.raises(CacheContractError, match="materialized handoff"):
+        replace(layout, group_specs=(replay, *layout.group_specs[1:]))
+    replay_payload = json.loads(layout_wire)
+    replay_payload["group_specs"][0].update(
+        retention="sliding_window",
+        sliding_window_tokens=state_lag + 1,
+        transfer_policy=None,
+        replay_checkpoint_group="linear-a",
+    )
+    with pytest.raises(
+        CacheContractError, match="invalid cache transfer contract"
+    ) as rejected:
+        CacheTransferContract.from_wire_bytes(json.dumps(replay_payload).encode())
+    assert "materialized handoff" in str(rejected.value.__cause__)
+    del contract_payload["group_specs"][1]["max_state_lag_tokens"]
+    with pytest.raises(CacheContractError, match="invalid cache transfer contract"):
+        CacheTransferContract.from_wire_bytes(json.dumps(contract_payload).encode())
 
 
 def test_lcm_group_capacity_uses_its_cache_blocks_per_parent() -> None:
@@ -511,6 +556,8 @@ def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
 
 _LCM_SPECS = (
     CacheGroupSpec(
+        replay_checkpoint_group=None,
+        max_state_lag_tokens=0,
         group_id="history",
         retention="full_history",
         rows_per_page=4,

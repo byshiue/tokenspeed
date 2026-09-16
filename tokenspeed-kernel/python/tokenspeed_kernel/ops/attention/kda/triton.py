@@ -678,6 +678,30 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     return _nvidia_kda_prefill(kda_chunk_prefill, **kwargs)
 
 
+from tokenspeed_kernel.ops.attention.kda._triton.buffered import (  # noqa: E402
+    triton_kda_buffered_recurrent,
+    validate_recurrent_blocks,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_conv import (  # noqa: E402
+    buffered_conv,
+    commit_conv_windows,
+    prepare_conv_blocks,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_endpoint import (  # noqa: E402
+    materialize_endpoints,
+    prepare_endpoint_commit,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_gate import (  # noqa: E402
+    buffered_history_gate,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_metadata import (  # noqa: E402
+    commit_positions,
+    prepare_positions,
+    refresh_decode_inputs,
+)
+from tokenspeed_kernel.ops.attention.kda._triton.buffered_producers import (  # noqa: E402
+    buffered_producers,
+)
 from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noqa: E402
     capture_replay_payload,
 )

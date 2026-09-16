@@ -195,6 +195,8 @@ class _SyntheticHybridRecipe(CacheRecipe):
         return groups + (
             (
                 CacheGroupSpec(
+                    replay_checkpoint_group=None,
+                    max_state_lag_tokens=0,
                     group_id=self._extra_state_group,
                     retention="full_history",
                     sliding_window_tokens=None,
@@ -214,6 +216,45 @@ def _hybrid_setup_with_narrow_draft():
         num_draft_layers=1,
         extra_state_group="state",
     ).setup()
+
+
+def test_replay_dependency_is_validated_before_packing_and_at_runtime(monkeypatch):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+        CacheRuntimeContract,
+    )
+
+    recipe = _SyntheticHybridRecipe(
+        layer_types=("sliding_attention",),
+        group_ids=("replay",),
+        windows=5,
+        extra_state_group="state",
+    )
+    declared = recipe.groups()
+    groups = tuple(
+        (
+            (
+                replace(spec, replay_checkpoint_group="state")
+                if spec.family == "history"
+                else replace(spec, max_state_lag_tokens=4)
+            ),
+            fields,
+        )
+        for spec, fields in declared
+    )
+    monkeypatch.setattr(recipe, "groups", lambda: groups)
+    setup = recipe.setup()
+    arena = create_cache_arena(setup.spec, device="cpu", enable_memory_saver=False)
+    contract = arena.runtime_contract
+    assert contract.group_specs[0].replay_checkpoint_group == "state"
+    assert isinstance(contract, CacheRuntimeContract)
+    bad_specs = (replace(groups[0][0], sliding_window_tokens=4), groups[1][0])
+    with pytest.raises(ValueError, match="window must exceed"):
+        replace(contract, group_specs=bad_specs)
+    groups = tuple(
+        (spec, fields) for spec, (_, fields) in zip(bad_specs, groups, strict=True)
+    )
+    with pytest.raises(ValueError, match="window must exceed"):
+        recipe.setup()
 
 
 def test_attention_configs_do_not_own_cache_setup() -> None:

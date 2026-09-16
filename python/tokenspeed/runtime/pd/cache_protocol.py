@@ -94,6 +94,11 @@ class CacheTransferContract:
     transfer_schema: CacheTransferSchema = CacheTransferSchema()
 
     def __post_init__(self) -> None:
+        if any(spec.replay_checkpoint_group is not None for spec in self.group_specs):
+            raise CacheContractError(
+                "request-local replay history requires materialized handoff; "
+                "PD integration is not available yet"
+            )
         self.transfer_schema.validate(self.plan)
 
     def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:

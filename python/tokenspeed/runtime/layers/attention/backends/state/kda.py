@@ -24,7 +24,7 @@ See ``KdaAttnBackend`` for what separates the family from GDN."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -52,6 +52,11 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
 from tokenspeed_kernel.platform import pdl_enabled
 from typing_extensions import override
 
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.state.kda_buffered import (
+    KDAReplayGroupMetadata,
+    KDAReplayWorkspace,
+)
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     logger,
@@ -87,11 +92,22 @@ def _slice_kda_prefill_inputs(
     )
 
 
+def _slice_kda_token_inputs(inputs: dict, start: int, end: int) -> dict:
+    """Slice token-leading producers, keeping model-static weights unchanged."""
+    sliced = {**inputs, "seq_len": end - start}
+    for name in ("mixed_qkv", "f_a_out", "beta_raw", "g_raw", "a", "b", "output_gate"):
+        value = inputs.get(name)
+        if value is not None:
+            sliced[name] = value[start:end]
+    return sliced
+
+
 class KdaAttnBackend(MambaAttnBackend):
     """Attention backend for KDA linear attention layers (Kimi-K3).
 
-    Everything generic to linear attention -- state paging and cache groups --
-    is inherited. When replay commit is available, speculative verify captures
+    Prefill state paging is inherited. An explicitly planned replay-history
+    pool uses one buffered decode/commit path for width one and verification.
+    Legacy pools retain eager commit: speculative verify captures
     its compact projection payload and writes no per-position state tape;
     commit immediately replays the accepted prefix from the committed page.
     KDA also replaces the scan seams: its decay gate is
@@ -112,12 +128,9 @@ class KdaAttnBackend(MambaAttnBackend):
     ) -> None:
         super().__init__(config, spec)
         self.max_bs = config.max_bs
+        self._context_len = config.context_len
         # The platform layout; the workspace planner probes the same one.
         self.kda_recurrent_layout = kda_recurrent_layout_default()
-        self._replay_active = False
-        self._batched_replay_kernel = None
-        self._replay_uses_raw_gate = False
-        self._verify_split_producers = False
         self._reset_replay_state()
         self.kda_backend = (kda_backend or "auto").strip().lower()
         if self.kda_backend not in KDA_PREFILL_BACKENDS:
@@ -132,6 +145,17 @@ class KdaAttnBackend(MambaAttnBackend):
         )
 
     def _reset_replay_state(self) -> None:
+        self._replay_active = False
+        self._batched_replay_kernel = None
+        self._replay_uses_raw_gate = False
+        self._verify_split_producers = False
+        self._buffered_replay: KDAReplayWorkspace | None = None
+        self.forward_decode_metadata: dict[str, KDAReplayGroupMetadata] | None = None
+        self._buffered_bs = 0
+        self._buffered_actual_bs = 0
+        self._buffered_num_extends = 0
+        self._buffered_prefill_tokens = 0
+        self._buffered_commit_pending = False
         self._verify_producer_stream: torch.cuda.Stream | None = None
         self._verify_producer_forks: dict[int, StreamFork] = {}
         self._replay_payloads: tuple[torch.Tensor, ...] | None = None
@@ -174,6 +198,39 @@ class KdaAttnBackend(MambaAttnBackend):
     @override
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
+        state_groups = set(cache_pool.state_group_by_layer.values())
+        if any(
+            spec.replay_checkpoint_group in state_groups
+            for spec in cache_pool.arena.cache_group_specs
+        ):
+            if not self._layer_pools_are_uniform(cache_pool):
+                raise RuntimeError("buffered KDA requires uniform local layer pools")
+            first = min(cache_pool.state_group_by_layer)
+            conv = cache_pool.get_component(first, "conv_state")
+            if (
+                not conv.is_cuda
+                or conv.dtype != torch.bfloat16
+                or self.dtype != torch.bfloat16
+            ):
+                raise RuntimeError("buffered KDA requires BF16 CUDA state")
+            if self.is_draft or self.kda_recurrent_layout != "v_major":
+                raise RuntimeError("buffered KDA requires a V-major target state pool")
+            for layer in cache_pool.state_group_by_layer:
+                replay = cache_pool.get_replay_buffers(layer)
+                if replay.layout.max_window != self.spec_num_tokens:
+                    raise RuntimeError("buffered KDA width differs from the cache plan")
+                if (
+                    self._buffered_replay is not None
+                    and replay.layout != self._buffered_replay.metadata.layout
+                ):
+                    raise RuntimeError(
+                        "cannot rebind a different buffered replay layout"
+                    )
+            return
+        if self._buffered_replay is not None:
+            raise RuntimeError(
+                "cannot remove buffered replay fields during pool rebind"
+            )
         replay_active = kda_replay_commit_supported(
             self.dtype,
             recurrent_layout=self.kda_recurrent_layout,
@@ -190,6 +247,25 @@ class KdaAttnBackend(MambaAttnBackend):
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self._reset_replay_state()
+        state_groups = set(cache_pool.state_group_by_layer.values())
+        if any(
+            spec.replay_checkpoint_group in state_groups
+            for spec in cache_pool.arena.cache_group_specs
+        ):
+            self._replay_active = False
+            self._buffered_replay = KDAReplayWorkspace(
+                cache_pool, max_bs=self.max_bs, max_context_len=self._context_len
+            )
+            layout = self._buffered_replay.metadata.layout
+            logger.info(
+                "KDA buffered replay: capacity=%d, target_width=%d, kernel=%s, "
+                "workspace_bytes=%d (experimental)",
+                layout.capacity,
+                layout.max_window,
+                self._buffered_replay.recurrent_kernel.__name__,
+                self._buffered_replay.nbytes,
+            )
+            return
         shape = self._replay_shape(cache_pool)
         self._replay_active = kda_replay_commit_supported(
             self.dtype,
@@ -424,6 +500,13 @@ class KdaAttnBackend(MambaAttnBackend):
 
     @override
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
+        if self._buffered_replay is not None:
+            if (
+                max_bs > self.max_bs
+                or draft_token_num != self._buffered_replay.metadata.layout.max_window
+            ):
+                raise RuntimeError("buffered workspace differs from execution geometry")
+            return self._buffered_replay.nbytes
         if not self._replay_active:
             return super().preallocate_verify_workspace(max_bs, draft_token_num)
         self._ensure_verify_scratch(max_bs, draft_token_num)
@@ -434,6 +517,325 @@ class KdaAttnBackend(MambaAttnBackend):
         )
         payload_bytes = sum(payload.nbytes for payload in (self._replay_payloads or ()))
         return conv_bytes + payload_bytes
+
+    @override
+    def init_cuda_graph_state(self, max_bs: int, **kwargs) -> None:
+        if self._buffered_replay is None:
+            return super().init_cuda_graph_state(max_bs, **kwargs)
+        if max_bs > self.max_bs:
+            raise RuntimeError("buffered decode exceeds the planned runtime capacity")
+
+    @override
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        block_tables: Mapping[str, torch.Tensor],
+        **kwargs,
+    ) -> None:
+        # Buffered recurrence has no query-start-loc warmup asymmetry: capture
+        # uses the ordinary idle refresh. Legacy KDA still needs Mamba's hook.
+        if self._buffered_replay is not None:
+            self.refresh_decode_metadata(
+                bs,
+                0,
+                req_pool_indices,
+                seq_lens,
+                forward_mode=forward_mode,
+                block_tables=block_tables,
+                num_extends=0,
+                for_graph_replay=True,
+            )
+            return
+        super().init_forward_metadata_capture_cuda_graph(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            forward_mode,
+            block_tables=block_tables,
+            **kwargs,
+        )
+
+    @override
+    def refresh_decode_metadata(
+        self,
+        bs: int,
+        actual_bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        forward_mode: ForwardMode,
+        block_tables: Mapping[str, torch.Tensor],
+        num_extends: int,
+        for_graph_replay: bool,
+        **kwargs,
+    ) -> None:
+        workspace = self._buffered_replay
+        if workspace is None:
+            return super().refresh_decode_metadata(
+                bs,
+                actual_bs,
+                req_pool_indices,
+                seq_lens,
+                forward_mode=forward_mode,
+                block_tables=block_tables,
+                num_extends=num_extends,
+                for_graph_replay=for_graph_replay,
+                **kwargs,
+            )
+        if num_extends or not forward_mode.is_decode_or_idle():
+            raise RuntimeError("buffered refresh requires a pure decode batch")
+        self._buffered_bs, self._buffered_actual_bs = bs, actual_bs
+        self._buffered_num_extends = 0
+        self._buffered_prefill_tokens = 0
+        self._buffered_commit_pending = actual_bs > 0
+        workspace.metadata.refresh(
+            bs, actual_bs, seq_lens, block_tables, for_handoff=False
+        )
+        # These stamps are request-local, zeroed fields, never transferred.
+        # State payload load fences remain at each layer's first consumption.
+        workspace.metadata.prepare(bs, for_handoff=False)
+        # Expose every captured tensor to the existing graph pointer guard.
+        # The inherited slot carries prefill metadata, not buffered decode.
+        self.forward_metadata = None
+        self.forward_decode_metadata = workspace.metadata._batch(bs)
+
+    @override
+    def init_forward_metadata(
+        self,
+        bs: int,
+        num_extends: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        block_tables: Mapping[str, torch.Tensor],
+        extend_seq_lens: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_with_prefix: bool,
+        **kwargs,
+    ) -> None:
+        self._buffered_actual_bs = 0
+        self._buffered_commit_pending = False
+        self._buffered_num_extends = num_extends
+        self._buffered_prefill_tokens = 0
+        if self._buffered_replay is not None and forward_mode.is_mixed():
+            if not 0 < num_extends < bs:
+                raise ValueError("mixed KDA metadata requires extend and decode rows")
+            # The decode suffix uses exactly the pure-decode refresh. Prefill
+            # metadata covers only leading extend rows, whose input snapshots
+            # must already be exact under the cache-owner handoff contract.
+            decodes = bs - num_extends
+            self.refresh_decode_metadata(
+                decodes,
+                decodes,
+                req_pool_indices[num_extends:bs],
+                seq_lens[num_extends:bs],
+                forward_mode=ForwardMode.DECODE,
+                block_tables={
+                    gid: rows[num_extends:bs] for gid, rows in block_tables.items()
+                },
+                num_extends=0,
+                for_graph_replay=False,
+            )
+            self._buffered_num_extends = num_extends
+            self._buffered_prefill_tokens = int(extend_seq_lens_cpu[:num_extends].sum())
+            bs = num_extends
+            req_pool_indices = req_pool_indices[:bs]
+            seq_lens = seq_lens[:bs]
+            block_tables = {gid: rows[:bs] for gid, rows in block_tables.items()}
+            forward_mode = ForwardMode.EXTEND
+        elif (
+            self._buffered_replay is not None
+            and not forward_mode.is_idle()
+            and num_extends != bs
+        ):
+            raise ValueError("buffered prefill metadata must describe only extend rows")
+        super().init_forward_metadata(
+            bs,
+            num_extends,
+            req_pool_indices,
+            seq_lens,
+            forward_mode,
+            block_tables=block_tables,
+            extend_seq_lens=extend_seq_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+            extend_with_prefix=extend_with_prefix,
+            **kwargs,
+        )
+
+    @override
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        bs: int,
+        forward_mode: ForwardMode,
+        save_kv_cache: bool,
+        **kwargs,
+    ):
+        workspace = self._buffered_replay
+        if workspace is None or not forward_mode.is_mixed():
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                token_to_kv_pool,
+                bs,
+                forward_mode,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        extends = self._buffered_num_extends
+        decodes = self._buffered_actual_bs
+        prefill_tokens = self._buffered_prefill_tokens
+        real_tokens = prefill_tokens + decodes * workspace.metadata.layout.max_window
+        if (
+            not save_kv_cache
+            or not 0 < extends < bs
+            or extends + decodes != bs
+            or kwargs["seq_len"] < real_tokens
+        ):
+            raise RuntimeError("mixed KDA forward differs from its refreshed metadata")
+        # This is one model dispatch. Within each KDA layer, variable-length
+        # prefill scans its exact input states and the decode suffix consumes
+        # the same buffered operation as pure decode. Slices are zero-copy;
+        # shared decode output must be consumed before the next layer reuses it.
+        prefill = super().forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            extends,
+            ForwardMode.EXTEND,
+            save_kv_cache=save_kv_cache,
+            **_slice_kda_token_inputs(kwargs, 0, prefill_tokens),
+        )
+        decode = self.forward_decode(
+            q,
+            k,
+            v,
+            layer,
+            token_to_kv_pool,
+            decodes,
+            save_kv_cache=save_kv_cache,
+            **_slice_kda_token_inputs(kwargs, prefill_tokens, real_tokens),
+        )
+        # KDA prefill returns packed [tokens,H,D]; buffered decode retains
+        # the scan-compatible leading dimension until the hybrid wrapper.
+        parts = [prefill.unsqueeze(0), decode]
+        padding = kwargs["seq_len"] - real_tokens
+        if padding:
+            parts.append(
+                decode.new_zeros((1, padding, workspace.heads, workspace.value_dim))
+            )
+        return torch.cat(parts, dim=1)
+
+    @override
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        bs: int,
+        save_kv_cache: bool,
+        **kwargs,
+    ):
+        workspace = self._buffered_replay
+        if workspace is None:
+            return super().forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                token_to_kv_pool,
+                bs,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
+        if not save_kv_cache or bs != self._buffered_bs:
+            raise RuntimeError("buffered forward requires its refreshed writable batch")
+        if kwargs["bias"] is not None or kwargs["activation"] not in ("silu", "swish"):
+            raise RuntimeError("buffered KDA requires bias-free SiLU convolution")
+        layer_id = kwargs["layer_id"]
+        # The workspace caches pool views, so it must not bypass the per-layer
+        # load fence. Recurrent and conv commit run only after all layers.
+        self.kv_pool.get_replay_buffers(layer_id)
+        width = workspace.metadata.layout.max_window
+        out = workspace.forward(
+            layer_id,
+            bs,
+            kwargs["mixed_qkv"].view(bs, width, workspace.channels),
+            kwargs["conv_weights"],
+            kwargs["f_a_out"],
+            kwargs["f_b_weight"],
+            kwargs["beta_raw"].view(bs, width, workspace.heads),
+            kwargs["A_log"],
+            kwargs["dt_bias"],
+            kwargs["lower_bound"],
+        ).view(1, bs * width, workspace.heads, workspace.value_dim)
+        gate = kwargs.get("output_gate")
+        if gate is not None:
+            out = rmsnorm_gated_sigmoid(
+                out.view(-1, workspace.heads * workspace.value_dim),
+                gate,
+                kwargs["norm_weight"],
+                kwargs["norm_eps"],
+                workspace.heads,
+                workspace.value_dim,
+                enable_pdl=pdl_enabled(),
+            ).view(1, bs * width, workspace.heads, workspace.value_dim)
+        return out
+
+    @override
+    def state_commit_validity(
+        self, bs: int, *, num_extends: int
+    ) -> torch.Tensor | None:
+        if (
+            self._buffered_replay is None
+            or not self._buffered_actual_bs
+            or self._buffered_commit_pending
+        ):
+            return None
+        if (
+            num_extends != self._buffered_num_extends
+            or bs - num_extends != self._buffered_actual_bs
+        ):
+            raise RuntimeError("commit validity must exclude graph padding")
+        return self._buffered_replay.metadata.ok[:, : self._buffered_actual_bs]
+
+    @override
+    def commit_state_after_verify(
+        self, accepted_lengths: torch.Tensor, *, num_extends: int
+    ) -> None:
+        if self._buffered_replay is None:
+            return super().commit_state_after_verify(
+                accepted_lengths, num_extends=num_extends
+            )
+        if not self._buffered_actual_bs:
+            return  # Pure prefill, idle or the graph's zero-live capture warmup.
+        if (
+            num_extends != self._buffered_num_extends
+            or accepted_lengths.numel() != num_extends + self._buffered_actual_bs
+        ):
+            raise RuntimeError("buffered commit must match the live mixed/decode rows")
+        # Prefill has already written exact final states. Only decode rows owe
+        # accepted commit; their counts include the target input, without +1.
+        self.commit_verified_state(accepted_lengths[num_extends:])
 
     def _kda_gate(
         self,
@@ -811,7 +1213,22 @@ class KdaAttnBackend(MambaAttnBackend):
 
     @override
     def commit_verified_state(self, accepted_length: torch.Tensor) -> None:
-        """Replay and eagerly commit this round's accepted KDA prefix."""
+        """Commit live accepted input counts using the bound pool's state protocol."""
+        if self._buffered_replay is not None:
+            if not self._buffered_actual_bs:
+                return
+            if not self._buffered_commit_pending:
+                raise RuntimeError("buffered batch has already committed")
+            if accepted_length.numel() != self._buffered_actual_bs:
+                raise RuntimeError("buffered commit requires live accepted counts")
+            self._buffered_replay.commit(
+                self._buffered_bs,
+                accepted_length,
+                self._buffered_replay.no_handoff[: accepted_length.numel()],
+                for_handoff=False,
+            )
+            self._buffered_commit_pending = False
+            return
         if not self._replay_active:
             return super().commit_verified_state(accepted_length)
         ctx = self._verify_commit_ctx
@@ -821,8 +1238,8 @@ class KdaAttnBackend(MambaAttnBackend):
 
         committed, tables, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
-        # Runtime accept lengths count draft matches; the target token itself
-        # always advances state, matching the established scratch commit.
+        # Acceptance already includes the target input. The page helper clamps
+        # that count to the verify window; it must not add another token.
         group_ids = list(self._replay_group_ids or self._state_groups())
         write_stack = torch.empty(
             (len(group_ids), bs), dtype=torch.int32, device=accepted_length.device

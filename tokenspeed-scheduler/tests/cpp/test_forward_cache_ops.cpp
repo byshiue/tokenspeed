@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -555,6 +556,100 @@ TEST(SchedulerConfigValidateTest, RejectsNonPositiveSlidingWindowWithGroupId) {
         config.cache_groups[0].sliding_window_tokens = window;
         ExpectRejectedNamingGroup(config, "nonpositive_window");
     }
+}
+
+TEST(SchedulerConfigValidateTest, StateLagIsNonNegativeAndStateOnly) {
+    for (CacheGroupFamily family : {CacheGroupFamily::History, CacheGroupFamily::State}) {
+        for (std::int32_t lag : {-1, 0, 12}) {
+            SCOPED_TRACE(::testing::Message() << "family=" << static_cast<int>(family) << " lag=" << lag);
+            CacheGroupConfig group{.group_id = "lag-contract",
+                                   .block_granularity = 128,
+                                   .total_pages = 4,
+                                   .family = family,
+                                   .max_state_lag_tokens = lag};
+            const bool valid = lag >= 0 && (family == CacheGroupFamily::State || lag == 0);
+            BlockPool pool(3, {1});
+            const std::array specs{
+                CacheGroupSpec{.kind = family == CacheGroupFamily::State ? AttnKind::kMambaState : AttnKind::kFull,
+                               .block_granularity = 128,
+                               .max_state_lag_tokens = lag}};
+            if (valid) {
+                EXPECT_NO_THROW(group.Validate());
+                EXPECT_NO_THROW(MakeCoordinator(specs, 128, pool, /*host_pool=*/nullptr,
+                                                /*stream_device_cache_to_host=*/true));
+            } else {
+                EXPECT_THROW(group.Validate(), std::invalid_argument);
+                EXPECT_THROW(MakeCoordinator(specs, 128, pool, /*host_pool=*/nullptr,
+                                             /*stream_device_cache_to_host=*/true),
+                             std::runtime_error);
+            }
+        }
+    }
+}
+
+TEST(SchedulerConfigValidateTest, ReplayHistoryRequiresAStateDependencyAndSafeHandoff) {
+    SchedulerConfig cfg{};
+    cfg.prefix_granularity = 4;
+    cfg.max_scheduled_tokens = 8;
+    cfg.device_allocator.total_pages = 32;
+    // Declare the dependency after its consumer to rule out an order-based
+    // interpretation of the string ID at the Python/C++ boundary.
+    cfg.cache_groups = {
+        {.group_id = "replay",
+         .block_granularity = 2,
+         .total_pages = 32,
+         .retention = CacheGroupConfig::Retention::SlidingWindow,
+         .sliding_window_tokens = 5,
+         .replay_checkpoint_group = "state"},
+        {.group_id = "state",
+         .block_granularity = 4,
+         .total_pages = 32,
+         .family = CacheGroupFamily::State,
+         .max_state_lag_tokens = 4},
+    };
+    EXPECT_NO_THROW(cfg.Validate());
+    const auto specs = MakeSpecsFromConfig(cfg);
+    EXPECT_EQ(specs[0].replay_checkpoint_group, 1U);
+    BlockPool pool(32, {1, 1});
+    EXPECT_NO_THROW(MakeCoordinator(specs, 4, pool, /*host_pool=*/nullptr,
+                                    /*stream_device_cache_to_host=*/true));
+    for (const std::string& dependency : {"", "replay", "missing"}) {
+        auto invalid = cfg;
+        invalid.cache_groups[0].replay_checkpoint_group = dependency;
+        EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    }
+    for (std::int32_t window : {0, 4}) {
+        auto invalid = cfg;
+        invalid.cache_groups[0].sliding_window_tokens = window;
+        EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    }
+    auto invalid = cfg;
+    invalid.cache_groups[1].family = CacheGroupFamily::History;
+    invalid.cache_groups[1].max_state_lag_tokens = 0;
+    EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    invalid = cfg;
+    invalid.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+    EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    invalid = cfg;
+    invalid.cache_groups.push_back(cfg.cache_groups[1]);
+    EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    for (Role role : {Role::kP, Role::kD}) {
+        invalid = cfg;
+        invalid.role = role;
+        EXPECT_THROW(invalid.Validate(), std::invalid_argument);
+    }
+    for (std::uint32_t dependency : {0U, 2U}) {
+        auto invalid_specs = specs;
+        invalid_specs[0].replay_checkpoint_group = dependency;
+        EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool, /*host_pool=*/nullptr,
+                                     /*stream_device_cache_to_host=*/true),
+                     std::runtime_error);
+    }
+    auto invalid_specs = specs;
+    invalid_specs[0].sliding_window = 4;
+    EXPECT_THROW(MakeCoordinator(invalid_specs, 4, pool, /*host_pool=*/nullptr,
+                                 /*stream_device_cache_to_host=*/true),
+                 std::runtime_error);
 }
 
 TEST(SchedulerConfigValidateTest, RejectsSlidingWindowStateGroupWithGroupId) {

@@ -69,6 +69,8 @@ def _overlap_admission_scheduler(verify_width: int) -> Scheduler:
     # Cache group page 0 is reserved by the allocator.
     cfg.cache_groups = [
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id="overlap.history",
             block_granularity=1,
             total_pages=total_pages,
@@ -95,6 +97,8 @@ def test_overlap_schedule_depth_defaults_to_zero_and_rejects_deeper_pipeline():
     cfg = _base_config()
     cfg.cache_groups = [
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id="history",
             block_granularity=cfg.prefix_granularity,
             total_pages=cfg.num_device_pages,
@@ -122,6 +126,8 @@ def test_sliding_release_before_admit_prevents_oom():
     cfg.max_scheduled_tokens = 1024
     cfg.cache_groups = [
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id="swa.test",
             block_granularity=2,
             total_pages=8,
@@ -149,6 +155,8 @@ def test_batch_admission_debits_simulated_free_pages():
     cfg.max_scheduled_tokens = 512
     cfg.cache_groups = [
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id=f"swa.g{i}",
             block_granularity=2,
             total_pages=12,
@@ -173,6 +181,8 @@ def test_group_tables_use_each_groups_block_granularity():
     cfg.prefix_granularity = 8
     cfg.cache_groups = [
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id="history",
             block_granularity=8,
             total_pages=17,
@@ -180,6 +190,8 @@ def test_group_tables_use_each_groups_block_granularity():
             family=CacheGroupFamily.History,
         ),
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id="swa",
             block_granularity=2,
             total_pages=65,
@@ -210,6 +222,8 @@ def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
     cfg.decode_input_tokens = 1
     cfg.cache_groups = [
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id="history",
             block_granularity=4,
             total_pages=cfg.num_device_pages,
@@ -217,6 +231,8 @@ def _hybrid_chunked_scheduler(num_usable_pages: int) -> Scheduler:
             family=CacheGroupFamily.History,
         ),
         CacheGroupConfig(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id="swa",
             block_granularity=4,
             total_pages=cfg.num_device_pages,

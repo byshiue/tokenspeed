@@ -121,6 +121,9 @@ def derive_history_groups_by_layer(
     that also owns indexer or state planes in other groups still resolves to
     the one group its ``PagedAttention`` rides.
 
+    Request-local replay history stores recurrence inputs, not attention KV;
+    its checkpoint dependency excludes it from this paged mapping.
+
     Args:
         arena: The cache arena whose plan and group specs to read.
         first_layer: This view's first layer in the merged plan.
@@ -138,7 +141,7 @@ def derive_history_groups_by_layer(
     history = {
         str(spec.group_id)
         for spec in arena.cache_group_specs
-        if spec.family == "history"
+        if spec.family == "history" and spec.replay_checkpoint_group is None
     }
     wanted_planes = set(kv_planes)
     mapping: dict[int, str] = {}
@@ -169,6 +172,8 @@ def derive_paged_group_ids(
     one paged leaf for — a draft view over a shared arena sees only the
     groups its own layers use, never the target's whole set.
 
+    Replay-dependent history has no paged-attention leaf.
+
     Args:
         arena: The cache arena whose plan and group specs to read.
         first_layer: This view's first layer in the merged plan.
@@ -180,7 +185,7 @@ def derive_paged_group_ids(
     history = {
         str(spec.group_id)
         for spec in arena.cache_group_specs
-        if spec.family == "history"
+        if spec.family == "history" and spec.replay_checkpoint_group is None
     }
     found: set[str] = set()
     for field in arena.plan.fields:

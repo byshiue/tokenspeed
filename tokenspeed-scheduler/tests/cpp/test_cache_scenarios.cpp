@@ -303,6 +303,210 @@ TEST(MambaStateCheckpointCapacityTest, CountsRetainedInputForChunkedSingleForwar
     }
 }
 
+TEST(ReplayHistoryPrefillTest, BoundsEmptyPrefillAndDecodeAcrossChunkingAndReuse) {
+    for (const std::int32_t grain : {1, 2, 4}) {
+        for (const std::int32_t width : {1, 3}) {
+            for (const std::int32_t depth : {0, 1}) {
+                for (const std::int32_t chunk : {8, 32}) {
+                    for (const bool reuse : {false, true}) {
+                        SCOPED_TRACE(::testing::Message() << "grain=" << grain << " width=" << width << " depth="
+                                                          << depth << " chunk=" << chunk << " reuse=" << reuse);
+                        SchedulerConfig cfg{};
+                        cfg.prefix_granularity = 4;
+                        cfg.max_scheduled_tokens = chunk;
+                        cfg.max_batch_size = 1;
+                        cfg.decode_input_tokens = width;
+                        cfg.overlap_schedule_depth = depth;
+                        cfg.disable_l2_cache = true;
+                        cfg.disable_prefix_cache = !reuse;
+                        // State's conservative working set plus replay's W=5
+                        // lookback, candidate width, overlap and boundary offset.
+                        const std::int32_t replay_bound = (4 + (2 + depth) * width - 1 + 2 * grain - 2) / grain;
+                        const std::int32_t state_bound = 3 + (3 + std::max(4, (1 + depth) * width) + 3) / 4;
+                        cfg.device_allocator.total_pages = 1 + state_bound + replay_bound;
+                        auto state = MakeGroup("state", 4, cfg.device_allocator.total_pages,
+                                               CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0);
+                        state.max_state_lag_tokens = 4;
+                        auto history =
+                            MakeGroup("replay", grain, cfg.device_allocator.total_pages,
+                                      CacheGroupConfig::Retention::SlidingWindow, CacheGroupFamily::History, 5);
+                        history.replay_checkpoint_group = "state";
+                        cfg.cache_groups = {state, history};
+                        Scheduler scheduler{cfg};
+                        EXPECT_GE(scheduler.MaxSingleRequestTokens(), 24);
+                        if (chunk == 8 && reuse) {
+                            auto short_cfg = cfg;
+                            --short_cfg.device_allocator.total_pages;
+                            for (auto& group : short_cfg.cache_groups) --group.total_pages;
+                            Scheduler short_pool{short_cfg};
+                            EXPECT_LT(short_pool.MaxSingleRequestTokens(), 24);
+                        }
+                        // Reuse the materialized token-20 checkpoint with empty
+                        // history. These are scheduler tests, not state numerics.
+                        for (const std::string id : {"seed", "resume"}) {
+                            const std::int32_t prompt = id == "seed" ? 21 : 24;
+                            scheduler.SubmitRequests({RequestSpec{.request_id = id,
+                                                                  .tokens = std::vector<std::int32_t>(prompt, 1),
+                                                                  .max_new_tokens = 64}});
+                            std::int32_t after = 0;
+                            while (after < prompt) {
+                                const ExecutionPlan plan = scheduler.NextExecutionPlan();
+                                const ForwardBatch* batch = FindForwardBatch(plan);
+                                ASSERT_NE(batch, nullptr);
+                                ASSERT_EQ(batch->request_ids, (std::vector<std::string>{id}));
+                                if (after == 0) {
+                                    EXPECT_EQ(batch->extend_prefix_lens[0], reuse && id == "resume" ? 20 : 0);
+                                }
+                                after = batch->extend_prefix_lens[0] + batch->input_lengths[0];
+                                const auto& row = batch->block_tables.at("replay").at(0);
+                                const std::int32_t reserve = after == prompt ? width : 0;
+                                EXPECT_EQ(row.size(), static_cast<std::size_t>((after + reserve + grain - 1) / grain));
+                                for (std::size_t slot = 0; slot < row.size(); ++slot) {
+                                    EXPECT_EQ(row[slot] > 0, slot >= static_cast<std::size_t>(after / grain));
+                                }
+                                ExecutionEvent done;
+                                done.With(forward::ExtendResult{.request_id = id,
+                                                                .tokens = after == prompt
+                                                                              ? std::vector<std::int32_t>{100}
+                                                                              : std::vector<std::int32_t>{}});
+                                scheduler.Advance(std::move(done));
+                            }
+                            if (id == "resume") {
+                                std::int32_t endpoint = prompt;
+                                for (std::int32_t step = 0; step < 16; ++step) {
+                                    const ExecutionPlan plan = scheduler.NextExecutionPlan();
+                                    const ForwardBatch* batch = FindForwardBatch(plan);
+                                    ASSERT_NE(batch, nullptr) << "decode step " << step;
+                                    const auto& row = batch->block_tables.at("replay").at(0);
+                                    EXPECT_LE(RealPages(batch->block_tables.at("replay")).size(),
+                                              static_cast<std::size_t>(replay_bound));
+                                    // Every candidate and committed replay row
+                                    // after the prefill checkpoint remains backed.
+                                    for (std::int32_t pos = std::max(prompt, endpoint - 4); pos < endpoint + width;
+                                         ++pos) {
+                                        ASSERT_LT(static_cast<std::size_t>(pos / grain), row.size());
+                                        EXPECT_GT(row[pos / grain], 0);
+                                    }
+                                    const std::int32_t accepted = step % width + 1;
+                                    endpoint += accepted;
+                                    ExecutionEvent done;
+                                    done.With(forward::ExtendResult{
+                                        .request_id = id, .tokens = std::vector<std::int32_t>(accepted, 101 + step)});
+                                    done.With(forward::UpdateReserveNumTokens{
+                                        .request_id = id, .reserve_num_tokens_in_next_schedule_event = accepted});
+                                    scheduler.Advance(std::move(done));
+                                }
+                            }
+                            ExecutionEvent done;
+                            done.With(forward::Finish{.request_id = id});
+                            scheduler.Advance(std::move(done));
+                            scheduler.NextExecutionPlan();
+                            EXPECT_EQ(scheduler.AvailableLcmBlocks(), cfg.device_allocator.total_pages - 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(ReplayHistoryPrefillTest, RetainsExactDecodeBoundaryUntilConservativePublication) {
+    for (const bool buffered : {false, true}) {
+        for (const std::int32_t depth : {0, 1}) {
+            for (const bool lands_on_boundary : {false, true}) {
+                SCOPED_TRACE(::testing::Message()
+                             << "buffered=" << buffered << " depth=" << depth << " aligned=" << lands_on_boundary);
+                SchedulerConfig cfg{};
+                cfg.prefix_granularity = 128;
+                cfg.max_scheduled_tokens = 256;
+                cfg.max_batch_size = 1;
+                cfg.decode_input_tokens = 4;
+                cfg.overlap_schedule_depth = depth;
+                cfg.disable_l2_cache = true;
+                cfg.disable_prefix_cache = false;
+                cfg.device_allocator.total_pages = 64;
+                auto state =
+                    MakeGroup("state", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0);
+                state.max_state_lag_tokens = buffered ? 12 : 0;
+                cfg.cache_groups = {
+                    MakeGroup("full", 128, 64, CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::History, 0),
+                    state};
+                if (buffered) {
+                    auto replay = MakeGroup("replay", 8, 64, CacheGroupConfig::Retention::SlidingWindow,
+                                            CacheGroupFamily::History, 13);
+                    replay.replay_checkpoint_group = "state";
+                    cfg.cache_groups.push_back(replay);
+                }
+                Scheduler scheduler{cfg};
+                std::vector<std::int32_t> tokens(124, 1);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "parent", .tokens = tokens, .max_new_tokens = 64}});
+                auto feedback = [&](std::vector<std::int32_t> output, bool decode) {
+                    tokens.insert(tokens.end(), output.begin(), output.end());
+                    ExecutionEvent done;
+                    done.With(forward::ExtendResult{.request_id = "parent", .tokens = output});
+                    if (decode) {
+                        done.With(forward::UpdateReserveNumTokens{
+                            .request_id = "parent",
+                            .reserve_num_tokens_in_next_schedule_event = static_cast<std::int32_t>(output.size())});
+                    }
+                    scheduler.Advance(std::move(done));
+                };
+                ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                feedback({2}, false);
+                // Both routes end at 133, but only one actually writes S_128.
+                // The conservative frontier is endpoint-3, so publication of
+                // that boundary happens after its exact endpoint has passed.
+                for (const auto count : {lands_on_boundary ? 4 : 3, lands_on_boundary ? 1 : 2, 4}) {
+                    ASSERT_NE(FindForwardBatch(scheduler.NextExecutionPlan()), nullptr);
+                    feedback(std::vector<std::int32_t>(count, 3), true);
+                }
+                ExecutionEvent finish;
+                finish.With(forward::Finish{.request_id = "parent"});
+                scheduler.Advance(std::move(finish));
+                scheduler.NextExecutionPlan();
+                tokens.insert(tokens.end(), 11, 4);
+                scheduler.SubmitRequests({RequestSpec{.request_id = "resume", .tokens = tokens, .max_new_tokens = 16}});
+                const ExecutionPlan resumed = scheduler.NextExecutionPlan();
+                const ForwardBatch* batch = FindForwardBatch(resumed);
+                ASSERT_NE(batch, nullptr);
+                EXPECT_EQ(batch->extend_prefix_lens.at(0), lands_on_boundary ? 128 : 0);
+            }
+        }
+    }
+}
+
+TEST(MambaStateCheckpointCapacityTest, BudgetsDeclaredLagOnEveryRole) {
+    for (Role role : {Role::kFused, Role::kD, Role::kP}) {
+        for (std::int32_t lag : {0, 1, 4, 5, 12}) {
+            SCOPED_TRACE(::testing::Message() << "role=" << static_cast<int>(role) << " lag=" << lag);
+            SchedulerConfig cfg{};
+            cfg.role = role;
+            cfg.prefix_granularity = 4;
+            cfg.max_scheduled_tokens = 8;
+            cfg.max_batch_size = 1;
+            cfg.disable_l2_cache = true;
+            cfg.disable_prefix_cache = true;
+            // Restoring the zero-lag two-block bound must pay for lag on
+            // every role: a declared lookback also delays prefill reclaim.
+            cfg.device_allocator.total_pages = 3 + (lag + 3) / 4;
+            CacheGroupConfig state = MakeGroup("state", 4, cfg.device_allocator.total_pages,
+                                               CacheGroupConfig::Retention::FullHistory, CacheGroupFamily::State, 0);
+            state.transfer_policy = CacheTransferPolicy::LatestSnapshot;
+            state.max_state_lag_tokens = lag;
+            cfg.cache_groups = {state};
+            EXPECT_EQ(MakeSpecsFromConfig(cfg)[0].max_state_lag_tokens, lag);
+            Scheduler funded{cfg};
+            EXPECT_EQ(funded.MaxSingleRequestTokens(), role == Role::kP ? 8 : 5);
+            if (lag > 0) {
+                --cfg.device_allocator.total_pages;
+                --cfg.cache_groups[0].total_pages;
+                Scheduler short_one_block{cfg};
+                EXPECT_LT(short_one_block.MaxSingleRequestTokens(), funded.MaxSingleRequestTokens());
+            }
+        }
+    }
+}
+
 TEST(MambaStateCheckpointCapacityTest, CountsFirstChunkSuffixAndSubPageGrowth) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = 4;

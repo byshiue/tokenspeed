@@ -107,6 +107,7 @@ def kimi_recipe(
         else None
     )
     return KimiK3Recipe(
+        replay_buffer_capacity=None,
         server_args=SimpleNamespace(
             max_total_tokens=None,
             chunked_prefill_size=max_scheduled_tokens,

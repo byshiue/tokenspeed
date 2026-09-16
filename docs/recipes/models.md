@@ -285,12 +285,33 @@ Notes:
   processor. Preserve the checkpoint's
   `media_proc_cfg.in_patch_limit=65536`; silently falling back to K2.5's
   16384-patch default reduces OCR resolution.
-- KDA recurrent-state pages register for prefix-cache reuse only when a
-  prefill chunk ends exactly on a logical cache-page boundary. The engine floors
-  `--chunked-prefill-size` to the plan's page grain automatically (logged as
-  a warning when it adjusts); the page grain is budget-dependent (e.g. 1472
-  at 32k context, 1536 at 1M), so do not hand-tune the chunk size against a
-  hard-coded page value. Prefix hits are page-granular.
+- KDA prefix reuse requires an exactly materialized checkpoint at the prefix
+  boundary. A completing prefill can write both its last internal aligned
+  checkpoint and its final continuation state in one model forward. Prefix
+  identity is controlled by `--prefix-granularity` (128 for the K3 recipe),
+  not the memory budget or the KDA kernel's tile size.
+
+### Experimental buffered decode
+
+`--ssm-replay-buffer-capacity 8` enables the experimental KDA buffered path.
+It retains accepted K/U/decay history in LCM-owned cache groups and materializes
+recurrent state on capacity flush or at publishable aligned accepted endpoints.
+Ordinary decode and four-token EAGLE3 verification use the same implementation.
+Prefill keeps its exact-state scan; CUDA graphs and overlap need not be disabled.
+
+The initial dispatch supports NVIDIA Blackwell, BF16 activations, FP32 recurrent
+state, 128-dimensional KDA heads, and target width one or four. Capacity counts
+token entries per request/layer, including candidates; require
+`2 * target_width <= capacity <= 64`. It is fixed at startup and independent of
+prefix granularity. Omitting the option preserves current execution; zero is
+invalid. This option is distinct from `--enable-replay-ssm`, which targets Qwen
+GDN verification. Other model families reject a buffered capacity.
+
+Only fused serving is accepted. Agentic continuations reuse materialized prefix
+checkpoints; request-local history is neither prefix-shared nor transferred.
+PD/live-endpoint migration remains gated. No capacity is recommended for
+production yet: real-model accuracy and end-to-end EAGLE3 performance are still
+under validation. See the [implementation record](../design/kda-buffered-replay-progress.md).
 
 ### NVIDIA
 

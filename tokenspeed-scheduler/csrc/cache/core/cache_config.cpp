@@ -49,6 +49,16 @@ void CacheGroupConfig::Validate() const {
                                     "a State group keeps recurrent-state checkpoints and rides FullHistory "
                                     "retention; a sliding token window is a History group");
     }
+    if (max_state_lag_tokens < 0 || (family != CacheGroupFamily::State && max_state_lag_tokens != 0)) {
+        throw std::invalid_argument(where + "max_state_lag_tokens must be non-negative and zero for History groups");
+    }
+    if (replay_checkpoint_group && (replay_checkpoint_group->empty() || *replay_checkpoint_group == group_id ||
+                                    family != CacheGroupFamily::History || retention != Retention::SlidingWindow ||
+                                    transfer_policy != CacheTransferPolicy::Unspecified)) {
+        throw std::invalid_argument(where +
+                                    "replay_checkpoint_group requires another named State group, sliding "
+                                    "History and no transfer policy; materialized handoff is not integrated");
+    }
 }
 
 }  // namespace tokenspeed

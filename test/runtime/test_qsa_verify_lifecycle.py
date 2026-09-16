@@ -21,7 +21,8 @@
 """Check commit order, live acceptance and failure handling after eager or replay.
 
 Exercise execution modes with all consumers, then each optional consumer alone.
-The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
+The same runner entry covers width-one targets without a drafter. Fan-out spies
+record hook calls; separate checks exercise real consumers with no staged state.
 """
 
 from types import SimpleNamespace
@@ -35,9 +36,17 @@ from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
+    QSAIndexerBackend,
+)
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+    Qwen4ExpPLEBackend,
+)
+from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+from tokenspeed.runtime.layers.attention.backends.state.mamba import MambaAttnBackend
 
 
 def _runner(
@@ -72,18 +81,20 @@ def _runner(
             device="cpu",
             dtype=torch.bfloat16,
             is_draft=is_draft,
-            speculative_num_draft_tokens=4,
+            speculative_num_draft_tokens=4 if has_drafter else 1,
             component=lambda component_type: SimpleNamespace(
                 num_attention_heads=1, num_kv_heads=1, attn_tp_size=1, head_dim=8
             ),
         )
 
+    recurrent_backend = object.__new__(MambaAttnBackend)
+    recurrent_backend.commit_verified_state = commit_recurrent
     wrapper.attn_backend = Qwen4ExpBackend(
         config=config(False),
         attention_backend=(
             HybridLinearAttnBackend(
                 full_backend,
-                SimpleNamespace(commit_verified_state=commit_recurrent),
+                recurrent_backend,
                 [1, 3],
             )
             if "recurrent" in consumers
@@ -111,7 +122,7 @@ def _runner(
     wrapper.drafter = (
         SimpleNamespace(attn_backend=draft_backend) if has_drafter else None
     )
-    wrapper.max_tokens_per_req = 4
+    wrapper.max_tokens_per_req = 4 if has_drafter else 1
     wrapper.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
         seq_lens_buf=torch.tensor([10, 10, 1, 1], dtype=torch.int32),
@@ -129,7 +140,7 @@ def _runner(
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
     result = (
         torch.arange(16, dtype=torch.int32),
-        torch.tensor([3, 1, 99, 99], dtype=torch.int32),
+        torch.tensor([3 if has_drafter else 1, 1, 99, 99], dtype=torch.int32),
         None,
     )
 
@@ -137,7 +148,7 @@ def _runner(
         events.append("execute")
         if fail_forward:
             raise RuntimeError("forward failed")
-        return result[0][:8], result[1][:2], None
+        return result[0][: 2 * wrapper.max_tokens_per_req], result[1][:2], None
 
     wrapper._forward_func = lambda **kwargs: execute()
     wrapper.graphs = {4: SimpleNamespace(replay=execute)}
@@ -154,7 +165,7 @@ def _run(wrapper, mode):
         global_num_tokens=None,
         all_decode_or_idle=mode.is_decode(),
         capture_hidden_mode=None,
-        input_num_tokens=8,
+        input_num_tokens=2 * wrapper.max_tokens_per_req,
     )
     empty = torch.empty(0, dtype=torch.int32)
     result = wrapper(
@@ -181,6 +192,11 @@ def _run(wrapper, mode):
         (ForwardMode.MIXED, False, True, ("recurrent", "ple", "qsa"), True),
         (ForwardMode.EXTEND, False, True, ("recurrent", "ple", "qsa"), True),
         (ForwardMode.DECODE, False, False, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.DECODE, True, False, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.DECODE, False, False, ("recurrent",), False),
+        (ForwardMode.DECODE, True, False, ("recurrent",), False),
+        (ForwardMode.MIXED, False, False, ("recurrent", "ple", "qsa"), True),
+        (ForwardMode.EXTEND, False, False, ("recurrent", "ple", "qsa"), True),
         (ForwardMode.DECODE, False, True, ("recurrent",), True),
         (ForwardMode.DECODE, True, True, ("ple",), True),
         (ForwardMode.DECODE, True, True, ("qsa",), True),
@@ -205,21 +221,20 @@ def test_runner_commits_live_acceptance_once_after_execution(
         wrapper.attn_backend = wrapper.attn_backend.attention_backend
         wrapper.config.spec_algo = "DSPARK"
     _run(wrapper, mode)
+    accepted = [3, 1] if has_drafter else [1, 1]
     expected_qsa = (
-        [([3, 1], int(mode.is_mixed()))]
-        if has_drafter
-        and "qsa" in consumers
-        and mode in (ForwardMode.DECODE, ForwardMode.MIXED)
+        [(accepted, int(mode.is_mixed()))]
+        if "qsa" in consumers and mode in (ForwardMode.DECODE, ForwardMode.MIXED)
         else []
     )
     assert commits["qsa"] == expected_qsa
     assert events[:2] == ["metadata", "execute"]
     assert "draft_qsa" not in events
-    verifies_decode = has_drafter and mode.is_decode()
+    verifies_decode = mode.is_decode()
     expected_commits = []
     for consumer in ("recurrent", "ple"):
         active = verifies_decode and consumer in consumers
-        assert commits[consumer] == ([[3, 1]] if active else [])
+        assert commits[consumer] == ([accepted] if active else [])
         if active:
             expected_commits.append(consumer)
     if expected_qsa:
@@ -228,10 +243,11 @@ def test_runner_commits_live_acceptance_once_after_execution(
 
 
 @pytest.mark.parametrize("use_graph", [False, True])
-def test_failed_execution_does_not_commit_stale_staging(use_graph):
+@pytest.mark.parametrize("has_drafter", [False, True])
+def test_failed_execution_does_not_commit_stale_staging(use_graph, has_drafter):
     wrapper, events, commits = _runner(
         use_graph=use_graph,
-        has_drafter=True,
+        has_drafter=has_drafter,
         consumers=("recurrent", "ple", "qsa"),
         fail_forward=True,
     )
@@ -239,3 +255,24 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
         _run(wrapper, ForwardMode.DECODE)
     assert events == ["metadata", "execute"]
     assert commits == {"recurrent": [], "ple": [], "qsa": []}
+
+
+def test_unstaged_consumers_ignore_width_one_commit():
+    accepted = torch.ones(2, dtype=torch.int32)
+    for cls in (MambaAttnBackend, KdaAttnBackend, Qwen4ExpPLEBackend):
+        backend = object.__new__(cls)
+        backend._verify_commit_ctx = None
+        if cls is KdaAttnBackend:
+            backend._buffered_replay = None
+            # Both the ordinary GDN delegate and the existing KDA replay route
+            # must be no-ops when forward already wrote the final state.
+            backend._replay_active = False
+            backend.commit_verified_state(accepted)
+            backend._replay_active = True
+        backend.commit_verified_state(accepted)
+        assert backend._verify_commit_ctx is None
+    qsa = object.__new__(QSAIndexerBackend)
+    qsa._verify_state = None
+    qsa.commit_after_mtp_verify(accepted, num_extends=0)
+    qsa.commit_after_mtp_verify(accepted, num_extends=1)
+    assert accepted.tolist() == [1, 1]

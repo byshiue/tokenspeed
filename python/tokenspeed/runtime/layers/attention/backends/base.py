@@ -396,14 +396,34 @@ class AttentionBackend(CachePoolBinding, ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_verify(
         self, accepted_lengths: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Commit live acceptance after drafted decode/mixed execution or replay.
+        """Commit live acceptance after decode/mixed execution or graph replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
-        lead the mixed batch. Stateless backends inherit this no-op.
+        lead the mixed batch. Acceptance counts input tokens, including the
+        target input: ordinary decode passes one, without a separate commit
+        route or an added token. Only live rows are passed. Consumers that
+        already wrote their final state need no commit; stateless backends
+        inherit this no-op.
         """
+
+    def state_commit_validity(
+        self, bs: int, *, num_extends: int
+    ) -> torch.Tensor | None:
+        """Return device bool ``[local groups, live decode requests]`` validity.
+
+        Called after forward and accepted-state commit, before output D2H.
+        These are borrowed per-round flags: the executor snapshots them on the
+        execution stream before another refresh may overwrite them. None means
+        this consumer has no deferred-state validation for this round. Padding
+        is excluded; the control plane must agree across ranks before publishing
+        any successful result. This is not checkpoint provenance.
+        In a mixed batch the leading num_extends requests already wrote exact
+        prefill states, so the flags cover only the deferred decode suffix.
+        """
+        return None
 
     @contextmanager
     def record_pd_cache_step(

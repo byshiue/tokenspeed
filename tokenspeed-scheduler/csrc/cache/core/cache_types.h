@@ -80,6 +80,12 @@ struct CacheGroupSpec {
     // Tokens represented by one CacheBlock in this group. Required: must be
     // a positive divisor of the coordinator-wide prefix granularity.
     std::int32_t block_granularity{0};
+    // State-only retention lookback beyond the eager-state endpoint. Prefix
+    // reuse still requires one exactly materialized boundary snapshot.
+    std::int32_t max_state_lag_tokens{0};
+    // Dense group index of the state that seeds request-local replay history.
+    // Not a retention/geometry override; absent for reusable cache groups.
+    std::optional<std::uint32_t> replay_checkpoint_group{};
 };
 
 // Per-group input for one admission. prefix_hashes is the request's cumulative
@@ -100,6 +106,8 @@ struct GroupDemand {
     // earlier logical slots as null holes and materializes only this suffix.
     // Snapshot-state local prefill uses an absolute endpoint here; Decode-side
     // PD also uses it for latest snapshots and retained sliding tails.
+    // Replay prefill leaves history empty: the suffix begins at the endpoint's
+    // block, or at the end of the table for an aligned chunk with no reserve.
     std::int32_t materialized_suffix_start{-1};
     // Prefill publication streams newly completed history and snapshot-state
     // blocks to Host. Decode publication leaves this false so only sliding

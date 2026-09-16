@@ -247,6 +247,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             extras += (
                 (
                     CacheGroupSpec(
+                        replay_checkpoint_group=None,
+                        max_state_lag_tokens=0,
                         group_id=QWEN4_EXP_PLE_CACHE_GROUP,
                         retention="full_history",
                         sliding_window_tokens=None,
@@ -259,6 +261,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         qsa_compressed_fields, qsa_recent_fields = self._qsa_fields()
         if qsa_compressed_fields:
             qsa_spec = CacheGroupSpec(
+                replay_checkpoint_group=None,
+                max_state_lag_tokens=0,
                 group_id=QWEN4_EXP_QSA_CACHE_GROUP,
                 retention="full_history",
                 rows_per_page=QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
@@ -284,6 +288,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 ),
                 (
                     CacheGroupSpec(
+                        replay_checkpoint_group=None,
+                        max_state_lag_tokens=0,
                         group_id=QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
                         retention="sliding_window",
                         rows_per_page=QWEN4_EXP_QSA_RECENT_ROWS_PER_PAGE,

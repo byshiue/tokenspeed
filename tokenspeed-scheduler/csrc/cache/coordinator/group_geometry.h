@@ -69,7 +69,8 @@ public:
             .num_blocks = num_blocks,
             .suffix_start = demand.materialized_suffix_start,
             .table_blocks_after = logical_blocks,
-            .available_tokens_after = logical_blocks * block_granularity_ - demand.num_tokens,
+            .available_tokens_after = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(logical_blocks) * block_granularity_ - demand.num_tokens),
         };
     }
 
@@ -84,7 +85,7 @@ public:
         };
     }
 
-    // Pages [0, result) of the table have fully expired under the group's
+    // Blocks [0, result) of the table have fully expired under the group's
     // retention policy at this progress; kFull never expires. This is where
     // the sliding-window/state token policy meets page arithmetic, so it
     // lives here and not in the (token-free) allocator.
@@ -97,16 +98,21 @@ public:
                 window = spec.sliding_window;
                 break;
             case AttnKind::kMambaState:
-                // Keep exactly the live state page plus its snapshot.
+                // Matching still needs one boundary snapshot. A live request
+                // can additionally depend on a lagging materialized state.
                 window = kMambaStateWindow;
                 break;
             default:
                 FatalCheck(false, "unknown AttnKind in retention policy");
         }
         _assert(window > 0, "retention window must be > 0");
-        const std::int32_t skipped = num_computed_tokens - window + 1;
+        const std::int64_t lag = spec.kind == AttnKind::kMambaState ? spec.max_state_lag_tokens : 0;
+        // State at endpoint c occupies (c - 1) / grain, including when c is
+        // aligned. Widen before subtraction: the configured lag may be int32
+        // max, and early request progress can be smaller than that lag.
+        const std::int64_t skipped = static_cast<std::int64_t>(num_computed_tokens) - window + 1 - lag;
         // Only fully-slid-out pages expire.
-        return skipped <= 0 ? 0 : skipped / block_granularity_;
+        return skipped <= 0 ? 0 : static_cast<std::int32_t>(skipped / block_granularity_);
     }
 
     static constexpr std::int32_t kMambaStateWindow = 2;
@@ -123,10 +129,16 @@ private:
                 "sparse suffix materialization requires a positive extent");
         const std::int64_t extent = static_cast<std::int64_t>(demand.num_tokens) + demand.reserve_tokens;
         _assert(extent <= std::numeric_limits<std::int32_t>::max(), "sparse suffix extent exceeds int32 range");
-        const std::int32_t last_block = static_cast<std::int32_t>((extent - 1) / block_granularity_);
-        _assert(demand.materialized_suffix_start <= last_block,
+        // An aligned, empty suffix still advances absolute table positions.
+        // Do not round up this limit: an unbacked partial block would report
+        // writable AvailableTokens even though its table entry is a hole.
+        _assert(demand.materialized_suffix_start <= extent / block_granularity_,
                 "materialized suffix starts beyond the requested extent");
-        return last_block - demand.materialized_suffix_start + 1;
+        const std::int32_t logical_blocks =
+            static_cast<std::int32_t>((extent + block_granularity_ - 1) / block_granularity_);
+        _assert(demand.materialized_suffix_start < logical_blocks || demand.reserve_tokens == 0,
+                "empty sparse suffix cannot reserve unbacked tokens");
+        return logical_blocks - demand.materialized_suffix_start;
     }
 
     std::int32_t block_granularity_;

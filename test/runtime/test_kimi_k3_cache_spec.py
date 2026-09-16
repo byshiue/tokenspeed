@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import replace
 
 _TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 from test.runtime.conftest import TP8_PAGE_SET_BYTES, kimi_tp8_layout
 
+import pytest
 import torch
 
 
@@ -223,6 +225,30 @@ def test_lcm_parent_demand_uses_per_group_packing() -> None:
     assert admitted >= 131_072
     assert recipe.parents_needed(layout, admitted) <= 98
     assert recipe.token_capacity(layout, 97) < admitted
+
+
+@pytest.mark.parametrize("lag,extra_blocks", [(0, 0), (60, 1), (128, 1), (257, 3)])
+def test_kda_lag_budget_keeps_the_existing_prefill_working_set(
+    monkeypatch, lag, extra_blocks
+):
+    recipe, _, layout = kimi_tp8_layout(max_bs=3, max_scheduled_tokens=8_192)
+    baseline = recipe.parents_needed(layout, 131_072)
+    groups = recipe.groups()
+    assert all(spec.max_state_lag_tokens == 0 for spec, _ in groups)
+    monkeypatch.setattr(
+        recipe,
+        "groups",
+        lambda: tuple(
+            (
+                (replace(spec, max_state_lag_tokens=lag), fields)
+                if spec.family == "state"
+                else (spec, fields)
+            )
+            for spec, fields in groups
+        ),
+    )
+    # Three requests, three state groups, one state block per LCM parent.
+    assert recipe.parents_needed(layout, 131_072) == baseline + 9 * extra_blocks
 
 
 def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:

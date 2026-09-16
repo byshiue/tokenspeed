@@ -192,6 +192,10 @@ def prepare_cache_setup(
     recipe = _RECIPES.get(family)
     if recipe is None:
         raise ValueError(f"unsupported cache model family: {family}")
+    capacity = getattr(server_args, "ssm_replay_buffer_capacity", None)
+    if capacity is not None and family != "kimi_k3":
+        raise ValueError("--ssm-replay-buffer-capacity is supported only by Kimi-K3")
+    recipe_options = {"replay_buffer_capacity": capacity} if family == "kimi_k3" else {}
     return recipe(
         server_args=server_args,
         model_config=model_config,
@@ -201,4 +205,5 @@ def prepare_cache_setup(
         cache_budget_bytes=cache_budget_bytes,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
+        **recipe_options,
     ).setup()

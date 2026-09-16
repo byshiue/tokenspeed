@@ -199,7 +199,9 @@ something the idle refresh cannot express:
 * **DeepseekV4**: the packed `tokens_per_req` row machinery and its bespoke
   multi-group metadata build;
 * **Mamba** (`MambaAttnBackend`): the warmup kernels need the arange
-  query-start-loc, which the idle refresh deliberately zeroes;
+  query-start-loc, which the idle refresh deliberately zeroes. KDA delegates
+  legacy pools here; buffered pools use the ordinary idle refresh because
+  their recurrence consumes endpoint/width buffers, not query boundaries;
 * **Inkling**: conv-state seeding (paged conv reads `pos = seq_len - 1`, so
   capture must seed real lengths);
 * **HybridLinearAttnBackend / Qwen4ExpBackend / MSAHybrid**: pure fan-out to
@@ -465,9 +467,16 @@ recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
 verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
-The runner calls `commit_speculative_state_after_verify` once on the target
-after drafted decode/mixed execution or graph replay, with live acceptance
-and `num_extends`. Since forward mode is derived from the extend count,
+The runner calls `commit_state_after_verify` once on the target after
+decode/mixed execution or graph replay, with live acceptance and `num_extends`.
+This includes width-one decode without a drafter: acceptance already counts
+the target input and must not be incremented. The hook runs after successful
+execution and after replay outputs are sliced back to the live batch; failed
+forwards, pure prefill and idle execution do not commit. A consumer that wrote
+its final state during forward has no pending work and returns without a GPU
+operation. This lets a buffered recurrent consumer defer its commit without
+adding a second ordinary-decode path.
+Since forward mode is derived from the extend count,
 zero means decode at this entry. Hybrid commits GDN/KDA only then; the
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
 decode/mixed, excluding leading extends from QSA acceptance. Mixed rounds
@@ -475,6 +484,171 @@ retain PLE's direct state writes. Each consumer commits once; stateless
 backends inherit a no-op.
 Transient verify storage belongs to these consumers; LCM remains the owner
 of the persistent request caches.
+
+The experimental `KDAReplayMetadata` follows the same ownership split. It
+allocates raw table stacks and position scratch once at full runtime batch
+capacity, with cached per-bs views; all layers in a state/history group share
+one position record. The shared `GroupTableStacks` fill runs at ratio one,
+preserving raw block IDs, clearing padding and column tails. This assigns no
+row layout to recurrent state. Live refresh rejects missing, oversized or
+non-unit-column-stride tables instead of allocating a contiguous replacement.
+Refresh writes one endpoint/width pair for all groups; width one and verify
+use the same operation. Position preparation and full-range backing validation
+run once per group before any recurrence reads or stores, not once per layer.
+The tables and positions must remain unchanged through all layer consumers.
+
+All local layers in a group commit the same checkpoint stamp in one launch,
+after every layer's data stores. Only under this ordering invariant may the
+next prepare read one representative local layer's stamp. A PP view enumerates
+its own local layers; a pool replacement creates a new metadata owner and
+requires recapture. Preparation reads only request-local stamps, which are
+zeroed on fresh allocation and excluded from transfer. State payload access is
+fenced at each layer's first consumption, before the workspace's cached views
+are used. A false validity flag suppresses GPU stores but does not itself
+reject a scheduler result or grant checkpoint provenance. Buffered KDA is an
+explicit experimental startup option, pending full-model validation. The executor's
+rank-agreed result check supplies failure feedback; this metadata owner is not
+an alternate serving path.
+
+The experimental `KDAReplayWorkspace` composes that metadata with one
+width-parameterized conv/gate/recurrent forward. Conv preparation validates
+the current endpoint's source and every possible acceptance destination once
+per group. The four-tap conv producer consumes BF16 inputs and captures raw
+candidates while computing conv outputs. Independent conv and gate CTAs share
+one launch and preallocated outputs; recurrence follows on the same stream.
+The gate CTAs are issued first to reduce the launch tail. There is no cross-CTA
+communication or producer stream/event state. The workspace retains raw
+candidates per local layer but shares conv/gate/output scratch across layers.
+Each layer must consume its output before the following layer reuses it.
+These are per-round tensors, not private persistent request state.
+
+Multi-token windows keep separate representations for verification and accepted
+history. Verify rounds the conv/gate producers to BF16. History consumes
+replay-order FP32 K, pre-SiLU V, and log-decay; keeping V before SiLU preserves
+the replay's fused projection subtraction. The conv producer writes the extra
+K/V scratch in the same launch. With at least 16 packed token rows, gate CTAs
+compute both the raw verify dot and the replay dot with bias as the initial MMA
+accumulator. Adding bias to the rounded raw dot is not equivalent. Smaller
+row counts retain the separate scalar history-gate launch: fusing that reduction
+with MMA changes its FP32 rounding. Both use accepted replay's gate tiling.
+The scratch is shared across layers and included in the recipe budget, not
+added to persistent request state.
+
+Two register-local recurrence chains start from one reconstructed committed
+state. Their independent updates are interleaved per token to expose instruction
+overlap; each chain retains its own operation order and only the history chain
+supplies the FP32 K/U/D entries. The static maximum window is unrolled, with
+live width guarding every token's reads and stores. There is no second
+reconstruction or post-acceptance replay. Width one retains ordinary decode's
+BF16 producer/state arithmetic through the same
+forward and commit. The static scratch dtype follows the maximum window and
+is included in recipe accounting before graph capture. Native verification
+outputs remain BF16; changing the producer precision does not change weights,
+sampling or acceptance rules. Numerical and full-model performance gates are
+required separately.
+
+Blackwell 128-key multi-token target verify and buffered verify share one explicit
+arithmetic implementation. Q/K squared norms, state-key projection and state-Q
+output use a balanced tree that pairs adjacent logical keys at each level,
+regardless of tile or warp layout. Products and additions round separately;
+normalization uses round-to-nearest square root/division, and Q is scaled before
+the output dot. State decay rounds before the correction FMA. Every value row
+follows the same rule. Gluon places four adjacent keys in each lane, performs
+two local pair levels and five warp-shuffle levels with explicit rounded adds.
+This preserves the logical tree without repeated layout conversions. No
+global compiler optimization is disabled. Other head dimensions/vendors and
+ordinary decode retain their existing arithmetic.
+
+This is a new numerical contract, not bitwise emulation of an old compiler.
+Verification must retain a frozen original as an independent quality/performance
+reference, alongside shared-arithmetic unbuffered and buffered execution.
+Equality of the new pair isolates replay; it does not establish unchanged
+generation, acceptance rate, AIME score or speed relative to the frozen original.
+
+After all local layer forwards finish, acceptance preparation selects endpoint
+materialization at aligned accepted endpoints or an explicit GPU handoff mask.
+It validates counts before any commit stores. One GPU launch commits accepted
+conv windows across layers; another materializes the selected recurrent
+endpoints, followed by the shared group stamp commits. It handles
+width one and verify identically; rejected candidates do not enter the conv
+window. The recipe reserves candidates, shared scratch, descriptors and raw
+table/position buffers at full runtime batch capacity before sizing the arena.
+The workspace reports the same tensor-byte total, excluding LCM fields and
+CUDA stream/event implementation overhead. Binding a different pool requires
+a new workspace and recapture; old descriptors must not survive it.
+
+Endpoint materialization shares the forward's FP32 history reconstruction.
+Gluon layouts batch paged history loads while keeping the update ordered by
+token: round the state decay, then apply the correction FMA. Aggregating decay
+products and outer products would change rounding even with identical K/U/D.
+No TF32 operands or tensor-core reconstruction are used. This preserves the
+accepted replay update order without changing cache ownership, flush decisions
+or endpoint publication.
+After a capacity flush its source is `S_e`; otherwise it starts from `S_c`.
+It consumes only accepted rows through `e+a`, never rejected candidates. A
+zero-acceptance handoff may still need to materialize old committed history.
+No additional state store is needed when the source is already exact. The
+per-group `materialized` flag records a required write, not its completion;
+stamp commit may consume it only after all layer stores finish. The caller's
+handoff mask grants neither writable ownership nor publication provenance.
+The endpoint writer keeps a bounded persistent grid for empty rounds. For
+multi-iteration grids, its static stride is coprime to the request/value-tile
+cycle, avoiding programs that repeatedly visit only inactive request rows.
+This depends only on batch/field geometry, never a host read of device flags;
+the operation sequence, reconstruction arithmetic and cache fences are unchanged.
+
+Quiescent endpoint materialization uses `materialize_current`: the caller
+supplies fresh tables and exact accepted endpoints for a live-only batch,
+which may differ from the last forward's requests and order. The shared
+metadata/endpoint/stamp operations take explicit `for_handoff=True`; ordinary
+forward and commit pass false. Handoff has width and acceptance zero, validates
+only committed history `[c,e)` and the exact state destination, and never plans
+a capacity flush. There is no forward to execute such a flush, so treating its
+decision as completed would read stale `S_e` instead of reconstructing `S_c`.
+Missing future candidate pages do not prevent handoff. Conv is already at `e`
+and is not rewritten; cached raw payload and conv candidate indices are ignored.
+All local payload fences precede the batched state writer, followed by stamps.
+An already-exact endpoint is a no-op. The owner must preserve exclusive page
+ownership through completion and check the returned live validity before any
+handoff or reuse. Scheduler-triggered lifecycle integration remains pending;
+this operation alone does not authorize a transfer or release.
+
+The KDA backend now dispatches buffered decode for an explicitly planned replay
+pool. Width one and verify use the same refresh, forward and accepted commit;
+the persistent workspace exists before capture, with no legacy verify tape.
+Its decode metadata slot exposes cached group views to the graph pointer guard.
+Normal commit uses a preallocated false handoff mask and materializes aligned
+accepted endpoints automatically. Refresh arms one commit; a repeated commit
+is rejected, and validity is not exposed while that commit is still pending.
+The executor copies live decode-suffix group-validity flags
+with its outputs; CPU rank agreement rejects a failed round before scheduler
+feedback (see `event-loop.md`). Pure prefill retains its existing exact-state
+path and reports no deferred commit flags. In a mixed batch, KDA constructs
+prefill metadata only for the leading extend requests and refreshes the decode
+suffix through the same buffered entry as pure decode. The CPU-known extend
+token count slices token-leading producer views within each layer; static
+weights are shared. Prefill scans only its exact input states, decode reads
+checkpoint plus accepted history, and their outputs are concatenated in the
+original token order, with any projection padding zeroed. This remains one
+model forward, not two scheduled requests. Accepted commit ignores leading
+prefill counts; returned validity is `[local groups, live decode requests]`.
+The hybrid wrapper delegates the common hook to its linear child; legacy
+Mamba/GDN consumers retain their existing pure-decode-only deferred commit.
+Mixed composition adds no persistent workspace allocation and does not alter
+ordinary decode capture. A subsequent pure refresh clears the mixed split.
+
+Prefill's exact-input contract still belongs to the cache owner. In particular,
+inserting quiescent materialization after admission has reshaped or zeroed
+history pages is too late. No such lifecycle shortcut is installed here, and
+an eventual handoff must preserve its failure flags before another metadata
+refresh can overwrite them. Current agentic requests resume through immutable
+prefix checkpoints, and retraction restores reusable checkpoints then recomputes
+the suffix, as before; neither path consumes a lagging live endpoint directly.
+The experimental capacity option binds replay fields before allocation and
+resolves the registered Blackwell recurrence for its producer dtype once. Unsupported
+capacity, width, geometry or hardware fails startup rather than falling back.
+No default capacity is chosen. PD and direct live-endpoint transfer remain
+gated; full-model correctness and Eagle3 no-regression are still required.
 
 QSA verify staging and PLE commit-row buffers are preallocated for full
 decode capacity and sliced per batch. Cache recipes reserve their bytes
@@ -717,8 +891,9 @@ mapping remains a separate consumer of the shared mapping helpers
 * `test/runtime/test_qsa_backend.py` — independent QSA raw-group metadata,
   target-only verify workspace, and live cache writes across eager execution
   and CUDA graph replay; `test_qsa_verify_lifecycle.py` — the Qwen4-Exp root
-  commits GDN/PLE on decode and QSA on decode/mixed, using real acceptance
-  rows once after execution, including PLE without GDN and failure cases.
+  commits GDN/PLE on decode and QSA on decode/mixed, using live acceptance
+  rows once after execution. It covers width-one/no-drafter and speculative
+  fan-out, PLE without GDN, failure ordering and real unstaged-consumer no-ops.
 * `test/runtime/test_qwen4_backend_composition.py` — local consumer selection,
   workspace accounting, draft hooks through the attention composite and one
   PD cache step per layer.

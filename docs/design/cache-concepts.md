@@ -265,6 +265,221 @@ disappear from the GPU budget. (Platforms without the replay kernels fall
 back to the dense `max_bs * (draft_tokens + 1)` per-position state
 workspace, reserved the same way.)
 
+#### Live-state retention lag
+
+`CacheGroupSpec.max_state_lag_tokens` is a non-negative token count, not a
+geometry or prefix-matching grain. It bounds how far a live state consumer may
+read behind accepted progress. History groups must declare zero. Current state
+recipes also declare zero: they still materialize the accepted endpoint each
+round. The field alone does not enable buffered replay.
+
+For a state-group span `G`, conservative scheduler progress `p`, and declared
+lag `d`, only block-table slots below `max(0, floor((p - d - 1) / G))` may
+expire. The `-1` is necessary because state at endpoint `c` occupies slot
+`(c - 1) / G`, including when `c` is aligned. Admission's reclaim credit,
+victim planning, in-place-reserve checks and actual reclamation all use
+`GroupGeometry::ExpiredBlocksAt`; none may independently assume zero lag.
+Overlap protection still comes from conservative scheduler progress and its
+existing reservation horizon, not from silently enlarging `d`.
+
+Matching remains the window-2, single-materialized-snapshot policy. A prefix
+hit initializes a new consumer at that snapshot; it does not need the old
+request's replay history. A larger retention lag grants no publication or
+transfer provenance. Buffered execution must provide that separate contract
+before dispatch is enabled (see the [buffered replay plan](kda-buffered-replay-plan.md)).
+
+Capacity bounds conservatively add `ceil(d / G)` state blocks per live request
+to the existing eager-state working set, before LCM packing. Kimi-K3 keeps its
+larger prefill input/checkpoint/tail/growth budget; the lag allowance is not a
+replacement for it. The C++ single-request bound includes the same extra
+lookback on every role: a declared lag also delays prefill reclamation, even
+though current prefill-only consumers have no need to declare one.
+This is reserved headroom, not an assertion that every allowance block is live
+at the same time, nor a measurement of replay-history memory.
+
+The Python spec and parameterized scheduler binding require an explicit lag,
+including zero, and the bridge carries it unchanged. Serialized group specs
+carry it too; peers missing the field fail contract decoding rather than
+silently guessing eager-state retention. Rebuild the scheduler extension
+together with runtime updates to this contract.
+
+#### Request-local replay history
+
+A sliding, per-token history group may declare `replay_checkpoint_group`, the
+ID of a state group in the same cache plan. This says that an exact checkpoint
+can seed an empty history on resume. It does not say that the old request's
+history is reusable. Ordinary groups explicitly declare `None`.
+
+The dependency is validated before recipe packing, in the runtime contract,
+and at scheduler construction. It must name a state group, regardless of
+declaration order. The history window `W` must exceed that state's maximum lag
+`d`: the ordinary sliding-retention rule then keeps every input in `[p-d, p)`.
+The scheduler still reserves the current candidate window and overlap horizon
+through its normal token demand. No backend-private allocator or request table
+is introduced.
+
+Reuse and retention deliberately differ here. Prefix matching uses the existing
+zero-lookback window matcher, so history contributes absolute-position null
+holes up to the boundary established by reusable groups. Its state dependency
+must still match an exact checkpoint. Device hits and Host extensions both
+start with no history entries; subsequent suffix blocks are allocated for the
+new request, even when another live request has the same prefix. Live retention
+continues to use the declared `W`, not matching's zero lookback.
+
+These rows are excluded from prefix publication, canonicalization, boundary
+residency events and Host writeback. Direct Host publication is rejected. They
+are freed with the request or reclaimed through the ordinary sliding policy.
+History ownership grants no materialization provenance to its checkpoint.
+
+Local prefill seeds empty replay history from its exact output checkpoint.
+Its replay demand uses the absolute endpoint, with a sparse suffix beginning
+at `floor(after / block_granularity)`. An intermediate chunk ends aligned and
+reserves no decode tokens, so its table advances using holes only. A completing
+chunk allocates the blocks covering `[after, after + decode_width)`, including
+any partial starting block; earlier rows in that block remain uninitialized.
+Consumers must use the initialized-history endpoint, not assume every row in
+an allocated block is valid. Ordinary sliding attention still allocates the
+whole prefill extent because its kernels actually write those rows.
+
+An empty sparse suffix is legal only at an aligned extent with no reserve.
+Otherwise the table would advertise writable tail capacity in a null block.
+Allocation planning and commit share this check; failed admission does not
+advance the table. Decode continues through normal dense admission and sliding
+reclamation.
+
+Replay capacity excludes prefill chunk rows, but still includes the retained
+window, candidates and overlap. Decode's conservative reclamation frontier is
+`TokenSize() - decode_width`, up to `decode_width - 1` behind the accepted
+endpoint; this guard costs storage even without overlap. Both the Python group
+budget and C++ startup bound include it, plus partial-block rounding. Logical
+table width remains absolute and is not reduced to the resident window.
+
+Exact state publication has a separate watermark. An accepted endpoint can
+reach an aligned boundary before the conservative hash frontier reaches it.
+Decode admission must retain that materialization evidence in `CacheProgress`
+until publication catches up; examining only the latest endpoint loses it once
+decode advances past the boundary. Update the watermark only for a known exact
+endpoint, never by rounding a crossed or merely allocated position down.
+
+The experimental Kimi-K3 startup capacity adds the fields below to the recipe
+before memory planning; omitting it preserves the existing layout. Its KDA
+backend consumes them through unified
+buffered decode and accepted-endpoint commit, with rank-agreed failure feedback.
+Mixed batches compose exact-state prefill with the same buffered decode suffix.
+Direct live-endpoint handoffs remain gated. A prefill consumer must receive an exact snapshot before cache admission
+can discard its history; runtime dispatch cannot recover already-recycled rows.
+Current agentic continuations are new requests matched against immutable prefix
+snapshots, not in-place decode-to-prefill transitions. Retraction retains its
+existing prefix-checkpoint writeback and suffix recomputation; it does not export
+live replay state. PD rejects replay-history declarations and wire contracts until materialized
+handoff is implemented. This explicit gate must not be removed by giving the
+history a `full_suffix` transfer policy: there may be no initialized prefill
+rows to transfer, and a lagging checkpoint is not the accepted endpoint.
+
+#### Experimental KDA replay fields
+
+Each KDA state group has a request-local history group containing FP32 normalized
+K, correction U and multiplicative per-channel decay. Blocks currently hold
+eight tokens. This is a physical packing choice, not the logical capacity `L`,
+maximum execution width `T`, prefix grain, or scan-kernel tile size. The group
+declares window `L` and its state group declares lag `L-T`, with `L >= 2*T`.
+The ordinary group budget includes candidate and overlap protection; these are
+additional physical rows, not permission to exceed the logical capacity.
+
+One int64 checkpoint stamp accompanies each history row. Only the last accepted
+input row is stamped, with materialized position `c+1`; zero means empty history
+seeded at an exact endpoint. The stamps are per-layer cache fields so pipeline
+narrowing, layer fences and page zeroing have the same owner as K/U/decay.
+For the full Kimi-K3 layout they occupy the spare 24th plane. Putting them beside
+K/U/decay would reduce TP8 history packing from six blocks per parent to five.
+Truncated models without a spare MLA/draft plane put each stamp beside its own
+layer's K/U/decay. Their packing uses the smallest whole-MLA plane width whose
+element-aligned strides fit the padding budget, rather than taking the potentially
+huge LCM of history-plus-stamp payload bytes. No new plane is introduced.
+For example, a 20-layer TP8 FP8-MLA model without draft layers keeps five planes,
+with MLA/history packing of 13/6 blocks per LCM parent instead of failing startup.
+The planner preserves exact MLA page strides. For the full model, TP8/16 parent
+size is unchanged, while smaller TP widths round the parent to whole MLA and
+history blocks.
+Pool accessors expose zero-copy typed views and allocate no private history.
+Replay-dependent groups are not attention KV and do not get paged-attention
+router leaves.
+
+The unregistered GPU position primitives resolve the row at `e-1` through the
+current raw block table, derive `h=e-c`, and request a capacity flush when
+`h+2*T > L`. They fill caller-owned output buffers without host readback.
+Commit stamps `e+a-1` after state/history stores, where `a` includes the target
+input. A flush with zero acceptance must restamp `e-1` with `e+1`; otherwise the
+next round would still see the old checkpoint. Idle rows and rejected candidates
+do not mutate stamps. Invalid positions/acceptance clear the per-row validity
+output and suppress stores; consumers must enforce that result before publishing.
+
+Zero or missing stamps are **not** a recovery mechanism for lost live history.
+They are valid seeds only after exact-endpoint materialization and fresh-page
+zeroing. The runtime still needs to enforce this transition, integrate stable
+batch outputs and paged recurrence dispatch, and order materialization before publication,
+incremental prefill, transfer and retraction. A capacity-flush decision alone
+does not establish prefix-publication provenance.
+
+The registered recurrence consumes the arena's strided fields
+and current raw history/state tables. It reads `S_c` from slot `(c-1)/G` (or
+implicit zero state at `c=0`), reconstructs `[c,e)`, and writes candidates at
+absolute positions `[e,e+width)`. LCM owns physical reuse: there is no dense
+per-request ring allocation or modulo-capacity placement. A capacity flush
+writes only the reconstructed, pre-candidate state `S_e`, in slot `(e-1)/G`;
+otherwise it writes no full state. The destination must be request-writable,
+never an immutable published snapshot.
+
+A separate GPU backing check validates the whole read/write range before any
+recurrence stores. Failure clears per-row validity and suppresses that row's
+state, history and output writes. Position prepare, backing check, recurrence
+and stamp commit run in the same order in eager execution and CUDA graphs.
+The extra launch is deliberate correctness groundwork, not a tuned dispatch
+decision. Startup resolves the native-BF16 Blackwell implementation once, with
+no legacy fallback; the per-layer loop calls that implementation directly.
+This replaces the earlier unregistered dense-ring GPU prototype;
+the CPU recurrence reference remains independent.
+
+The caller must preserve the allocator's exclusive ownership across all live
+readers and writers. Different cache groups cannot claim the same LCM parent:
+their field views overlay the same physical bytes even when their child ids
+differ. Positive block ids and valid tensor bounds do not establish ownership.
+No kernel in this prototype grants allocation, prefix-publication, transfer or
+in-flight-reuse permission.
+
+The experimental conv pipeline reads the short window at accepted endpoint
+`e`, not lagging recurrent checkpoint `c`. It stages only this round's raw
+inputs and commits the accepted suffix into slot `(e+a-1)/G`, for `a>0`.
+Zero acceptance leaves the window unchanged; a recurrent capacity flush can
+still advance its checkpoint stamp. Convolution backing is validated for
+every possible acceptance destination before any layer writes.
+
+An unpublished live state block may therefore hold a conv window at `e` and
+recurrent state at `c`. It represents the endpoint only together with the
+accepted replay history. It is not an exact snapshot for prefill, prefix reuse
+or transfer until recurrent endpoint materialization completes. Committing a
+conv window or stamp alone does not change that rule. Published snapshots
+remain immutable, and all destinations must be request-writable.
+
+An experimental batched endpoint writer now reconstructs the accepted state
+using the same FP32 history operation as forward. A post-acceptance decision
+selects the actual aligned endpoint, not every boundary crossed by a verify
+window, or a caller's explicit handoff mask. Prefix identity uses the arena's
+`prefix_granularity`; state addressing still uses the state group's span.
+The writer starts from the capacity-flushed state when present and stops at
+`e+a`. A following group stamp commit records that exact endpoint. GPU flags
+describe this ordered work; they do not publish a scheduler result or authorize
+reuse, transfer or reclamation. Those owner-level transitions remain gated.
+
+A quiescent endpoint operation refreshes its own request tables and positions;
+it cannot reuse the most recent forward's batch or its planned flush flags.
+It reconstructs only `[c,e)`, leaves the accepted conv window at `e` intact,
+and stamps `e` after all layer stores. It does not require candidate capacity,
+which may be unavailable when the owner needs to reclaim pages. This is an
+execution primitive, not a new cache-transfer policy: the owner must still
+retain the source/destination through completion and reject invalid backing
+before handing off the result.
+
 ### Python runtime: maps logical to physical, perceives as little as possible
 
 The Python side owns the translation from the scheduler's cache-block tables
@@ -472,8 +687,9 @@ The conversion is `GroupGeometry` in the coordinator layer:
   bookkeeping values the manager stores verbatim; the manager executes the
   plan without deriving anything.
 * `ExpiredBlocksAt(spec, num_computed_tokens)` is the retention *policy*
-  (full attention never expires; SWA and Mamba-at-window-2 slide out whole
-  pages); the manager only *executes* the resulting block count. This is
+  (full attention never expires; SWA and state groups retire whole blocks,
+  with state's window-2 baseline extended by its declared live-state lag);
+  the manager only *executes* the resulting block count. This is
   what dissolved the old `SwaManager`/`MambaStateManager` subclasses.
 
 Where reclaim needs to know whether a block is still cached, it takes the

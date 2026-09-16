@@ -171,6 +171,8 @@ class DeepseekV41Recipe(CacheRecipe):
         return tuple(
             (
                 CacheGroupSpec(
+                    max_state_lag_tokens=0,
+                    replay_checkpoint_group=None,
                     group_id=gid,
                     retention=(
                         "full_history" if windows[gid] is None else "sliding_window"

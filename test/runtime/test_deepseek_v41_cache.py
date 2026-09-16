@@ -831,6 +831,8 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     layout = _layout(recipe)
     assert layout.lcm_block_bytes == 1_382_400 and len(layout.fields) == 51
     specs = {spec.group_id: spec for spec, _ in recipe.groups()}
+    assert all(spec.max_state_lag_tokens == 0 for spec in specs.values())
+    assert all(spec.replay_checkpoint_group is None for spec in specs.values())
     horizon = (1 + overlap_depth) * verify_width
     assert specs[SWA].sliding_window_tokens == 128 + horizon
     assert specs[TAIL].sliding_window_tokens == 2 + horizon

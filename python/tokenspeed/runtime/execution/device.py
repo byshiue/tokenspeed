@@ -138,6 +138,8 @@ class DeviceSpecs:
         cache_state_group_ids: Group ids of the state-family cache groups,
             for the per-group page-usage debug line. Empty for pools with no
             recurrent/conv state.
+        state_commit_group_count: Local buffered groups that must return
+            post-commit validity. Zero on a pipeline stage with no such layers.
         num_host_pages: The L2 host tier's page count (incl. the null page),
             sized here because it depends on the pools' transfer layout; 0
             without ``--enable-kvstore``. The scheduler is configured from it.
@@ -153,6 +155,8 @@ class DeviceSpecs:
     supports_disaggregation: bool
     supports_pd_layerwise_finalization: bool
     cache_state_group_ids: tuple[str, ...]
+    # Number of local replay groups whose post-commit flags must be returned.
+    state_commit_group_count: int
     num_host_pages: int
 
 
@@ -822,6 +826,15 @@ def build_device_side(
             str(spec.group_id)
             for spec in token_to_kv_pool.arena.cache_group_specs
             if spec.family == "state"
+        ),
+        state_commit_group_count=len(
+            {
+                spec.group_id
+                for spec in token_to_kv_pool.arena.cache_group_specs
+                if spec.replay_checkpoint_group is not None
+                and spec.replay_checkpoint_group
+                in getattr(token_to_kv_pool, "state_group_by_layer", {}).values()
+            }
         ),
         num_host_pages=(
             l2_cache_executor.num_host_pages if l2_cache_executor is not None else 0

@@ -169,7 +169,19 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             return pages;
         };
         std::int64_t child_pages = 0;
-        if (coordinator_.GroupIsPrefixClosed(i)) {
+        if (group.replay_checkpoint_group.has_value()) {
+            // Prefill seeds empty replay history, so its chunk size contributes
+            // no rows. Decode reclaims at TokenSize() - decode_width, up to
+            // width-1 behind the accepted endpoint. Include that guard as well
+            // as candidates, overlap and the worst starting-block offset.
+            const std::int64_t dense_pages =
+                ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
+            const std::int64_t window_pages = ceilDiv(static_cast<std::int64_t>(*group.sliding_window_tokens - 1) +
+                                                          std::max<std::int64_t>(decode_width - 1, 0) + decode_width +
+                                                          protected_tokens + block_granularity - 1,
+                                                      block_granularity);
+            child_pages = std::min(dense_pages, window_pages);
+        } else if (coordinator_.GroupIsPrefixClosed(i)) {
             child_pages = ceilDiv(static_cast<std::int64_t>(token_limit) + protected_tokens, block_granularity);
         } else if (config_.role == Role::kD) {
             if (group.transfer_policy == CacheTransferPolicy::LatestSnapshot) {
@@ -197,6 +209,12 @@ std::int64_t Scheduler::singleRequestLcmBlocksRequired(std::int32_t token_limit)
             }
         } else {
             child_pages = local_prefill_peak();
+        }
+        if (group.IsSnapshotStateGroup() && token_limit > 0) {
+            // Extend the existing eager-state working-set bound by the
+            // maximum whole-block growth of its retention interval. This is
+            // independent of prefix matching's single-snapshot lookback.
+            child_pages += ceilDiv(static_cast<std::int64_t>(group.max_state_lag_tokens), block_granularity);
         }
         group_pages[static_cast<std::size_t>(i)] = child_pages;
     }

@@ -710,6 +710,7 @@ class ForwardStepRunner:
             seq_lens,
             forward_mode=forward_mode,
             block_tables=block_tables,
+            num_extends=0,
             for_graph_replay=use_graph,
             **cache_kwargs,
         )
@@ -1010,10 +1011,8 @@ class ForwardStepRunner:
         if use_graph and padded_bs != bs:
             ctx.bs = bs
 
-        if self.drafter is not None and (
-            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
-        ):
-            self.attn_backend.commit_speculative_state_after_verify(
+        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
+            self.attn_backend.commit_state_after_verify(
                 result[1],
                 num_extends=ctx.num_extends,
             )

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import plan
@@ -64,8 +64,43 @@ class CacheGroupSpec:
     transfer_policy: TransferPolicy | None = None
     # Snapshot-state shape: raw-token span between two state checkpoints.
     checkpoint_granularity: int | None = None
+    # A live state may lag accepted progress by this many tokens. This is
+    # retention only: prefix reuse still needs one materialized snapshot.
+    # Explicit even for eager-state/history consumers, which declare zero.
+    max_state_lag_tokens: int = field(kw_only=True)
+    # Request-local replay history starts empty from this group's exact
+    # checkpoint on resume; its old rows are not reusable prefix data.
+    replay_checkpoint_group: str | None = field(kw_only=True)
 
     def __post_init__(self) -> None:
+        if self.replay_checkpoint_group is not None:
+            if (
+                not isinstance(self.replay_checkpoint_group, str)
+                or not self.replay_checkpoint_group
+                or self.replay_checkpoint_group == self.group_id
+                or self.family != "history"
+                or self.retention != "sliding_window"
+                or self.entry_stride_tokens != 1
+                or isinstance(self.sliding_window_tokens, bool)
+                or not isinstance(self.sliding_window_tokens, int)
+                or not 0 < self.sliding_window_tokens <= 2**31 - 1
+                or self.transfer_policy is not None
+            ):
+                raise ValueError(
+                    f"group {self.group_id!r}: replay_checkpoint_group requires "
+                    "another named state group, per-token sliding history and "
+                    "no transfer policy; materialized handoff is not integrated"
+                )
+        if (
+            isinstance(self.max_state_lag_tokens, bool)
+            or not isinstance(self.max_state_lag_tokens, int)
+            or not 0 <= self.max_state_lag_tokens <= 2**31 - 1
+            or (self.family != "state" and self.max_state_lag_tokens != 0)
+        ):
+            raise ValueError(
+                f"group {self.group_id!r}: max_state_lag_tokens must be a "
+                "non-negative int32 and zero for history groups"
+            )
         has_rows = (
             self.rows_per_page is not None or self.entry_stride_tokens is not None
         )
@@ -131,6 +166,36 @@ class CacheGroupSpec:
 
 # One declared cache group: what the scheduler is told, and the bytes it costs.
 CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[plan.CacheFieldSpec, ...]]
+
+
+def validate_replay_dependencies(specs: Sequence[CacheGroupSpec]) -> None:
+    """Validate replay history's checkpoint dependency and retention bound.
+
+    Args:
+        specs: The complete, ordered cache-group declaration.
+
+    Raises:
+        ValueError: If IDs are ambiguous, the dependency is not a state group,
+            or the history window could expire an unmaterialized input.
+    """
+    by_id = {spec.group_id: spec for spec in specs}
+    if len(by_id) != len(specs):
+        raise ValueError("group_specs contain duplicate group IDs")
+    for spec in specs:
+        if spec.replay_checkpoint_group is None:
+            continue
+        checkpoint = by_id.get(spec.replay_checkpoint_group)
+        if checkpoint is None or checkpoint.family != "state":
+            raise ValueError(
+                f"group {spec.group_id!r}: replay_checkpoint_group must name "
+                "a declared state group"
+            )
+        if spec.sliding_window_tokens <= checkpoint.max_state_lag_tokens:
+            raise ValueError(
+                f"group {spec.group_id!r}: replay history window must exceed "
+                "its checkpoint's max_state_lag_tokens"
+            )
+
 
 # Every group's page 0 is the reserved null page (padding rows, holes and
 # failed slots resolve to it); recipes subtract it again when they count
@@ -226,10 +291,15 @@ def compute_cache_group_page_counts(
         protected_pages = max_live_requests * _ceil_div(
             overlap_schedule_depth * decode_input_tokens, block_granularity
         )
-        # A state group holds two rolling checkpoints per request (input and
-        # output), whatever the prompt or chunk width.
+        # Add the maximum whole-block growth caused by a lagging state to
+        # the eager-state rolling input/output budget. Model recipes that
+        # budget a larger prefill working set apply the same extra lookback.
         if spec.family == "state":
-            total = max_live_requests * 2 + NULL_PAGES
+            total = (
+                max_live_requests
+                * (2 + _ceil_div(spec.max_state_lag_tokens, block_granularity))
+                + NULL_PAGES
+            )
         elif spec.retention == "full_history":
             full_pages = _ceil_div(max_total_tokens, block_granularity)
             total = full_pages + max_live_requests + protected_pages + NULL_PAGES
@@ -245,8 +315,18 @@ def compute_cache_group_page_counts(
             resident_pages = max_live_requests * _ceil_div(
                 resident_tokens_per_req, block_granularity
             )
-            scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
-            scheduled_pages = _ceil_div(scheduled_tokens, block_granularity)
+            if spec.replay_checkpoint_group is not None:
+                # Prefill seeds empty history from its exact checkpoint. Only
+                # decode candidates need new rows. Reclamation additionally
+                # trails the accepted endpoint by up to decode width minus one.
+                # Round each request independently, never the prefill chunk.
+                scheduled_pages = max_live_requests * _ceil_div(
+                    decode_input_tokens + max(decode_input_tokens - 1, 0),
+                    block_granularity,
+                )
+            else:
+                scheduled_tokens = min(max_scheduled_tokens, max_total_tokens)
+                scheduled_pages = _ceil_div(scheduled_tokens, block_granularity)
             total = (
                 resident_pages
                 + scheduled_pages
@@ -676,6 +756,8 @@ def _layer_group_spec(
         # Snapshot-state groups have no rows: one CacheBlock holds one
         # recurrent-state checkpoint taken every `block_tokens` tokens.
         return CacheGroupSpec(
+            replay_checkpoint_group=None,
+            max_state_lag_tokens=0,
             group_id=group_id,
             retention=retention,
             sliding_window_tokens=window,
@@ -683,6 +765,8 @@ def _layer_group_spec(
             checkpoint_granularity=block_tokens,
         )
     return CacheGroupSpec(
+        replay_checkpoint_group=None,
+        max_state_lag_tokens=0,
         group_id=group_id,
         retention=retention,
         rows_per_page=block_tokens,
@@ -727,5 +811,6 @@ __all__ = [
     "hybrid_slab_group_size",
     "layer_group_ids",
     "split_recurrent_state_groups",
+    "validate_replay_dependencies",
     "validate_scheduler_config",
 ]
