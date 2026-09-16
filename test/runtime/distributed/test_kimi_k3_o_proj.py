@@ -37,6 +37,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.flashinfer import flashinfer_projection_a2a
 from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
@@ -47,11 +48,13 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.models.kimi_k3_o_proj import (
     A2A_ENV_NAME,
     ENV_NAME,
+    RS_ENV_NAME,
     ProjectionWorkspace,
     initialize_projection_parallelism,
     make_output_projection,
     projection_a2a_backend,
     projection_mapping,
+    projection_rs_backend,
 )
 
 
@@ -128,6 +131,42 @@ def test_a2a_policy_and_lifecycle(monkeypatch):
     workspace.close()
     workspace.close()
     assert closed == [True]
+
+
+def test_rsag_policy_and_disabled_initialization(monkeypatch):
+    for backend in ("nccl", "triton_rsag"):
+        assert projection_rs_backend(backend) == backend
+    for backend in ("", "auto", "invalid"):
+        with pytest.raises(ValueError, match=RS_ENV_NAME):
+            projection_rs_backend(backend)
+    parallel = projection_mapping(dep_mapping(0, 4), "4")
+    workspace = ProjectionWorkspace(512, 256, torch.bfloat16, torch.device("cpu"))
+    monkeypatch.setenv(RS_ENV_NAME, "nccl")
+    workspace.initialize_reduce_scatter(parallel, [128])
+    assert workspace.rsag_states == {}
+    # Policy depends on padded subgroup capacity, not local valid rows.
+    workspace.rsag_states[128] = object()
+    for rows, width, expected in (
+        (1, 128, True),
+        (16, 128, True),
+        (17, 128, False),
+        (256, 128, False),
+        (257, 128, False),
+        (0, 128, False),
+        (16, 256, False),
+    ):
+        assert workspace.use_rsag(width, rows, True) == expected
+        assert not workspace.use_rsag(width, rows, False)
+    monkeypatch.setenv(RS_ENV_NAME, "triton_rsag")
+    no_a2a = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
+    no_a2a.initialize_reduce_scatter(parallel, [128])
+    assert no_a2a.rsag_states == {}
+    bad_dtype = ProjectionWorkspace(16, 256, torch.float16, torch.device("cpu"))
+    with pytest.raises(ValueError, match="BF16"):
+        bad_dtype.initialize_reduce_scatter(parallel, [128])
+    bad_width = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
+    with pytest.raises(ValueError, match="aligned"):
+        bad_width.initialize_reduce_scatter(parallel, [127])
 
 
 def test_optional_a2a_import_and_topology_fallback(monkeypatch):
@@ -382,8 +421,13 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
         "pack": pack,
         "all_to_all": exchange_inputs,
         "gemm": lambda: linear(recv),
-        "reduce_scatter": lambda: reduce_scatter(
-            partial, exchange.parallel.tp_group, backend=None
+        "reduce_scatter": lambda: exchange.workspace.reduce_scatter(
+            partial,
+            exchange.parallel,
+            rows,
+            exchange.workspace.use_flashinfer(
+                exchange.parallel, counts, exchange.input_size
+            ),
         ),
     }
     return {name: measure(call, iterations, True) for name, call in stages.items()}
@@ -482,6 +526,7 @@ def main():
             512, k, torch.bfloat16, torch.device("cuda")
         )
         exchange.workspace.initialize_a2a(exchange.parallel, k)
+        exchange.workspace.initialize_reduce_scatter(exchange.parallel, [n])
         reference_exchange = None
         if reference_module is not None:
             reference_exchange = reference_module.KimiOutputProjection(
@@ -490,12 +535,15 @@ def main():
             reference_exchange.workspace = reference_module.ProjectionWorkspace(
                 512, k, torch.bfloat16, torch.device("cuda")
             )
+            if hasattr(reference_exchange.workspace, "initialize_a2a"):
+                reference_exchange.workspace.initialize_a2a(exchange.parallel, k)
         patterns = [
             [1] * world,
             [8] * world,
             [16] * world,
             [17] * world,
             [64] * world,
+            [257] * world,
             [7 if r == 0 else 0 for r in range(world)],
             [r % 4 for r in range(world)],
             [0] * world,
@@ -516,9 +564,56 @@ def main():
             )
             expected = baseline(x)[0] if counts[rank] else x.new_empty((0, n))
             actual = exchange.forward(x, linear, counts)
+            fused_a2a = exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
+            using_rsag = exchange.workspace.use_rsag(
+                n, max(counts[r] for r in exchange.parallel.tp_group), fused_a2a
+            )
+            reduction_errors = torch.zeros(2, device="cuda", dtype=torch.float32)
+            if using_rsag:
+                # Same quantized GEMM partials: isolate reduction rounding from
+                # weight/activation quantization and TP1 accumulation changes.
+                partial, _ = linear(
+                    flashinfer_projection_a2a(exchange.workspace.a2a, x.contiguous())
+                )
+                reduction_reference = partial.float()
+                dist.all_reduce(
+                    reduction_reference,
+                    group=pg_manager.get_process_group(
+                        "nccl", exchange.parallel.tp_group
+                    ),
+                )
+                rows = counts[rank]
+                offset = exchange.parallel.tp_rank * rows
+                reduction_reference = reduction_reference[offset : offset + rows]
+                nccl_output = reduce_scatter(
+                    partial, exchange.parallel.tp_group, backend=None
+                )
+                norm = reduction_reference.norm().clamp_min(1e-8)
+                reduction_errors[0] = (
+                    actual.float() - reduction_reference
+                ).norm() / norm
+                reduction_errors[1] = (
+                    nccl_output.float() - reduction_reference
+                ).norm() / norm
+                assert reduction_errors[0] <= reduction_errors[1] + 0.001
+            dist.all_reduce(reduction_errors, op=dist.ReduceOp.MAX)
+            reference_relative_l2 = torch.tensor(
+                0.0, device="cuda", dtype=torch.float32
+            )
             if reference_exchange is not None:
                 prior = reference_exchange.forward(x, linear, counts)
-                torch.testing.assert_close(actual, prior, rtol=0, atol=0)
+                if using_rsag:
+                    reference_relative_l2 = (
+                        actual.float() - prior.float()
+                    ).norm() / prior.float().norm().clamp_min(1e-8)
+                    assert reference_relative_l2 < 0.01
+                else:
+                    torch.testing.assert_close(actual, prior, rtol=0, atol=0)
+            # Outputs must survive reuse of symmetric scratch by a later layer.
+            preserved = actual.clone()
+            exchange.forward(x * 0.5, linear, counts)
+            torch.testing.assert_close(actual, preserved, rtol=0, atol=0)
+            dist.all_reduce(reference_relative_l2, op=dist.ReduceOp.MAX)
             if x.shape[0]:
                 reference = x.float() @ reference_weight.T
                 delta = actual.float() - expected.float()
@@ -573,6 +668,11 @@ def main():
                 "shape": [n, k],
                 "layer": layer,
                 "counts": counts,
+                "reference_relative_l2": reference_relative_l2.item(),
+                "reduction_l2_vs_fp32": (
+                    reduction_errors.tolist() if using_rsag else None
+                ),
+                "rs_backend": ("triton_rsag" if using_rsag else "nccl"),
                 "a2a_backend": (
                     "flashinfer"
                     if exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
@@ -638,6 +738,10 @@ def main():
                 else "reference_tp4_projection"
             )
             profile_projection(exchange, linear, profile_baseline, k, world, label)
+        if reference_exchange is not None and hasattr(
+            reference_exchange.workspace, "close"
+        ):
+            reference_exchange.workspace.close()
         del reference_exchange
         exchange.workspace.close()
         del baseline, linear, exchange, reference_weight

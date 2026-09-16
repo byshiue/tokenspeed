@@ -71,6 +71,45 @@ helper, the MLA construction hook and distributed tests. Scheduler, cache
 geometry, attention input projections and expert placement do not change.
 Implementation, tests and deployment documentation belong to one PR.
 
+### Optional ReduceScatter
+
+`TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=triton_rsag` selects the existing
+token-aware Triton RSAG implementation; `nccl` remains the default. Rank
+agreement covers TP size and both communication settings. The settings are
+separate, but RSAG currently runs only with the fused FlashInfer A2A path.
+
+Communication preparation allocates symmetric scratch once per distinct
+projection output width and warms the reduction before capture. Capacity is
+`TP * min(max_tokens, 16)` rows. BF16 and output widths divisible by eight
+are required. On NVIDIA, this path needs NVLink multicast support; an explicit
+request fails startup if initialization is unsupported rather than attempting
+a rank-local recovery.
+
+All ranks in the subgroup select the backend from the same physical counts.
+Balanced batches of 1–16 rows use RSAG when FlashInfer A2A is active; larger
+or uneven physical batches use NCCL for reduction as well as A2A. Graph padding
+may make physical counts equal while valid request counts differ. An entirely
+empty subgroup skips both collectives. The rule does not depend on forward
+mode or whether execution is eager or captured.
+
+This restriction follows complete-projection measurements: RSAG with NCCL A2A
+regressed some 17–64-row and uneven cases, although RSAG with FlashInfer A2A
+was faster. Do not extend the threshold based on isolated reduction timings.
+If FlashInfer A2A is unavailable or disabled, initialization logs the fallback
+and allocates no RSAG scratch.
+
+RSAG stages the GEMM result into its symmetric buffer and clones the reduced
+output. Do not expose a view: the next attention layer reuses that buffer.
+With TP4, width 7168, and capacity 16 rows per rank, payload scratch is
+896 KiB per GPU per output width, plus synchronization metadata and output
+allocations. Graphs and in-flight operations must be released before closing
+the shared workspace.
+
+The NVIDIA multimem reduction accumulates BF16 inputs in FP32. Its outputs
+need not match NCCL's reduction order bit for bit. Tests report error against
+both NCCL and an FP32 reference; eager/graph equivalence and output lifetime
+remain exact checks. This remains opt-in until full-model validation passes.
+
 ## Validation gates
 
 1. Run a standalone four-GPU harness using small BF16 matrices, then production

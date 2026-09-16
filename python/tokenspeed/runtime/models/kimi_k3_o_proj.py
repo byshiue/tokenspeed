@@ -34,7 +34,15 @@ from tokenspeed_kernel.ops.communication.flashinfer import (
     create_projection_a2a,
     flashinfer_projection_a2a,
 )
-from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
+from tokenspeed_kernel.ops.communication.triton import (
+    create_state,
+)
+from tokenspeed_kernel.ops.communication.triton import (
+    reduce_scatter as triton_reduce_scatter,
+)
+from tokenspeed_kernel.ops.communication.triton import (
+    triton_pack_projection_input,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import (
@@ -55,8 +63,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
 A2A_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND"
+RS_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND"
 # Conservative measured envelope; larger/uneven batches use the NCCL path.
 FLASHINFER_MAX_TOKENS = 16
+# Measured with fused A2A. Mixing NCCL A2A and RSAG regressed small messages.
+RSAG_MAX_TOKENS = FLASHINFER_MAX_TOKENS
+
+
+def projection_rs_backend(value: str) -> str:
+    if value not in ("nccl", "triton_rsag"):
+        raise ValueError(f"{RS_ENV_NAME} must be nccl or triton_rsag")
+    return value
 
 
 def projection_a2a_backend(value: str) -> str:
@@ -95,6 +112,7 @@ def initialize_projection_parallelism(mapping: Mapping) -> None:
     """Agree on the setting before constructing/loading projection shards."""
     value = os.environ.get(ENV_NAME, "1")
     a2a_value = os.environ.get(A2A_ENV_NAME, "nccl")
+    rs_value = os.environ.get(RS_ENV_NAME, "nccl")
     if dist.is_initialized() and mapping.world_size > 1:
         # Every rank participates, even when its local setting is disabled or
         # malformed. Reject disagreement before entering differently sized groups.
@@ -102,14 +120,15 @@ def initialize_projection_parallelism(mapping: Mapping) -> None:
         values = [None] * mapping.world_size
         dist.all_gather_object(
             values,
-            (value, a2a_value),
+            (value, a2a_value, rs_value),
             group=pg_manager.get_process_group("gloo", mapping.world_group),
         )
         if len(set(values)) != 1:
             raise ValueError(
-                f"Projection TP/A2A settings differ across ranks: {values}"
+                f"Projection TP/A2A/RS settings differ across ranks: {values}"
             )
     projection_a2a_backend(a2a_value)
+    projection_rs_backend(rs_value)
     parallel = projection_mapping(mapping, value)
     if parallel.tp_size > 1:
         pg_manager.init_process_group(parallel.tp_group, backend=None)
@@ -140,6 +159,89 @@ class ProjectionWorkspace:
         self.a2a = None
         self.a2a_reason = None
         self._a2a_initialized = False
+        self.rsag_states = {}
+        self._rs_initialized = False
+
+    def initialize_reduce_scatter(
+        self, parallel: DenseLayerMapping, output_sizes: list[int]
+    ) -> None:
+        """Allocate bounded symmetric scratch per output width before capture.
+
+        Explicit opt-in accepts a different BF16 reduction order. Initialization
+        failures are fatal; never retry a failed collective with
+        another backend inside forward.
+        """
+        if self._rs_initialized:
+            return
+        backend = projection_rs_backend(os.environ.get(RS_ENV_NAME, "nccl"))
+        if backend == "triton_rsag":
+            if self.send.dtype != torch.bfloat16 or any(
+                width <= 0 or width % 8 for width in output_sizes
+            ):
+                raise ValueError("Projection RSAG requires BF16 and 8-aligned widths")
+            if self.a2a is None:
+                logger.warning("Projection RSAG requires fused NVLink A2A; using NCCL")
+                self._rs_initialized = True
+                return
+            group = pg_manager.get_process_group("nccl", parallel.tp_group)
+            capacity = min(self.max_tokens, RSAG_MAX_TOKENS) * parallel.tp_size
+            for width in sorted(set(output_sizes)):
+                state = create_state(
+                    group=group,
+                    rank_in_group=parallel.tp_rank,
+                    max_tokens=capacity,
+                    hidden_size=width,
+                    device=self.send.device,
+                    max_numel=0,
+                    max_bytes=0,
+                    attnres_max_numel=0,
+                    attnres_max_rows=0,
+                )
+                # Warm rendezvous/JIT on owned buffers, never inside model capture.
+                probe = torch.zeros(
+                    (parallel.tp_size, width),
+                    dtype=self.send.dtype,
+                    device=self.send.device,
+                )
+                triton_reduce_scatter(
+                    state,
+                    probe,
+                    tp_num_tokens=None,
+                    token_list_in_group=[1] * parallel.tp_size,
+                    safe=True,
+                )
+                self.rsag_states[width] = state
+            logger.info(
+                "Projection ReduceScatter: triton_rsag, cloned output, %s rows/rank",
+                min(self.max_tokens, RSAG_MAX_TOKENS),
+            )
+        self._rs_initialized = True
+
+    def use_rsag(self, output_size: int, max_tokens: int, fused_a2a: bool) -> bool:
+        """Use the measured fused-A2A combination, identically on every rank."""
+        return (
+            fused_a2a
+            and output_size in self.rsag_states
+            and 0 < max_tokens <= min(self.max_tokens, RSAG_MAX_TOKENS)
+        )
+
+    def reduce_scatter(
+        self,
+        partial: torch.Tensor,
+        parallel: DenseLayerMapping,
+        max_tokens: int,
+        fused_a2a: bool,
+    ) -> torch.Tensor:
+        """Return owned output rows; never expose the reusable RSAG buffer."""
+        if self.use_rsag(partial.shape[1], max_tokens, fused_a2a):
+            return triton_reduce_scatter(
+                self.rsag_states[partial.shape[1]],
+                partial,
+                tp_num_tokens=None,
+                token_list_in_group=[max_tokens] * parallel.tp_size,
+                safe=True,
+            )
+        return reduce_scatter(partial, parallel.tp_group, backend=None)
 
     def initialize_a2a(self, parallel: DenseLayerMapping, max_input_size: int) -> None:
         """Collectively prepare optional IPC/JIT resources before graph capture.
@@ -182,6 +284,10 @@ class ProjectionWorkspace:
         if self.a2a is not None:
             self.a2a.close()
             self.a2a = None
+        if self.rsag_states:
+            torch.cuda.synchronize(self.send.device)
+            dist.barrier(group=next(iter(self.rsag_states.values())).group)
+        self.rsag_states.clear()
 
 
 class KimiOutputProjection:
@@ -239,13 +345,16 @@ class KimiOutputProjection:
         # Rank-major output segments are exactly reduce-scatter's owner ordering.
         # One row already has rank-major byte order. Other shapes fuse the
         # transpose and padding, preserving the original BF16/FP16 values.
-        if workspace.use_flashinfer(parallel, counts, self.input_size):
+        fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
+        if fused_a2a:
             recv = flashinfer_projection_a2a(workspace.a2a, inputs.contiguous())
         else:
             packed = triton_pack_projection_input(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)
         partial, _ = linear(recv)
-        output = reduce_scatter(partial.contiguous(), parallel.tp_group, backend=None)
+        output = workspace.reduce_scatter(
+            partial.contiguous(), parallel, max_tokens, fused_a2a
+        )
         return output[: inputs.shape[0]]
 
 
