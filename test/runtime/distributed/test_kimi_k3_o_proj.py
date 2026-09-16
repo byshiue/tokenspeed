@@ -27,6 +27,7 @@ NVFP4 mixed-precision model. Run with 16 ranks to exercise four TP4 subgroups.
 """
 
 import argparse
+import builtins
 import importlib.util
 import json
 import os
@@ -44,10 +45,12 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.models.kimi_k3_o_proj import (
+    A2A_ENV_NAME,
     ENV_NAME,
     ProjectionWorkspace,
     initialize_projection_parallelism,
     make_output_projection,
+    projection_a2a_backend,
     projection_mapping,
 )
 
@@ -94,6 +97,75 @@ def test_projection_mapping_and_validation():
             projection_mapping(dep_mapping(0, 16), value)
     with pytest.raises(ValueError, match="requires"):
         projection_mapping(Mapping(rank=0, world_size=4), "4")
+
+
+def test_a2a_policy_and_lifecycle(monkeypatch):
+    for backend in ("nccl", "auto", "flashinfer"):
+        assert projection_a2a_backend(backend) == backend
+    for backend in ("", "invalid", "NVLINK"):
+        with pytest.raises(ValueError, match=A2A_ENV_NAME):
+            projection_a2a_backend(backend)
+    monkeypatch.setenv(A2A_ENV_NAME, "nccl")
+    workspace = ProjectionWorkspace(512, 256, torch.bfloat16, torch.device("cpu"))
+    parallel = projection_mapping(dep_mapping(0, 4), "4")
+    workspace.initialize_a2a(parallel, 256)
+    assert workspace.a2a is None
+    assert not workspace.use_flashinfer(parallel, [16] * 4, 256)
+    closed = []
+    workspace.a2a = SimpleNamespace(close=lambda: closed.append(True))
+    for rank in range(4):
+        parallel = projection_mapping(dep_mapping(rank, 4), "4")
+        for counts, channels, expected in (
+            ([1] * 4, 256, True),
+            ([16] * 4, 256, True),
+            ([17] * 4, 256, False),
+            ([512] * 4, 256, False),
+            ([16, 0, 16, 16], 256, False),
+            ([0] * 4, 256, False),
+            ([16] * 4, 100, False),
+        ):
+            assert workspace.use_flashinfer(parallel, counts, channels) == expected
+    workspace.close()
+    workspace.close()
+    assert closed == [True]
+
+
+def test_optional_a2a_import_and_topology_fallback(monkeypatch):
+    from tokenspeed_kernel.thirdparty.flashinfer.projection_alltoall import (
+        create_projection_a2a,
+    )
+
+    group = SimpleNamespace(size=lambda: 4)
+
+    def gather(values, value, group):
+        values[:] = [value] * group.size()
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    original_import = builtins.__import__
+    fake = None
+
+    def optional_import(name, *args, **kwargs):
+        if name == "flashinfer.comm.ulysses":
+            if fake is None:
+                raise ImportError("optional API absent")
+            return fake
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", optional_import)
+    kwargs = dict(
+        group=group, max_elems=4096, dtype=torch.bfloat16, device=torch.device("cuda")
+    )
+    comm, reason = create_projection_a2a(**kwargs, backend="auto")
+    assert comm is None and "optional API absent" in reason
+    with pytest.raises(RuntimeError, match="unavailable"):
+        create_projection_a2a(**kwargs, backend="flashinfer")
+    closed = []
+    fallback = SimpleNamespace(
+        backend="nccl", fallback_reason="no NVLink", close=lambda: closed.append(True)
+    )
+    fake = SimpleNamespace(UlyssesCommunicator=lambda **kwargs: fallback)
+    comm, reason = create_projection_a2a(**kwargs, backend="auto")
+    assert comm is None and reason == "no NVLink" and closed == [True]
 
 
 def test_disabled_projection_and_shard_loader(monkeypatch):
@@ -342,7 +414,7 @@ def profile_projection(
             for _ in range(20):
                 graph.replay()
     torch.cuda.synchronize()
-    control_group = pg_manager.get_process_group("gloo", list(range(world)))
+    control_group = pg_manager.get_process_group("gloo", tuple(range(world)))
     dist.barrier(group=control_group)
     torch.cuda.cudart().cudaProfilerStop()
     # Keep later GPU work out of the profiler-stop window on every rank.
@@ -409,6 +481,7 @@ def main():
         exchange.workspace = ProjectionWorkspace(
             512, k, torch.bfloat16, torch.device("cuda")
         )
+        exchange.workspace.initialize_a2a(exchange.parallel, k)
         reference_exchange = None
         if reference_module is not None:
             reference_exchange = reference_module.KimiOutputProjection(
@@ -420,6 +493,8 @@ def main():
         patterns = [
             [1] * world,
             [8] * world,
+            [16] * world,
+            [17] * world,
             [64] * world,
             [7 if r == 0 else 0 for r in range(world)],
             [r % 4 for r in range(world)],
@@ -498,6 +573,11 @@ def main():
                 "shape": [n, k],
                 "layer": layer,
                 "counts": counts,
+                "a2a_backend": (
+                    "flashinfer"
+                    if exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
+                    else "nccl"
+                ),
                 "relative_l2": relative_l2.item(),
                 "absolute_max": absolute_max.item(),
                 "baseline_reference_l2": baseline_error.item(),
@@ -559,6 +639,7 @@ def main():
             )
             profile_projection(exchange, linear, profile_baseline, k, world, label)
         del reference_exchange
+        exchange.workspace.close()
         del baseline, linear, exchange, reference_weight
         torch.cuda.empty_cache()
     dist.barrier()

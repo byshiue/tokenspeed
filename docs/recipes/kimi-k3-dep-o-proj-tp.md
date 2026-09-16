@@ -68,6 +68,24 @@ export the following on **every node before model startup**:
 export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=4
 ```
 
+To opt into fused NVLink A2A on supported single-node projection groups, also
+set `TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=auto` on every node. Use
+`flashinfer` instead to fail startup when NVLink initialization is unavailable,
+or `nccl` (the default) for the reference path. The FlashInfer installation
+must provide `flashinfer.comm.ulysses.UlyssesCommunicator`; older versions
+can use the NCCL fallback without an upgrade.
+
+Only balanced physical batches of at most 16 rows per rank use the optional
+path. Larger and uneven batches retain NCCL, including when `flashinfer` is
+requested. No mode-specific prefill/decode branch is added. Graph-padded rows
+count toward the limit. Startup logs report the selected backend and fallback
+reason. Keep the same setting throughout graph capture and replay.
+
+This changes projection A2A only: GEMM and NCCL ReduceScatter stay unchanged.
+The earlier 16-requests/rank prototype reduced complete projection latency
+by about 13.8%, not full-model latency. Full-model correctness and performance
+validation are still required before changing the default.
+
 This setting changes neither attention cache ownership nor EP placement.
 Unset/`1` preserves the original projection. The value must divide world size
 and projection dimensions, respect quantization alignment, and agree on all
