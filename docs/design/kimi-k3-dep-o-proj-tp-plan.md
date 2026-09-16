@@ -40,6 +40,32 @@ is introduced.
   they must not reduce the completed projection a second time.
 - Eager and captured forwards invoke the same helper.
 
+### Optional small-message A2A
+
+`TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND` selects `nccl` (default),
+`auto`, or `flashinfer`. All ranks agree on both projection settings at
+startup. This does not change the MoE communication backend.
+
+The optional FlashInfer Ulysses NVLink exchange fuses the token/channel
+transpose with A2A. Its adapter stays under tokenspeed-kernel. A shared
+workspace creates the communicator and its IPC/JIT resources before graph
+capture; sequential layers reuse it on one stream. Repeated preparation
+retains the workspace. IPC resources must outlive every graph that refers to
+them; explicit close is collective and is only safe after those graphs die.
+
+The initial measured envelope is balanced physical batches of 1–16 rows per
+rank with aligned channel shards. Larger or unequal subgroup counts use the
+existing padded NCCL exchange. This decision uses the same host counts on
+every subgroup rank, not forward mode or local occupancy. Graph padding can
+make physical counts equal even when valid request counts differ.
+
+`auto` falls back at startup when the optional API or supported NVLink
+topology is unavailable. `flashinfer` requires NVLink initialization to
+succeed, but still uses the shape-based NCCL fallback outside the envelope.
+Forward errors propagate; switching collectives after a rank-local failure
+would risk a deadlock. GEMM, quantization, ReduceScatter and output ownership
+are unchanged. NCCL remains the default until full-model validation passes.
+
 Expected source areas are Kimi model integration, the shared projection
 helper, the MLA construction hook and distributed tests. Scheduler, cache
 geometry, attention input projections and expert placement do not change.
