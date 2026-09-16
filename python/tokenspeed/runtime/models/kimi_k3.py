@@ -160,6 +160,12 @@ from tokenspeed.runtime.models.kimi_k3_comm import (
     K3MoeTailComm,
     prepare_k3_all_reduce_buffers,
 )
+from tokenspeed.runtime.models.kimi_k3_o_proj import (
+    ProjectionWorkspace,
+    initialize_projection_parallelism,
+    make_output_projection,
+    project_attention_output,
+)
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -318,6 +324,33 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
     ``o_proj`` all-reduces here — the AttnRes path does not use
     ``CommManager`` to fold the attention comm into the residual.
     """
+
+    def _make_output_projection(
+        self,
+        input_size: int,
+        output_size: int,
+        *,
+        bias: bool,
+        reduce_results: bool,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        tp_rank: int,
+        tp_size: int,
+        tp_group: tuple[int, ...],
+    ) -> RowParallelLinear:
+        # Keep the registered Linear at o_proj so checkpoint shard loaders and
+        # post-load quantization still see the original parameter names.
+        assert not bias
+        linear, self.output_projection_exchange = make_output_projection(
+            mapping=self.mapping,
+            input_size=input_size,
+            output_size=output_size,
+            quant_config=quant_config,
+            prefix=prefix,
+            default_parallel=self.mapping.attn,
+            reduce_results=reduce_results,
+        )
+        return linear
 
     def __init__(
         self,
@@ -579,7 +612,14 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         attnres_partial_args: tuple | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
-            return hidden_states
+            if self.output_projection_exchange is None:
+                return hidden_states
+            return project_attention_output(
+                hidden_states.new_empty((0, self.num_heads * self.v_head_dim)),
+                self.o_proj,
+                self.output_projection_exchange,
+                ctx,
+            )
         if self.use_output_gate:
             q, latent_cache, gate, absorbed_query = self._project_q_latent_gated(
                 hidden_states,
@@ -613,8 +653,12 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
             attn_output = sigmoid_mul(attn_output, gate)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return project_attention_output(
+            attn_output,
+            self.o_proj,
+            self.output_projection_exchange,
+            ctx,
+        )
 
 
 def _sliced_scratch(like: torch.Tensor, slot: int, n_tokens: int):
@@ -1145,16 +1189,14 @@ class KimiLinearKDA(nn.Module):
         self.conv_weights: torch.Tensor | None = None
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.o_proj = RowParallelLinear(
-            proj,
-            hidden,
-            bias=False,
-            reduce_results=False,  # layer-level fused AR+residual owns the reduce
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
+        self.o_proj, self.output_projection_exchange = make_output_projection(
+            mapping=mapping,
+            input_size=proj,
+            output_size=hidden,
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
+            default_parallel=mapping.linear_attn,
+            reduce_results=False,  # layer-level AR owns ordinary attention TP
         )
 
     def fuse_conv_weights(self) -> None:
@@ -1227,7 +1269,14 @@ class KimiLinearKDA(nn.Module):
         attnres_partial_args: tuple | None = None,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
-            return hidden_states
+            if self.output_projection_exchange is None:
+                return hidden_states
+            return project_attention_output(
+                hidden_states.new_empty((0, self.num_heads * self.head_dim)),
+                self.o_proj,
+                self.output_projection_exchange,
+                ctx,
+            )
 
         h = hidden_states
         num_tokens = h.shape[0]
@@ -1299,8 +1348,12 @@ class KimiLinearKDA(nn.Module):
                 hd,
                 enable_pdl=pdl_enabled(),
             )
-        output, _ = self.o_proj(core_out)
-        return output
+        return project_attention_output(
+            core_out,
+            self.o_proj,
+            self.output_projection_exchange,
+            ctx,
+        )
 
 
 class KimiLinearMoEGate(nn.Module):
@@ -2804,6 +2857,8 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
+        initialize_projection_parallelism(mapping)
+
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None
         )
@@ -3107,17 +3162,36 @@ class KimiLinearForCausalLM(BaseCausalLM):
     model_cls = KimiLinearModel
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        exchanges = [
+            layer.self_attn.output_projection_exchange
+            for layer in self.model.layers
+            if hasattr(layer, "self_attn")
+            and layer.self_attn.output_projection_exchange is not None
+        ]
+        if exchanges:
+            # One scratch pair for sequential attention layers, allocated before
+            # memory profiling/capture rather than one large pair per layer.
+            weight = next(self.parameters())
+            workspace = ProjectionWorkspace(
+                max_tokens=max_num_tokens,
+                max_input_size=max(exchange.input_size for exchange in exchanges),
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+            for exchange in exchanges:
+                exchange.workspace = workspace
         routed_hidden_size = (
             self.config.routed_expert_hidden_size
             if self.config.routed_expert_hidden_size is not None
             else self.config.hidden_size
         )
-        return prepare_k3_all_reduce_buffers(
+        prepared = prepare_k3_all_reduce_buffers(
             mapping=self.mapping,
             hidden_size=self.config.hidden_size,
             routed_hidden_size=routed_hidden_size,
             max_num_tokens=max_num_tokens,
         )
+        return bool(exchanges) or prepared
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
