@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import (
@@ -174,13 +175,10 @@ class KimiOutputProjection:
         recv = workspace.recv[:elements].view(size * max_tokens, shard)
         # Equal-sized messages permit capture and avoid device-to-host counts.
         # Rank-major output segments are exactly reduce-scatter's owner ordering.
-        send.zero_()
-        send[:, : inputs.shape[0]].copy_(
-            inputs.reshape(inputs.shape[0], size, shard).permute(1, 0, 2)
-        )
-        all_to_all_single(
-            recv, send.view(size * max_tokens, shard), parallel.tp_group, backend=None
-        )
+        # One row already has rank-major byte order. Other shapes fuse the
+        # transpose and padding, preserving the original BF16/FP16 values.
+        packed = triton_pack_projection_input(inputs, send)
+        all_to_all_single(recv, packed, parallel.tp_group, backend=None)
         partial, _ = linear(recv)
         output = reduce_scatter(partial.contiguous(), parallel.tp_group, backend=None)
         return output[: inputs.shape[0]]
