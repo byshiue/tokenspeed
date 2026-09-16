@@ -21,8 +21,81 @@
 
 """Optional, startup-only FlashInfer Ulysses communicator construction."""
 
+from pathlib import Path
+
 import torch
 import torch.distributed as dist
+
+
+class _CudaBufferView:
+    """Non-owning byte view; the retained communicator owns the IPC allocation."""
+
+    def __init__(self, pointer: int, num_bytes: int):
+        self.__cuda_array_interface__ = {
+            "shape": (num_bytes,),
+            "strides": None,
+            "typestr": "|u1",
+            "data": (pointer, False),
+            "version": 3,
+        }
+
+
+class BorrowedProjectionA2A:
+    """Prepared no-copy view of Ulysses output, valid until the next exchange.
+
+    The entry peer barrier protects previous consumers when every rank uses
+    this communicator and its consumers on one stream. Never retain the view
+    as a layer output, use concurrently, or close IPC resources with live graphs.
+    """
+
+    def __init__(self, comm):
+        from flashinfer.jit.core import gen_jit_spec
+
+        self.comm = comm
+        self.module = gen_jit_spec(
+            "tokenspeed_projection_ulysses_borrowed_v1",
+            [Path(__file__).with_name("ulysses_borrowed.cu")],
+        ).build_and_load()
+        pointer = comm._out_ptrs[comm.rank]
+        self.buffer = torch.as_tensor(
+            _CudaBufferView(pointer, comm.max_elems * comm.dtype.itemsize),
+            device=comm.device,
+        ).view(comm.dtype)
+        if self.buffer.data_ptr() != pointer:
+            raise RuntimeError("Projection IPC view unexpectedly copied storage")
+
+    def exchange(self, inputs):
+        rows, channels = inputs.shape
+        comm = self.comm
+        head_dim = 128 if channels % (128 * comm.world_size) == 0 else 8
+        output = self.buffer[: rows * channels].view(
+            1, rows * comm.world_size, channels // comm.world_size // head_dim, head_dim
+        )
+        self.module.ulysses_a2a(
+            comm._fa,
+            inputs.view(1, rows, channels // head_dim, head_dim),
+            output,
+            1,
+            rows,
+            channels // head_dim,
+            head_dim,
+            0,
+        )
+        return output.view(rows * comm.world_size, channels // comm.world_size)
+
+
+def prepare_borrowed_projection_a2a(comm, group):
+    """Collectively initialize the optional borrowed-output adapter before capture."""
+    prepared, error = None, None
+    try:
+        prepared = BorrowedProjectionA2A(comm)
+    except Exception as exc:
+        error = str(exc)
+    errors = [None] * group.size()
+    dist.all_gather_object(errors, error, group=group)
+    if any(item is not None for item in errors):
+        raise RuntimeError(f"Borrowed projection A2A initialization failed: {errors}")
+    return prepared
 
 
 def create_projection_a2a(

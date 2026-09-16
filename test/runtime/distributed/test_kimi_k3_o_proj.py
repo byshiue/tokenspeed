@@ -37,7 +37,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.flashinfer import flashinfer_projection_a2a
+from tokenspeed_kernel.ops.communication.flashinfer import (
+    flashinfer_projection_a2a,
+    flashinfer_projection_a2a_borrowed,
+)
 from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
@@ -134,7 +137,7 @@ def test_a2a_policy_and_lifecycle(monkeypatch):
 
 
 def test_rsag_policy_and_disabled_initialization(monkeypatch):
-    for backend in ("nccl", "triton_rsag"):
+    for backend in ("nccl", "triton_rsag", "triton_peer"):
         assert projection_rs_backend(backend) == backend
     for backend in ("", "auto", "invalid"):
         with pytest.raises(ValueError, match=RS_ENV_NAME):
@@ -146,6 +149,8 @@ def test_rsag_policy_and_disabled_initialization(monkeypatch):
     assert workspace.rsag_states == {}
     # Policy depends on padded subgroup capacity, not local valid rows.
     workspace.rsag_states[128] = object()
+    peer = object()
+    workspace.peer_states[128] = peer
     for rows, width, expected in (
         (1, 128, True),
         (16, 128, True),
@@ -157,6 +162,13 @@ def test_rsag_policy_and_disabled_initialization(monkeypatch):
     ):
         assert workspace.use_rsag(width, rows, True) == expected
         assert not workspace.use_rsag(width, rows, False)
+        assert workspace.peer_state(width, rows, True) is (peer if expected else None)
+        assert workspace.peer_state(width, rows, False) is None
+    monkeypatch.setenv(RS_ENV_NAME, "triton_peer")
+    no_peer = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
+    no_peer.initialize_reduce_scatter(parallel, [128])
+    assert no_peer.peer_states == {}
+    assert no_peer.borrowed_a2a is None
     monkeypatch.setenv(RS_ENV_NAME, "triton_rsag")
     no_a2a = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
     no_a2a.initialize_reduce_scatter(parallel, [128])
@@ -364,25 +376,36 @@ def make_linears(mapping: Mapping, weight, scale, quant):
 
 
 def measure(call, iterations: int, graph: bool) -> float:
+    """Time complete operations, amortizing graph submission over a short chain."""
+    if iterations <= 0:
+        raise ValueError("iterations must be positive")
     for _ in range(5):
         call()
     torch.cuda.synchronize()
+    chain = min(20, iterations) if graph else 1
+    replays = (iterations + chain - 1) // chain
     if graph:
         capture = torch.cuda.CUDAGraph()
         with torch.cuda.graph(capture):
-            call()
+            for _ in range(chain):
+                call()
         call = capture.replay
+        for _ in range(5):
+            call()
+        torch.cuda.synchronize()
     dist.barrier()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
         enable_timing=True
     )
     start.record()
-    for _ in range(iterations):
+    for _ in range(replays):
         call()
     end.record()
     end.synchronize()
     elapsed = torch.tensor(
-        start.elapsed_time(end) * 1000 / iterations, device="cuda", dtype=torch.float32
+        start.elapsed_time(end) * 1000 / (replays * chain),
+        device="cuda",
+        dtype=torch.float32,
     )
     dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
     return elapsed.item()
@@ -401,26 +424,37 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
         return {}
 
     packed = send.view(size * rows, shard)
+    fused = exchange.workspace.use_flashinfer(
+        exchange.parallel, counts, exchange.input_size
+    )
+    peer = exchange.workspace.peer_state(linear.output_size, rows, fused)
 
     def pack():
         nonlocal packed
         packed = triton_pack_projection_input(inputs, send)
 
     def exchange_inputs():
-        all_to_all_single(
-            recv,
-            packed,
-            exchange.parallel.tp_group,
-            backend=None,
-        )
+        nonlocal recv
+        if peer is not None:
+            recv = flashinfer_projection_a2a_borrowed(
+                exchange.workspace.borrowed_a2a, inputs
+            )
+        elif fused:
+            recv = flashinfer_projection_a2a(exchange.workspace.a2a, inputs)
+        else:
+            all_to_all_single(recv, packed, exchange.parallel.tp_group, backend=None)
+
+    def gemm():
+        if peer is not None:
+            return linear.forward_into(recv, None, peer.input_buffer(rows))
+        return linear(recv)
 
     pack()
     exchange_inputs()
-    partial, _ = linear(recv)
+    partial, _ = gemm()
     stages = {
-        "pack": pack,
         "all_to_all": exchange_inputs,
-        "gemm": lambda: linear(recv),
+        "gemm": gemm,
         "reduce_scatter": lambda: exchange.workspace.reduce_scatter(
             partial,
             exchange.parallel,
@@ -430,6 +464,8 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
             ),
         ),
     }
+    if not fused:
+        stages["pack"] = pack
     return {name: measure(call, iterations, True) for name, call in stages.items()}
 
 
@@ -437,17 +473,19 @@ def profile_projection(
     exchange, linear, baseline, k: int, world: int, baseline_label: str
 ):
     """Capture a short warmed baseline/TP4 graph comparison for NSYS."""
-    inputs = torch.randn(8, k, device="cuda", dtype=torch.bfloat16)
-    counts = [8] * world
+    inputs = torch.randn(16, k, device="cuda", dtype=torch.bfloat16)
+    counts = [16] * world
     for _ in range(5):
         baseline(inputs)
         exchange.forward(inputs, linear, counts)
     torch.cuda.synchronize()
     local_graph, tp_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
     with torch.cuda.graph(local_graph):
-        baseline(inputs)
+        for _ in range(20):
+            baseline(inputs)
     with torch.cuda.graph(tp_graph):
-        exchange.forward(inputs, linear, counts)
+        for _ in range(20):
+            exchange.forward(inputs, linear, counts)
     dist.barrier()
     torch.cuda.cudart().cudaProfilerStart()
     for name, graph in (
@@ -455,7 +493,7 @@ def profile_projection(
         ("tp4_projection", tp_graph),
     ):
         with torch.cuda.nvtx.range(name):
-            for _ in range(20):
+            for _ in range(5):
                 graph.replay()
     torch.cuda.synchronize()
     control_group = pg_manager.get_process_group("gloo", tuple(range(world)))
@@ -568,8 +606,15 @@ def main():
             using_rsag = exchange.workspace.use_rsag(
                 n, max(counts[r] for r in exchange.parallel.tp_group), fused_a2a
             )
+            using_peer = (
+                exchange.workspace.peer_state(
+                    n, max(counts[r] for r in exchange.parallel.tp_group), fused_a2a
+                )
+                is not None
+            )
+            custom_reduction = using_rsag or using_peer
             reduction_errors = torch.zeros(2, device="cuda", dtype=torch.float32)
-            if using_rsag:
+            if custom_reduction:
                 # Same quantized GEMM partials: isolate reduction rounding from
                 # weight/activation quantization and TP1 accumulation changes.
                 partial, _ = linear(
@@ -602,7 +647,7 @@ def main():
             )
             if reference_exchange is not None:
                 prior = reference_exchange.forward(x, linear, counts)
-                if using_rsag:
+                if custom_reduction:
                     reference_relative_l2 = (
                         actual.float() - prior.float()
                     ).norm() / prior.float().norm().clamp_min(1e-8)
@@ -670,9 +715,13 @@ def main():
                 "counts": counts,
                 "reference_relative_l2": reference_relative_l2.item(),
                 "reduction_l2_vs_fp32": (
-                    reduction_errors.tolist() if using_rsag else None
+                    reduction_errors.tolist() if custom_reduction else None
                 ),
-                "rs_backend": ("triton_rsag" if using_rsag else "nccl"),
+                "rs_backend": (
+                    "triton_peer"
+                    if using_peer
+                    else "triton_rsag" if using_rsag else "nccl"
+                ),
                 "a2a_backend": (
                     "flashinfer"
                     if exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
@@ -729,7 +778,7 @@ def main():
                 baseline
                 if reference_exchange is None
                 else lambda inputs: reference_exchange.forward(
-                    inputs, linear, [8] * world
+                    inputs, linear, [16] * world
                 )
             )
             label = (
