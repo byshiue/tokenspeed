@@ -126,10 +126,11 @@ def triton_projection_reduce_scatter_after_a2a(state, partial, rows):
     """Reduce TP4 partials, deferring reuse synchronization to the next A2A.
 
     Arguments and output match triton_projection_reduce_scatter. Every future
-    write to state.buffer must follow a same-subgroup A2A entry barrier on the
-    same serialized stream. That barrier observes all previous reduction reads
-    complete before any peer launches its next GEMM. This contract includes
-    transitions through NCCL fallback shapes and empty groups, which do not
-    write this buffer. Standalone reductions must use the fenced entry point.
+    write to state.buffer must follow a same-subgroup A2A entry barrier or an
+    explicit symmetric-memory pre-write barrier on the same serialized stream.
+    That barrier observes all previous reduction reads complete before any
+    peer launches its next GEMM. NCCL A2A itself does not supply this guarantee:
+    callers using NCCL must fence before writing, including after intervening
+    empty or NCCL-only batches. Standalone reductions use the fenced entry point.
     """
     return state._reduce(partial, rows, False)
