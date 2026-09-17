@@ -64,10 +64,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
 
 logger = logging.getLogger(__name__)
-A2A_ENV_NAME = "TOKENSPEED_O_PROJ_A2A_BACKEND"
-RS_ENV_NAME = "TOKENSPEED_O_PROJ_RS_BACKEND"
-DEFAULT_A2A_BACKEND = "flashinfer"
-DEFAULT_RS_BACKEND = "triton_peer"
 FLASHINFER_MAX_TOKENS = 512
 PEER_MAX_TOKENS = 8192
 
@@ -112,9 +108,11 @@ def validate_projection_settings(
                 f"Projection TP/A2A/RS settings differ across ranks: {values}"
             )
     if a2a_value not in ("nccl", "auto", "flashinfer"):
-        raise ValueError(f"Invalid {A2A_ENV_NAME}: {a2a_value}")
+        raise ValueError(f"Invalid output projection A2A backend: {a2a_value}")
     if rs_value not in ("nccl", "triton_peer"):
-        raise ValueError(f"{RS_ENV_NAME} must be nccl or triton_peer")
+        raise ValueError(
+            "Output projection reduction backend must be nccl or triton_peer"
+        )
     try:
         size = int(value)
     except ValueError as exc:
