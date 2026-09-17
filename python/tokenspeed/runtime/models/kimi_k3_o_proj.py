@@ -18,11 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Attention-DP to output-projection-TP exchange for Kimi-K3.
-
-Only the projection changes ownership. Attention/cache rows and the residual
-stream remain local to their original DP rank, including on empty ranks.
-"""
+"""Kimi-K3 configuration and integration for projection-only tensor parallelism."""
 
 import logging
 import os
@@ -30,30 +26,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.flashinfer import (
-    create_projection_a2a,
-    flashinfer_projection_a2a,
-    flashinfer_projection_a2a_borrowed,
-    flashinfer_projection_quantized_a2a,
-    prepare_borrowed_projection_a2a,
-)
-from tokenspeed_kernel.ops.communication.triton import (
-    create_state,
-)
-from tokenspeed_kernel.ops.communication.triton import (
-    reduce_scatter as triton_reduce_scatter,
-)
-from tokenspeed_kernel.ops.communication.triton import (
-    triton_pack_projection_input,
-)
-from tokenspeed_kernel.ops.communication.triton_projection import (
-    ProjectionPeerState,
-    triton_projection_reduce_scatter,
-    triton_projection_reduce_scatter_after_a2a,
-)
-from tokenspeed_kernel.ops.gemm import fp8_linear_accepts_prepacked_input
 
-from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import (
     AttentionLayerMapping,
     DenseLayerMapping,
@@ -62,6 +35,16 @@ from tokenspeed.runtime.distributed.mapping import (
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
+)
+from tokenspeed.runtime.layers.attention.o_proj import (
+    DistributedOutputProjection,
+    initialize_projection_group,
+)
+from tokenspeed.runtime.layers.attention.o_proj import (
+    make_output_projection as make_distributed_output_projection,
+)
+from tokenspeed.runtime.layers.attention.o_proj import (
+    projection_mapping as make_projection_mapping,
 )
 from tokenspeed.runtime.layers.linear import RowParallelLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -73,10 +56,6 @@ logger = logging.getLogger(__name__)
 ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
 A2A_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND"
 RS_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND"
-# Conservative measured envelope; larger/uneven batches use the NCCL path.
-FLASHINFER_MAX_TOKENS = 16
-# Measured with fused A2A. Mixing NCCL A2A and RSAG regressed small messages.
-RSAG_MAX_TOKENS = FLASHINFER_MAX_TOKENS
 
 
 def projection_rs_backend(value: str) -> str:
@@ -109,12 +88,7 @@ def projection_mapping(mapping: Mapping, value: str) -> DenseLayerMapping:
             f"{ENV_NAME}>1 requires attention/linear-attention TP1, "
             "attention DP == MoE EP == world size, and PP1"
         )
-    return DenseLayerMapping(
-        rank=mapping.rank,
-        world_size=mapping.world_size,
-        tp_size=size,
-        dp_size=mapping.world_size // size,
-    )
+    return make_projection_mapping(mapping.rank, mapping.world_size, size)
 
 
 def initialize_projection_parallelism(mapping: Mapping) -> None:
@@ -140,309 +114,10 @@ def initialize_projection_parallelism(mapping: Mapping) -> None:
     projection_rs_backend(rs_value)
     parallel = projection_mapping(mapping, value)
     if parallel.tp_size > 1:
-        pg_manager.init_process_group(parallel.tp_group, backend=None)
-        # Materialize backend/NCCL resources outside any model CUDA graph.
-        probe = torch.zeros((parallel.tp_size, 1), dtype=torch.bfloat16, device="cuda")
-        received = torch.empty_like(probe)
-        all_to_all_single(received, probe, parallel.tp_group, backend=None)
-        reduce_scatter(received, parallel.tp_group, backend=None)
+        initialize_projection_group(parallel)
         logger.info(
             "Kimi-K3 output projection TP%s: %s", parallel.tp_size, parallel.tp_group
         )
-
-
-class ProjectionWorkspace:
-    """Reusable exchange scratch, shared by sequential KDA/MLA layers."""
-
-    def __init__(
-        self,
-        max_tokens: int,
-        max_input_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        # All-to-all exchanges P * M * (K/P) elements: M*K, not P*M*K.
-        self.max_tokens = max_tokens
-        self.send = torch.empty(max_tokens * max_input_size, dtype=dtype, device=device)
-        self.recv = torch.empty_like(self.send)
-        self.a2a = None
-        self.a2a_reason = None
-        self._a2a_initialized = False
-        self.rsag_states = {}
-        self.peer_states = {}
-        self.borrowed_a2a = None
-        self._rs_initialized = False
-
-    def initialize_reduce_scatter(
-        self, parallel: DenseLayerMapping, output_sizes: list[int]
-    ) -> None:
-        """Allocate bounded symmetric scratch per output width before capture.
-
-        Explicit opt-in accepts a different BF16 reduction order. Initialization
-        failures are fatal; never retry a failed collective with
-        another backend inside forward.
-        """
-        if self._rs_initialized:
-            return
-        backend = projection_rs_backend(os.environ.get(RS_ENV_NAME, "nccl"))
-        if backend == "triton_peer":
-            if self.a2a is None or parallel.tp_size != 4:
-                logger.warning(
-                    "Projection peer reduction requires fused TP4 A2A; using NCCL"
-                )
-                self._rs_initialized = True
-                return
-            if self.send.dtype != torch.bfloat16 or any(
-                width <= 0 for width in output_sizes
-            ):
-                raise ValueError(
-                    "Projection peer reduction requires BF16 and positive widths"
-                )
-            group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
-            for width in sorted(set(output_sizes)):
-                state = ProjectionPeerState(
-                    group,
-                    min(self.max_tokens, FLASHINFER_MAX_TOKENS),
-                    width,
-                    self.send.device,
-                )
-                probe = state.input_buffer(1)
-                probe.zero_()
-                triton_projection_reduce_scatter(state, probe, 1)
-                self.peer_states[width] = state
-            logger.info(
-                "Projection ReduceScatter: triton_peer, direct GEMM and borrowed A2A"
-            )
-        if backend == "triton_rsag":
-            if self.send.dtype != torch.bfloat16 or any(
-                width <= 0 or width % 8 for width in output_sizes
-            ):
-                raise ValueError("Projection RSAG requires BF16 and 8-aligned widths")
-            if self.a2a is None:
-                logger.warning("Projection RSAG requires fused NVLink A2A; using NCCL")
-                self._rs_initialized = True
-                return
-            group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            capacity = min(self.max_tokens, RSAG_MAX_TOKENS) * parallel.tp_size
-            for width in sorted(set(output_sizes)):
-                state = create_state(
-                    group=group,
-                    rank_in_group=parallel.tp_rank,
-                    max_tokens=capacity,
-                    hidden_size=width,
-                    device=self.send.device,
-                    max_numel=0,
-                    max_bytes=0,
-                    attnres_max_numel=0,
-                    attnres_max_rows=0,
-                )
-                # Warm rendezvous/JIT on owned buffers, never inside model capture.
-                probe = torch.zeros(
-                    (parallel.tp_size, width),
-                    dtype=self.send.dtype,
-                    device=self.send.device,
-                )
-                triton_reduce_scatter(
-                    state,
-                    probe,
-                    tp_num_tokens=None,
-                    token_list_in_group=[1] * parallel.tp_size,
-                    safe=True,
-                )
-                self.rsag_states[width] = state
-            logger.info(
-                "Projection ReduceScatter: triton_rsag, cloned output, %s rows/rank",
-                min(self.max_tokens, RSAG_MAX_TOKENS),
-            )
-        self._rs_initialized = True
-
-    def use_rsag(self, output_size: int, max_tokens: int, fused_a2a: bool) -> bool:
-        """Use the measured fused-A2A combination, identically on every rank."""
-        return (
-            fused_a2a
-            and output_size in self.rsag_states
-            and 0 < max_tokens <= min(self.max_tokens, RSAG_MAX_TOKENS)
-        )
-
-    def peer_state(self, output_size: int, rows: int, fused_a2a: bool):
-        """Select the same prepared fast path from shared physical counts."""
-        if fused_a2a and 0 < rows <= min(self.max_tokens, FLASHINFER_MAX_TOKENS):
-            return self.peer_states.get(output_size)
-        return None
-
-    def reduce_scatter(
-        self,
-        partial: torch.Tensor,
-        parallel: DenseLayerMapping,
-        max_tokens: int,
-        fused_a2a: bool,
-    ) -> torch.Tensor:
-        """Return owned output rows; never expose the reusable RSAG buffer."""
-        peer = self.peer_state(partial.shape[1], max_tokens, fused_a2a)
-        if peer is not None:
-            return triton_projection_reduce_scatter(peer, partial, max_tokens)
-        if self.use_rsag(partial.shape[1], max_tokens, fused_a2a):
-            return triton_reduce_scatter(
-                self.rsag_states[partial.shape[1]],
-                partial,
-                tp_num_tokens=None,
-                token_list_in_group=[max_tokens] * parallel.tp_size,
-                safe=True,
-            )
-        return reduce_scatter(partial, parallel.tp_group, backend=None)
-
-    def initialize_a2a(self, parallel: DenseLayerMapping, max_input_size: int) -> None:
-        """Collectively prepare optional IPC/JIT resources before graph capture.
-
-        The communicator is shared by sequential layers and lives as long as
-        this workspace. Never replace it while captured graphs reference it.
-        """
-        if self._a2a_initialized:
-            return
-        backend = projection_a2a_backend(os.environ.get(A2A_ENV_NAME, "nccl"))
-        if backend != "nccl":
-            self.a2a, self.a2a_reason = create_projection_a2a(
-                group=pg_manager.get_process_group("nccl", parallel.tp_group),
-                max_elems=min(self.max_tokens, FLASHINFER_MAX_TOKENS) * max_input_size,
-                dtype=self.send.dtype,
-                device=self.send.device,
-                backend=backend,
-            )
-            logger.info(
-                "Projection A2A: %s (%s)",
-                "flashinfer" if self.a2a is not None else "nccl",
-                self.a2a_reason or "NVLink",
-            )
-        self._a2a_initialized = True
-
-    def use_flashinfer(
-        self, parallel: DenseLayerMapping, counts: list[int], input_size: int
-    ) -> bool:
-        """Choose identically on every subgroup rank, using only host metadata."""
-        rows = counts[parallel.rank]
-        return (
-            self.a2a is not None
-            and 0 < rows <= FLASHINFER_MAX_TOKENS
-            and input_size % (8 * parallel.tp_size) == 0
-            and all(counts[r] == rows for r in parallel.tp_group)
-        )
-
-    def close(self) -> None:
-        """Collectively release IPC resources after all referencing graphs die."""
-        if self.peer_states:
-            torch.cuda.synchronize(self.send.device)
-            dist.barrier(group=next(iter(self.peer_states.values())).group)
-        self.peer_states.clear()
-        self.borrowed_a2a = None
-        if self.a2a is not None:
-            self.a2a.close()
-            self.a2a = None
-        if self.rsag_states:
-            torch.cuda.synchronize(self.send.device)
-            dist.barrier(group=next(iter(self.rsag_states.values())).group)
-        self.rsag_states.clear()
-
-
-class KimiOutputProjection:
-    """Run a sharded projection and return outputs to the original DP owner.
-
-    The row-parallel Linear remains registered as self_attn.o_proj, preserving
-    checkpoint names and the existing packed-weight/scale shard loaders.
-    """
-
-    def __init__(self, parallel: DenseLayerMapping, input_size: int) -> None:
-        self.parallel = parallel
-        self.input_size = input_size
-        self.workspace: ProjectionWorkspace | None = None
-
-    def forward(
-        self, inputs: torch.Tensor, linear: RowParallelLinear, counts: list[int]
-    ) -> torch.Tensor:
-        """Project local [tokens, channels] rows using subgroup token counts.
-
-        Returns complete [local_tokens, hidden] rows in the original order.
-        All subgroup ranks must call, including ranks with no local tokens.
-        """
-        parallel = self.parallel
-        if (
-            len(counts) != parallel.world_size
-            or counts[parallel.rank] != inputs.shape[0]
-            or any(count < 0 for count in counts)
-            or inputs.ndim != 2
-            or inputs.shape[1] != self.input_size
-        ):
-            raise ValueError(
-                "Output projection requires matching collective token counts"
-            )
-        max_tokens = max(counts[r] for r in parallel.tp_group)
-        if max_tokens == 0:
-            return inputs.new_empty((0, linear.output_size))
-        workspace = self.workspace
-        if workspace is None or max_tokens > workspace.max_tokens:
-            raise RuntimeError(
-                "Output projection workspace must be prepared before forward"
-            )
-        if (
-            inputs.dtype != workspace.send.dtype
-            or inputs.device != workspace.send.device
-        ):
-            raise ValueError(
-                "Output projection inputs must match the prepared workspace"
-            )
-        size = parallel.tp_size
-        shard = self.input_size // size
-        elements = max_tokens * self.input_size
-        send = workspace.send[:elements].view(size, max_tokens, shard)
-        recv = workspace.recv[:elements].view(size * max_tokens, shard)
-        # Equal-sized messages permit capture and avoid device-to-host counts.
-        # Rank-major output segments are exactly reduce-scatter's owner ordering.
-        # One row already has rank-major byte order. Other shapes fuse the
-        # transpose and padding, preserving the original BF16/FP16 values.
-        fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
-        peer = workspace.peer_state(linear.output_size, max_tokens, fused_a2a)
-        quantized_a2a = (
-            peer is not None
-            # Smaller batches did not win in shared-buffer paired timings.
-            and max_tokens == 16
-            and self.input_size % 512 == 0
-            and fp8_linear_accepts_prepacked_input(
-                getattr(linear, "_prepared_fp8_linear", None)
-            )
-        )
-        if quantized_a2a:
-            recv, recv_scales = flashinfer_projection_quantized_a2a(
-                workspace.borrowed_a2a, inputs.contiguous()
-            )
-        elif peer is not None:
-            recv = flashinfer_projection_a2a_borrowed(
-                workspace.borrowed_a2a, inputs.contiguous()
-            )
-        elif fused_a2a:
-            recv = flashinfer_projection_a2a(workspace.a2a, inputs.contiguous())
-        else:
-            packed = triton_pack_projection_input(inputs, send)
-            all_to_all_single(recv, packed, parallel.tp_group, backend=None)
-        if peer is not None:
-            if quantized_a2a:
-                partial, _ = linear.forward_prepacked_into(
-                    recv, recv_scales, peer.input_buffer(max_tokens)
-                )
-            else:
-                partial, _ = linear.forward_into(
-                    recv, None, peer.input_buffer(max_tokens)
-                )
-            # The next borrowed A2A waits for all peer reads before this
-            # symmetric GEMM destination can be reused. No trailing fence here.
-            output = triton_projection_reduce_scatter_after_a2a(
-                peer, partial, max_tokens
-            )
-        else:
-            partial, _ = linear(recv)
-            output = workspace.reduce_scatter(
-                partial.contiguous(), parallel, max_tokens, fused_a2a
-            )
-        return output[: inputs.shape[0]]
 
 
 def make_output_projection(
@@ -454,46 +129,25 @@ def make_output_projection(
     prefix: str,
     default_parallel: AttentionLayerMapping | LinearAttnLayerMapping,
     reduce_results: bool,
-) -> tuple[RowParallelLinear, KimiOutputProjection | None]:
+) -> tuple[RowParallelLinear, DistributedOutputProjection | None]:
     """Construct projection shards and optional DP/TP exchange, without full weights."""
     value = os.environ.get(ENV_NAME, "1")
     parallel = None if value == "1" else projection_mapping(mapping, value)
-    enabled = parallel is not None and parallel.tp_size > 1
-    selected = parallel if enabled else default_parallel
-    if input_size % selected.tp_size:
-        raise ValueError("Output projection channels must divide projection TP size")
-    linear = RowParallelLinear(
-        input_size,
-        output_size,
-        bias=False,
-        input_is_parallel=True,
-        skip_bias_add=False,
-        params_dtype=None,
-        reduce_results=False if enabled else reduce_results,
+    return make_distributed_output_projection(
+        parallel=parallel,
+        input_size=input_size,
+        output_size=output_size,
         quant_config=quant_config,
         prefix=prefix,
-        tp_rank=selected.tp_rank,
-        tp_size=selected.tp_size,
-        tp_group=selected.tp_group,
-        use_presharded_weights=False,
-        override_kernel_name=None,
-        interleave_linear_and_gate=False,
+        default_parallel=default_parallel,
+        reduce_results=reduce_results,
     )
-    if enabled:
-        # Mixed checkpoints resolve quantization per Linear. Inspect that
-        # resolved method, not the model-level default (e.g. MXFP8 vs FP8).
-        resolved = getattr(linear.quant_method, "quant_config", None)
-        block = getattr(resolved, "weight_block_size", None)
-        alignment = block[-1] if block else getattr(resolved, "group_size", 1)
-        if linear.input_size_per_partition % alignment:
-            raise ValueError("Output projection TP shard splits a quantization block")
-    return linear, KimiOutputProjection(parallel, input_size) if enabled else None
 
 
 def project_attention_output(
     inputs: torch.Tensor,
     linear: RowParallelLinear,
-    exchange: KimiOutputProjection | None,
+    exchange: DistributedOutputProjection | None,
     ctx: "ForwardContext",
 ) -> torch.Tensor:
     """Apply the ordinary projection or its projection-only TP exchange."""
