@@ -40,8 +40,10 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.flashinfer import (
     flashinfer_projection_a2a,
     flashinfer_projection_a2a_borrowed,
+    flashinfer_projection_quantized_a2a,
 )
 from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
+from tokenspeed_kernel.ops.gemm import fp8_linear_accepts_prepacked_input
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -179,6 +181,29 @@ def test_rsag_policy_and_disabled_initialization(monkeypatch):
     bad_width = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
     with pytest.raises(ValueError, match="aligned"):
         bad_width.initialize_reduce_scatter(parallel, [127])
+
+
+def test_peer_reduction_reuse_fence_contract(monkeypatch):
+    import tokenspeed_kernel.ops.communication.triton_projection as kernels
+
+    state = kernels.ProjectionPeerState.__new__(kernels.ProjectionPeerState)
+    state.max_rows, state.p, state.r, state.hidden = 16, 4, 0, 128
+    state.buffer = torch.empty(64, 128, dtype=torch.bfloat16)
+    state.ptrs = None
+    barriers = []
+    state.handle = SimpleNamespace(barrier=lambda channel: barriers.append(channel))
+
+    class FakeReduction:
+        def __getitem__(self, grid):
+            return lambda *args: args[1].zero_()
+
+    monkeypatch.setattr(kernels, "owner_reduce", FakeReduction())
+    for synchronize_reuse, expected in ((True, [0, 1]), (False, [0])):
+        barriers.clear()
+        output = state._reduce(state.input_buffer(16), 16, synchronize_reuse)
+        assert barriers == expected
+        assert output.shape == (16, 128)
+        assert output.data_ptr() != state.buffer.data_ptr()
 
 
 def test_optional_a2a_import_and_topology_fallback(monkeypatch):
@@ -428,14 +453,27 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
         exchange.parallel, counts, exchange.input_size
     )
     peer = exchange.workspace.peer_state(linear.output_size, rows, fused)
+    quantized = (
+        peer is not None
+        and rows == 16
+        and exchange.input_size % 512 == 0
+        and fp8_linear_accepts_prepacked_input(
+            getattr(linear, "_prepared_fp8_linear", None)
+        )
+    )
+    recv_scales = None
 
     def pack():
         nonlocal packed
         packed = triton_pack_projection_input(inputs, send)
 
     def exchange_inputs():
-        nonlocal recv
-        if peer is not None:
+        nonlocal recv, recv_scales
+        if quantized:
+            recv, recv_scales = flashinfer_projection_quantized_a2a(
+                exchange.workspace.borrowed_a2a, inputs
+            )
+        elif peer is not None:
             recv = flashinfer_projection_a2a_borrowed(
                 exchange.workspace.borrowed_a2a, inputs
             )
@@ -445,6 +483,10 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
             all_to_all_single(recv, packed, exchange.parallel.tp_group, backend=None)
 
     def gemm():
+        if quantized:
+            return linear.forward_prepacked_into(
+                recv, recv_scales, peer.input_buffer(rows)
+            )
         if peer is not None:
             return linear.forward_into(recv, None, peer.input_buffer(rows))
         return linear(recv)
@@ -453,9 +495,11 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
     exchange_inputs()
     partial, _ = gemm()
     stages = {
-        "all_to_all": exchange_inputs,
+        "quantize_all_to_all" if quantized else "all_to_all": exchange_inputs,
         "gemm": gemm,
-        "reduce_scatter": lambda: exchange.workspace.reduce_scatter(
+        # Isolated reduction needs its own trailing reuse fence; complete
+        # projection timings instead reuse the next A2A's entry barrier.
+        "reduce_scatter_standalone": lambda: exchange.workspace.reduce_scatter(
             partial,
             exchange.parallel,
             rows,
@@ -512,6 +556,7 @@ def main():
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--layer", type=int, choices=(0, 3))
     parser.add_argument("--reference-module", type=Path)
+    parser.add_argument("--reference-shared-workspace", action="store_true")
     parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
@@ -570,15 +615,27 @@ def main():
             reference_exchange = reference_module.KimiOutputProjection(
                 exchange.parallel, k
             )
-            reference_exchange.workspace = reference_module.ProjectionWorkspace(
-                512, k, torch.bfloat16, torch.device("cuda")
-            )
-            if hasattr(reference_exchange.workspace, "initialize_a2a"):
-                reference_exchange.workspace.initialize_a2a(exchange.parallel, k)
+            if args.reference_shared_workspace:
+                # Only for references with the same workspace contract.
+                # Serial calls then compare identical communication addresses.
+                reference_exchange.workspace = exchange.workspace
+            else:
+                reference_exchange.workspace = reference_module.ProjectionWorkspace(
+                    512, k, torch.bfloat16, torch.device("cuda")
+                )
+                if hasattr(reference_exchange.workspace, "initialize_a2a"):
+                    reference_exchange.workspace.initialize_a2a(exchange.parallel, k)
+                if hasattr(reference_exchange.workspace, "initialize_reduce_scatter"):
+                    reference_exchange.workspace.initialize_reduce_scatter(
+                        exchange.parallel, [n]
+                    )
         patterns = [
             [1] * world,
             [8] * world,
+            [2] * world,
+            [4] * world,
             [16] * world,
+            [16 if r < 4 else 0 for r in range(world)],
             [17] * world,
             [64] * world,
             [257] * world,
@@ -692,11 +749,14 @@ def main():
                 capture = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(capture):
                     graphed = exchange.forward(x, linear, counts)
-                for multiplier in (0.5, -1.0, 0.0):
+                for multiplier in (0.5, -1.0, 1e-10, 0.0):
                     x.mul_(multiplier)
                     capture.replay()
                     eager = exchange.forward(x, linear, counts)
                     torch.testing.assert_close(graphed, eager, rtol=0, atol=0)
+                    if reference_exchange is not None and using_peer:
+                        prior = reference_exchange.forward(x, linear, counts)
+                        torch.testing.assert_close(eager, prior, rtol=0, atol=0)
                 # Captured collective counts describe physical rows. Valid
                 # token counts may change within that envelope between replays.
                 for valid in (counts[rank] // 2, counts[rank], 0):
@@ -711,6 +771,7 @@ def main():
                 del capture, graphed
             record = {
                 "shape": [n, k],
+                "reference_shared_workspace": args.reference_shared_workspace,
                 "layer": layer,
                 "counts": counts,
                 "reference_relative_l2": reference_relative_l2.item(),
@@ -746,6 +807,7 @@ def main():
                     )
                 if reference_exchange is not None:
                     variants = {
+                        "tp1": local,
                         "reference": lambda: reference_exchange.forward(
                             x, linear, counts
                         ),
@@ -753,11 +815,9 @@ def main():
                     }
                     samples = []
                     for repeat in range(args.repeats):
-                        order = (
-                            ("reference", "optimized")
-                            if repeat % 2 == 0
-                            else ("optimized", "reference")
-                        )
+                        names = ("tp1", "reference", "optimized")
+                        offset = repeat % len(names)
+                        order = names[offset:] + names[:offset]
                         samples.append(
                             {
                                 name: measure(variants[name], args.iterations, True)

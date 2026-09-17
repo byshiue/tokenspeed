@@ -71,6 +71,9 @@ class ProjectionPeerState:
 
     def reduce(self, partial, rows):
         """Return owned local rows; all peers must call, including padded ranks."""
+        return self._reduce(partial, rows, True)
+
+    def _reduce(self, partial, rows, synchronize_reuse):
         destination = self.input_buffer(rows)
         if partial.shape != destination.shape or partial.dtype != destination.dtype:
             raise ValueError("Projection partials have incompatible shape or dtype")
@@ -89,8 +92,10 @@ class ProjectionPeerState:
         owner_reduce[(triton.cdiv(rows * self.hidden, 1024),)](
             self.ptrs, out, rows, self.hidden, self.p, self.r, 1024
         )
-        # No rank may start the next GEMM until all remote reads finish.
-        self.handle.barrier(channel=1)
+        # Standalone callers need an explicit fence before reusing partials.
+        # The complete projection can instead use its next A2A entry barrier.
+        if synchronize_reuse:
+            self.handle.barrier(channel=1)
         return out
 
 
@@ -108,3 +113,23 @@ def triton_projection_reduce_scatter(state, partial, rows):
     its borrowed input buffer must be serialized on one stream per subgroup.
     """
     return state.reduce(partial, rows)
+
+
+@register_kernel(
+    "communication",
+    "projection_reduce_scatter_after_a2a",
+    name="triton_projection_reduce_scatter_after_a2a",
+    solution="triton",
+    signatures=format_signatures(("partial",), "dense", {torch.bfloat16}),
+)
+def triton_projection_reduce_scatter_after_a2a(state, partial, rows):
+    """Reduce TP4 partials, deferring reuse synchronization to the next A2A.
+
+    Arguments and output match triton_projection_reduce_scatter. Every future
+    write to state.buffer must follow a same-subgroup A2A entry barrier on the
+    same serialized stream. That barrier observes all previous reduction reads
+    complete before any peer launches its next GEMM. This contract includes
+    transitions through NCCL fallback shapes and empty groups, which do not
+    write this buffer. Standalone reductions must use the fenced entry point.
+    """
+    return state._reduce(partial, rows, False)
