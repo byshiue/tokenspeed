@@ -164,6 +164,8 @@ from tokenspeed.runtime.models.kimi_k3_comm import (
 )
 from tokenspeed.runtime.models.kimi_k3_o_proj import (
     A2A_ENV_NAME,
+    DEFAULT_A2A_BACKEND,
+    DEFAULT_RS_BACKEND,
     RS_ENV_NAME,
     initialize_projection_parallelism,
     make_output_projection,
@@ -3187,7 +3189,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 workspace.initialize_a2a(
                     exchanges[0].parallel,
                     max_input_size,
-                    backend=os.environ.get(A2A_ENV_NAME, "nccl"),
+                    backend=os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
                 )
                 workspace.initialize_reduce_scatter(
                     exchanges[0].parallel,
@@ -3197,7 +3199,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                         if hasattr(layer, "self_attn")
                         and layer.self_attn.output_projection_exchange is not None
                     ],
-                    backend=os.environ.get(RS_ENV_NAME, "nccl"),
+                    backend=os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
                 )
             elif max_num_tokens > workspace.max_tokens:
                 raise RuntimeError("Cannot grow a prepared projection workspace")
