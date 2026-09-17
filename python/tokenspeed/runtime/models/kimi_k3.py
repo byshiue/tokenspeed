@@ -56,7 +56,6 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -110,10 +109,6 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.attention.o_proj import (
-    A2A_ENV_NAME,
-    DEFAULT_A2A_BACKEND,
-    DEFAULT_RS_BACKEND,
-    RS_ENV_NAME,
     ProjectionWorkspace,
     initialize_projection_group,
     make_output_projection,
@@ -188,7 +183,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -197,20 +192,18 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-O_PROJ_TP_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
 
 
 def _output_projection_mapping(mapping: Mapping) -> DenseLayerMapping:
     """Resolve projection-only TP without changing attention/cache mappings."""
-    value = os.environ.get(O_PROJ_TP_ENV_NAME, "1")
+    setting = envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE
+    value = setting.get()
     try:
         size = int(value)
     except ValueError as exc:
-        raise ValueError(f"{O_PROJ_TP_ENV_NAME} must be a positive integer") from exc
+        raise ValueError(f"{setting.name} must be a positive integer") from exc
     if size < 1 or mapping.world_size % size:
-        raise ValueError(
-            f"{O_PROJ_TP_ENV_NAME} must be a positive divisor of world size"
-        )
+        raise ValueError(f"{setting.name} must be a positive divisor of world size")
     if size > 1 and (
         mapping.attn.dp_size != mapping.world_size
         or mapping.linear_attn.tp_size != 1
@@ -218,7 +211,7 @@ def _output_projection_mapping(mapping: Mapping) -> DenseLayerMapping:
         or mapping.pp_size != 1
     ):
         raise ValueError(
-            f"{O_PROJ_TP_ENV_NAME}>1 requires attention/linear-attention TP1, "
+            f"{setting.name}>1 requires attention/linear-attention TP1, "
             "attention DP == MoE EP == world size, and PP1"
         )
     return projection_mapping(mapping.rank, mapping.world_size, size)
@@ -2928,9 +2921,9 @@ class KimiLinearModel(nn.Module):
         # Agree before parsing local settings or constructing projection groups.
         validate_projection_settings(
             mapping,
-            os.environ.get(O_PROJ_TP_ENV_NAME, "1"),
-            os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
-            os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+            envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
+            envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+            envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
         )
         parallel = _output_projection_mapping(mapping)
         initialize_projection_group(parallel)
@@ -3260,7 +3253,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 workspace.initialize_a2a(
                     exchanges[0].parallel,
                     max_input_size,
-                    backend=os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
+                    backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
                 )
                 workspace.initialize_reduce_scatter(
                     exchanges[0].parallel,
@@ -3270,7 +3263,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                         if hasattr(layer, "self_attn")
                         and layer.self_attn.output_projection_exchange is not None
                     ],
-                    backend=os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+                    backend=envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
                 )
             elif max_num_tokens > workspace.max_tokens:
                 raise RuntimeError("Cannot grow a prepared projection workspace")

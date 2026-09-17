@@ -52,18 +52,17 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.layers.attention import o_proj as projection_ops
 from tokenspeed.runtime.layers.attention.o_proj import (
-    A2A_ENV_NAME,
-    DEFAULT_A2A_BACKEND,
-    DEFAULT_RS_BACKEND,
-    RS_ENV_NAME,
     ProjectionWorkspace,
     initialize_projection_group,
     make_output_projection,
     projection_mapping,
     validate_projection_settings,
 )
+from tokenspeed.runtime.utils.env import envs
 
-ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
+ENV_NAME = envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.name
+A2A_ENV_NAME = envs.TOKENSPEED_O_PROJ_A2A_BACKEND.name
+RS_ENV_NAME = envs.TOKENSPEED_O_PROJ_RS_BACKEND.name
 
 
 def dep_mapping(rank: int, world: int) -> Mapping:
@@ -92,6 +91,13 @@ def dep_mapping(rank: int, world: int) -> Mapping:
 
 
 def test_projection_mapping_and_validation(monkeypatch):
+    for field, expected in (
+        (envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE, "1"),
+        (envs.TOKENSPEED_O_PROJ_A2A_BACKEND, "flashinfer"),
+        (envs.TOKENSPEED_O_PROJ_RS_BACKEND, "triton_peer"),
+    ):
+        monkeypatch.delenv(field.name, raising=False)
+        assert field.get() == expected
     for size in (1, 2, 4, 8, 16):
         for rank in range(16):
             mapping = dep_mapping(rank, 16)
@@ -104,8 +110,15 @@ def test_projection_mapping_and_validation(monkeypatch):
             assert mapping.attn.tp_size == mapping.linear_attn.tp_size == 1
             assert mapping.moe.ep_size == 16
     for value in ("", "bad", "0", "-1", "3", "32"):
+        monkeypatch.setenv(ENV_NAME, value)
+        assert envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get() == value
         with pytest.raises(ValueError):
-            validate_projection_settings(dep_mapping(0, 16), value, "nccl", "nccl")
+            validate_projection_settings(
+                dep_mapping(0, 16),
+                envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
+                "nccl",
+                "nccl",
+            )
     from tokenspeed.runtime.models.kimi_k3 import _output_projection_mapping
 
     monkeypatch.setenv(ENV_NAME, "4")
@@ -127,18 +140,20 @@ def test_projection_mapping_and_validation(monkeypatch):
             monkeypatch.setenv(name, value)
             validate_projection_settings(
                 mapping,
-                os.environ[ENV_NAME],
-                os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
-                os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+                envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
+                envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+                envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
             )
         for value in invalid:
             monkeypatch.setenv(name, value)
-            with pytest.raises(ValueError, match=name):
+            with pytest.raises(
+                ValueError, match="A2A" if name == A2A_ENV_NAME else "reduction"
+            ):
                 validate_projection_settings(
                     mapping,
-                    os.environ[ENV_NAME],
-                    os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
-                    os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+                    envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
+                    envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+                    envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
                 )
         monkeypatch.setenv(name, "nccl")
 
@@ -164,8 +179,6 @@ def test_projection_mapping_and_validation(monkeypatch):
 
 
 def test_a2a_policy_and_lifecycle(monkeypatch):
-    assert DEFAULT_A2A_BACKEND == "flashinfer"
-    assert DEFAULT_RS_BACKEND == "triton_peer"
     monkeypatch.setenv(A2A_ENV_NAME, "nccl")
     workspace = ProjectionWorkspace(512, 256, torch.bfloat16, torch.device("cpu"))
     parallel = projection_mapping(0, 4, 4)
@@ -705,9 +718,9 @@ def main():
     os.environ[ENV_NAME] = "4"
     parallel = validate_projection_settings(
         mapping,
-        os.environ[ENV_NAME],
-        os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
-        os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+        envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
+        envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+        envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
     )
     initialize_projection_group(parallel)
     reference_module = None
@@ -749,12 +762,12 @@ def main():
         exchange.workspace.initialize_a2a(
             exchange.parallel,
             k,
-            backend=os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
+            backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
         )
         exchange.workspace.initialize_reduce_scatter(
             exchange.parallel,
             [n],
-            backend=os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+            backend=envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
         )
         reference_exchange = None
         if reference_module is not None:

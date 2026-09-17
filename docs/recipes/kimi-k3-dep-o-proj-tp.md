@@ -73,7 +73,10 @@ FlashInfer A2A (`flashinfer`) and custom symmetric reduction (`triton_peer`).
 Backend overrides use `TOKENSPEED_O_PROJ_A2A_BACKEND` and
 `TOKENSPEED_O_PROJ_RS_BACKEND`; replace the former Kimi-prefixed backend
 variables in existing launch scripts. The old names are no longer read.
-The TP-size switch remains Kimi-specific. Shared projection construction,
+The TP-size switch remains Kimi-specific. All three settings and defaults are
+registered in `runtime/utils/env.py` as raw strings: ranks agree on their values
+before strict validation, so malformed input is rejected rather than silently
+replaced by a default. Shared projection construction,
 execution, and settings validation live in `layers/attention/o_proj.py`;
 `models/kimi_k3.py` owns feature enablement and DEP topology restrictions.
 The thresholds are independent and refer to physical tokens per rank, including
