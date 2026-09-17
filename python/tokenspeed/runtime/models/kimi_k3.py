@@ -56,6 +56,7 @@ Module hierarchy matches the checkpoint::
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -107,6 +108,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.attention.o_proj import ProjectionWorkspace
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
 )
@@ -161,7 +163,8 @@ from tokenspeed.runtime.models.kimi_k3_comm import (
     prepare_k3_all_reduce_buffers,
 )
 from tokenspeed.runtime.models.kimi_k3_o_proj import (
-    ProjectionWorkspace,
+    A2A_ENV_NAME,
+    RS_ENV_NAME,
     initialize_projection_parallelism,
     make_output_projection,
     project_attention_output,
@@ -3042,7 +3045,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     dtype=weight.dtype,
                     device=weight.device,
                 )
-                workspace.initialize_a2a(exchanges[0].parallel, max_input_size)
+                workspace.initialize_a2a(
+                    exchanges[0].parallel,
+                    max_input_size,
+                    backend=os.environ.get(A2A_ENV_NAME, "nccl"),
+                )
                 workspace.initialize_reduce_scatter(
                     exchanges[0].parallel,
                     [
@@ -3051,6 +3058,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                         if hasattr(layer, "self_attn")
                         and layer.self_attn.output_projection_exchange is not None
                     ],
+                    backend=os.environ.get(RS_ENV_NAME, "nccl"),
                 )
             elif max_num_tokens > workspace.max_tokens:
                 raise RuntimeError("Cannot grow a prepared projection workspace")
