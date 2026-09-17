@@ -180,7 +180,13 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
     planned = fp8_linear(
-        plan, x, weight, weight_scales, out_dtype=torch.bfloat16, out=None
+        plan,
+        x,
+        weight,
+        weight_scales,
+        out_dtype=torch.bfloat16,
+        out=None,
+        input_scales_prepacked=False,
     )
     prepacked = mm(
         x,
@@ -193,6 +199,23 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         prepacked_scales=True,
     )
     torch.testing.assert_close(planned, prepacked, atol=0, rtol=0)
+
+    q, scales = flashinfer_fp8_blockscale_quantize_prepacked(x)
+    supplied = fp8_linear(
+        plan,
+        q,
+        weight,
+        weight_scales,
+        input_scales=scales,
+        out_dtype=x.dtype,
+        out=None,
+        input_scales_prepacked=True,
+    )
+    torch.testing.assert_close(supplied[:m], planned, atol=0, rtol=0)
+    with pytest.raises(ValueError, match="Prepacked input"):
+        fp8_linear(
+            plan, x, weight, weight_scales, out=None, input_scales_prepacked=True
+        )
 
     # Exercise direct destinations and the padded/strided copy fallback with
     # canaries: a padded kernel must never overwrite the caller's next row.
@@ -210,6 +233,7 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
                 bias=None,
                 out_dtype=x.dtype,
                 out=destination,
+                input_scales_prepacked=False,
             )
 
         result = run_into()
@@ -238,7 +262,13 @@ def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> No
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
     planned = fp8_linear(
-        plan, x, weight, weight_scales, out_dtype=torch.bfloat16, out=None
+        plan,
+        x,
+        weight,
+        weight_scales,
+        out_dtype=torch.bfloat16,
+        out=None,
+        input_scales_prepacked=False,
     )
     canonical = mm(
         x,
@@ -265,7 +295,15 @@ def test_prepared_plan_is_exact_for_partial_row_tiles(device: str, m: int) -> No
     )
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
-    got = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16, out=None)
+    got = fp8_linear(
+        plan,
+        x,
+        weight,
+        weight_scales,
+        out_dtype=torch.bfloat16,
+        out=None,
+        input_scales_prepacked=False,
+    )
 
     # Compare against the exact product of the quantized operands.
     quantized_x, activation_scales = flashinfer_fp8_blockscale_quantize_prepacked(x)

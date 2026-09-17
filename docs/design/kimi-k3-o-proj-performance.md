@@ -240,7 +240,110 @@ reference had 100 receive copies of 393216 bytes. The optimized path had
 zero memcpy events and no staging-copy kernel: each projection ran A2A,
 activation quantization, GEMM, two barriers, and owner reduction.
 
+### Reusing the next A2A barrier
+
+The complete copy-free path can omit its trailing reduction barrier because
+the next A2A waits for every peer before another GEMM overwrites symmetric
+partials. Standalone reductions retain that barrier. This changes
+synchronization only, not arithmetic or output ownership.
+
+A matched 16-GPU comparison against the previous copy-free implementation,
+using the same chained-graph protocol and six alternating samples, measured:
+
+| Projection, 16 rows/rank | Previous copy-free | Deferred reuse fence |
+|---|---:|---:|
+| KDA | 36.62 µs | 31.78 µs |
+| MLA | 36.57 µs | 31.93 µs |
+
+All 22 real-weight cases matched the previous implementation bit for bit.
+A separate prototype also passed delayed-rank tests and graphs containing
+batch-size changes, inactive groups and NCCL fallback transitions. The
+paired gains were about 13%; absolute latencies should not be compared to
+unpaired baselines from other runs. This optimization is retained.
+
+### Quantizing during A2A
+
+The fused exchange sends FP8 values and FP32 128-channel scales instead of
+BF16 activations, then feeds those scales directly to the prepared GEMM.
+At 16 rows/rank, payload falls from 384 KiB to 198 KiB. Both regions fit in
+the existing receive allocation; no persistent buffer is added.
+
+An initial production comparison used separate communication workspaces and
+showed gains even for an unchanged one-row control. Repeating with shared
+buffers removed that control difference. The shared-buffer comparison is the
+isolated ablation; separate-workspace numbers should not be used to justify
+small-batch fusion.
+
+Using the same real weights, 16 GPUs and chained-graph protocol, six rotating
+TP1/reference/candidate samples gave:
+
+| Projection | Rows/rank | BF16 A2A + quantization | Fused quantization + A2A |
+|---|---:|---:|---:|
+| KDA | 2 | 26.64 µs | 26.81 µs |
+| KDA | 4 | 27.08 µs | 27.34 µs |
+| KDA | 8 | 27.66 µs | 27.71 µs |
+| KDA | 16 | 30.89 µs | 29.80 µs |
+| MLA | 2 | 26.75 µs | 26.91 µs |
+| MLA | 4 | 27.08 µs | 27.43 µs |
+| MLA | 8 | 27.76 µs | 27.82 µs |
+| MLA | 16 | 30.93 µs | 29.74 µs |
+
+Only the 16-row route is retained: roughly 3.5–3.8% lower complete-projection
+latency. Smaller batches keep BF16 A2A. All 26 real-weight cases passed;
+outputs matched the prior implementation exactly, including graph replays
+with zero and tiny inputs. The fused quantizer preserves the runtime's
+BF16-rounded amax floor rather than changing zero-input scale semantics.
+These checks are not a full-model accuracy result.
+
+The final 16-row-only policy passed 28 real-weight and 24 BF16 cases, including
+active and inactive subgroups. A repeat measured 30.89 → 29.80 µs for KDA
+and 30.89 → 29.76 µs for MLA; unchanged smaller shapes stayed within timing
+noise. The prepared FP8 kernel tests (39) and projection unit tests (7) passed.
+
+A short NSYS capture confirms the intended change on all four GPUs of an
+inspected subgroup. For 100 projections per path, the reference launches
+100 A2A and 100 activation-quantization kernels; the candidate replaces
+them with 100 fused exchange kernels. Both retain 100 GEMMs, publication
+barriers and owner reductions, with zero memcpy events. Profiled durations
+are diagnostic only; the latency table uses unprofiled CUDA-event samples.
+
+### TP1 versus TP4: latency and storage
+
+In that shared-buffer run, independent TP1 projections took 24.22 µs for
+KDA and 24.39 µs for MLA at 16 rows/rank. Fused TP4 took 29.80/29.74 µs,
+about 23%/22% longer. All four TP4 groups were active: 256 tokens in total,
+with the same aggregate work as 16 independent TP1 projections.
+
+For each [7168,12288] FP8 projection, checkpoint weight and FP32 block scales
+occupy 84.02 MiB per GPU under TP1 versus 21.01 MiB under TP4, a saving of
+63.02 MiB. These numbers exclude prepared scale copies, communication scratch,
+allocator overhead and the rest of the model. The TP4 partial-result buffer
+is 896 KiB per GPU per shared output width; quantized exchange adds no
+communication allocation.
+
+Keep TP size as a startup choice. TP1 is preferable for projection latency
+when replicated weights fit; TP4 remains a weight-storage tradeoff, not a
+measured latency win. Switching to TP1 dynamically would require retaining
+the full weights, losing the storage benefit, or gathering missing weights
+before use. Neither is a free communication optimization. No dynamic
+selection or weight replication is introduced by these experiments.
+
 ### Other candidates and limits
+
+GEMM–reduction fusion was also tested after retaining the deferred reuse
+fence. The installed fused dense-GEMM API does not support the checkpoint's
+per-128-K scales, so a bounded FP8 prototype preserved those scales, published
+BF16 partial tiles and reduced peer data in the same kernel. Both 128- and
+64-column tile variants passed real-weight numerical and graph tests on
+16 GPUs at 1/8/16 rows per rank.
+
+At 16 rows/rank, the first variant took 49.83 µs for KDA and 48.44 µs for
+MLA. Smaller tiles lowered register use from 242 to 122 and latency to
+44.28/43.96 µs, still slower than the matched retained path at about
+30.84/31.28 µs. Relative L2 differences were below 0.02%. Neither prototype
+is integrated. This result does not rule out fusion built into a better
+GEMM implementation; it shows that removing launches did not compensate
+for the cost of these replacements.
 
 The earlier 41–44 µs comparison used one projection per graph. Capturing 20
 operations reduced the apparent custom-reduction advantage to about 1.4–1.6%

@@ -125,6 +125,13 @@ export TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=flashinfer
 export TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=triton_peer
 ```
 
+For prepared block-FP8 projections, this path fuses quantization into A2A at
+16 physical rows per rank. Smaller batches retain BF16 exchange because
+shared-buffer measurements did not show a gain. The complete projection
+also reuses the next A2A entry barrier as its reduction-storage reuse fence;
+standalone reduction diagnostics still include an explicit trailing fence.
+See the performance notes for paired timings and the TP1 memory tradeoff.
+
 It borrows the A2A receive buffer and lets supported FP8 GEMMs write directly
 into symmetric reduction storage. The final output is owned, not a workspace
 view. The same balanced 1–16 physical rows/rank cutoff applies; larger or
