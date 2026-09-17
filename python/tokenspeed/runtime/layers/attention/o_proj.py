@@ -28,6 +28,7 @@ must outlive all captured graphs that reference them.
 """
 
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -59,6 +60,7 @@ from tokenspeed.runtime.distributed.mapping import (
     AttentionLayerMapping,
     DenseLayerMapping,
     LinearAttnLayerMapping,
+    Mapping,
 )
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -66,7 +68,14 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 from tokenspeed.runtime.layers.linear import RowParallelLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 
+if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.context import ForwardContext
+
 logger = logging.getLogger(__name__)
+A2A_ENV_NAME = "TOKENSPEED_O_PROJ_A2A_BACKEND"
+RS_ENV_NAME = "TOKENSPEED_O_PROJ_RS_BACKEND"
+DEFAULT_A2A_BACKEND = "flashinfer"
+DEFAULT_RS_BACKEND = "triton_peer"
 FLASHINFER_MAX_TOKENS = 512
 PEER_MAX_TOKENS = 8192
 RSAG_MAX_TOKENS = 64
@@ -79,6 +88,47 @@ def projection_mapping(rank: int, world_size: int, tp_size: int) -> DenseLayerMa
     return DenseLayerMapping(
         rank=rank, world_size=world_size, tp_size=tp_size, dp_size=world_size // tp_size
     )
+
+
+def validate_projection_settings(
+    mapping: Mapping, value: str, a2a_value: str, rs_value: str
+) -> DenseLayerMapping:
+    """Validate explicit TP/backend settings across ranks and return the mapping.
+
+    Args:
+        mapping: Model mapping supplying the world group and rank.
+        value: Requested projection TP size, kept as a string until ranks agree.
+        a2a_value: Selected A2A backend.
+        rs_value: Selected reduction backend.
+
+    Returns:
+        The contiguous projection mapping. The model must validate its topology
+        before calling initialize_projection_group; this function creates no
+        projection subgroup and reads no environment variables.
+    """
+    if dist.is_initialized() and mapping.world_size > 1:
+        # Every rank participates, even when its local setting is disabled or
+        # malformed. Reject disagreement before entering differently sized groups.
+        pg_manager.init_process_group(mapping.world_group, backend="gloo")
+        values = [None] * mapping.world_size
+        dist.all_gather_object(
+            values,
+            (value, a2a_value, rs_value),
+            group=pg_manager.get_process_group("gloo", mapping.world_group),
+        )
+        if len(set(values)) != 1:
+            raise ValueError(
+                f"Projection TP/A2A/RS settings differ across ranks: {values}"
+            )
+    if a2a_value not in ("nccl", "auto", "flashinfer", "flashinfer_quantized"):
+        raise ValueError(f"Invalid {A2A_ENV_NAME}: {a2a_value}")
+    if rs_value not in ("nccl", "triton_rsag", "triton_peer"):
+        raise ValueError(f"{RS_ENV_NAME} must be nccl, triton_rsag, or triton_peer")
+    try:
+        size = int(value)
+    except ValueError as exc:
+        raise ValueError("Projection TP size must be a positive integer") from exc
+    return projection_mapping(mapping.rank, mapping.world_size, size)
 
 
 def initialize_projection_group(parallel: DenseLayerMapping) -> None:
@@ -446,3 +496,21 @@ def make_output_projection(
     return linear, (
         DistributedOutputProjection(parallel, input_size) if enabled else None
     )
+
+
+def project_attention_output(
+    inputs: torch.Tensor,
+    linear: RowParallelLinear,
+    exchange: DistributedOutputProjection | None,
+    ctx: "ForwardContext",
+) -> torch.Tensor:
+    """Apply the ordinary projection or its projection-only TP exchange."""
+    if exchange is None:
+        output, _ = linear(inputs)
+        return output
+    counts = ctx.collective_global_num_tokens
+    if counts is None:
+        counts = ctx.global_num_tokens
+    if counts is None:
+        raise ValueError("Output projection TP requires collective token counts")
+    return exchange.forward(inputs, linear, counts)

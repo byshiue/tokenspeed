@@ -101,14 +101,25 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     reduce_scatter,
 )
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import DenseLayerMapping, Mapping
 from tokenspeed.runtime.distributed.pp_stage import PPStageState, pp_layer_window
 from tokenspeed.runtime.execution.forward_step import (
     get_is_capture_mode,
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
-from tokenspeed.runtime.layers.attention.o_proj import ProjectionWorkspace
+from tokenspeed.runtime.layers.attention.o_proj import (
+    A2A_ENV_NAME,
+    DEFAULT_A2A_BACKEND,
+    DEFAULT_RS_BACKEND,
+    RS_ENV_NAME,
+    ProjectionWorkspace,
+    initialize_projection_group,
+    make_output_projection,
+    project_attention_output,
+    projection_mapping,
+    validate_projection_settings,
+)
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
 )
@@ -162,15 +173,6 @@ from tokenspeed.runtime.models.kimi_k3_comm import (
     K3MoeTailComm,
     prepare_k3_all_reduce_buffers,
 )
-from tokenspeed.runtime.models.kimi_k3_o_proj import (
-    A2A_ENV_NAME,
-    DEFAULT_A2A_BACKEND,
-    DEFAULT_RS_BACKEND,
-    RS_ENV_NAME,
-    initialize_projection_parallelism,
-    make_output_projection,
-    project_attention_output,
-)
 from tokenspeed.runtime.models.moonvit import MoonViTVisionPath
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
@@ -192,6 +194,32 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+O_PROJ_TP_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
+
+
+def _output_projection_mapping(mapping: Mapping) -> DenseLayerMapping:
+    """Resolve projection-only TP without changing attention/cache mappings."""
+    value = os.environ.get(O_PROJ_TP_ENV_NAME, "1")
+    try:
+        size = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{O_PROJ_TP_ENV_NAME} must be a positive integer") from exc
+    if size < 1 or mapping.world_size % size:
+        raise ValueError(
+            f"{O_PROJ_TP_ENV_NAME} must be a positive divisor of world size"
+        )
+    if size > 1 and (
+        mapping.attn.dp_size != mapping.world_size
+        or mapping.linear_attn.tp_size != 1
+        or mapping.moe.ep_size != mapping.world_size
+        or mapping.pp_size != 1
+    ):
+        raise ValueError(
+            f"{O_PROJ_TP_ENV_NAME}>1 requires attention/linear-attention TP1, "
+            "attention DP == MoE EP == world size, and PP1"
+        )
+    return projection_mapping(mapping.rank, mapping.world_size, size)
+
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -358,7 +386,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         # post-load quantization still see the original parameter names.
         assert not bias
         linear, self.output_projection_exchange = make_output_projection(
-            mapping=self.mapping,
+            parallel=_output_projection_mapping(self.mapping),
             input_size=input_size,
             output_size=output_size,
             quant_config=quant_config,
@@ -1206,7 +1234,7 @@ class KimiLinearKDA(nn.Module):
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.o_proj, self.output_projection_exchange = make_output_projection(
-            mapping=mapping,
+            parallel=_output_projection_mapping(mapping),
             input_size=proj,
             output_size=hidden,
             quant_config=quant_config,
@@ -2770,7 +2798,15 @@ class KimiLinearModel(nn.Module):
         self.mapping = mapping
         self.quant_config = quant_config
 
-        initialize_projection_parallelism(mapping)
+        # Agree before parsing local settings or constructing projection groups.
+        validate_projection_settings(
+            mapping,
+            os.environ.get(O_PROJ_TP_ENV_NAME, "1"),
+            os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
+            os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+        )
+        parallel = _output_projection_mapping(mapping)
+        initialize_projection_group(parallel)
 
         alt_stream = (
             torch.cuda.Stream(priority=-1) if torch.cuda.is_available() else None

@@ -70,6 +70,12 @@ export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=4
 
 With projection TP enabled, omitted backend settings now select BF16
 FlashInfer A2A (`flashinfer`) and custom symmetric reduction (`triton_peer`).
+Backend overrides use `TOKENSPEED_O_PROJ_A2A_BACKEND` and
+`TOKENSPEED_O_PROJ_RS_BACKEND`; replace the former Kimi-prefixed backend
+variables in existing launch scripts. The old names are no longer read.
+The TP-size switch remains Kimi-specific. Shared projection construction,
+execution, and settings validation live in `layers/attention/o_proj.py`;
+`models/kimi_k3.py` owns feature enablement and DEP topology restrictions.
 The thresholds are independent and refer to physical tokens per rank, including
 graph padding—not context length or subgroup-total tokens:
 
@@ -93,11 +99,11 @@ are fatal. Never retry another collective after a rank-local forward failure.
 To run the NCCL reference, set both backends explicitly:
 
 ```bash
-export TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=nccl
-export TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=nccl
+export TOKENSPEED_O_PROJ_A2A_BACKEND=nccl
+export TOKENSPEED_O_PROJ_RS_BACKEND=nccl
 ```
 
-`TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=flashinfer_quantized` retains the
+`TOKENSPEED_O_PROJ_A2A_BACKEND=flashinfer_quantized` retains the
 experimental Quant FI + Sym route for compatible prepared block-FP8
 projections within the 512-row FI envelope. It is not the default. The usual
 `flashinfer` path sends BF16 and quantizes separately before FP8 GEMM.
