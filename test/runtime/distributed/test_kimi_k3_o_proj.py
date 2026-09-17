@@ -51,19 +51,19 @@ from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
 from tokenspeed.runtime.layers.attention import o_proj as projection_ops
-from tokenspeed.runtime.layers.attention.o_proj import ProjectionWorkspace
-from tokenspeed.runtime.models.kimi_k3_o_proj import (
+from tokenspeed.runtime.layers.attention.o_proj import (
     A2A_ENV_NAME,
     DEFAULT_A2A_BACKEND,
     DEFAULT_RS_BACKEND,
-    ENV_NAME,
     RS_ENV_NAME,
-    initialize_projection_parallelism,
+    ProjectionWorkspace,
+    initialize_projection_group,
     make_output_projection,
-    projection_a2a_backend,
     projection_mapping,
-    projection_rs_backend,
+    validate_projection_settings,
 )
+
+ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
 
 
 def dep_mapping(rank: int, world: int) -> Mapping:
@@ -91,11 +91,11 @@ def dep_mapping(rank: int, world: int) -> Mapping:
     )
 
 
-def test_projection_mapping_and_validation():
+def test_projection_mapping_and_validation(monkeypatch):
     for size in (1, 2, 4, 8, 16):
         for rank in range(16):
             mapping = dep_mapping(rank, 16)
-            parallel = projection_mapping(mapping, str(size))
+            parallel = projection_mapping(mapping.rank, mapping.world_size, size)
             assert parallel.tp_group == tuple(
                 range(rank // size * size, (rank // size + 1) * size)
             )
@@ -105,29 +105,77 @@ def test_projection_mapping_and_validation():
             assert mapping.moe.ep_size == 16
     for value in ("", "bad", "0", "-1", "3", "32"):
         with pytest.raises(ValueError):
-            projection_mapping(dep_mapping(0, 16), value)
+            validate_projection_settings(dep_mapping(0, 16), value, "nccl", "nccl")
+    from tokenspeed.runtime.models.kimi_k3 import _output_projection_mapping
+
+    monkeypatch.setenv(ENV_NAME, "4")
     with pytest.raises(ValueError, match="requires"):
-        projection_mapping(Mapping(rank=0, world_size=4), "4")
+        _output_projection_mapping(Mapping(rank=0, world_size=4))
+    monkeypatch.setenv(ENV_NAME, "1")
+    monkeypatch.setenv(A2A_ENV_NAME, "nccl")
+    monkeypatch.setenv(RS_ENV_NAME, "nccl")
+    mapping = dep_mapping(0, 1)
+    for name, valid, invalid in (
+        (
+            A2A_ENV_NAME,
+            ("nccl", "auto", "flashinfer", "flashinfer_quantized"),
+            ("", "invalid", "NVLINK"),
+        ),
+        (RS_ENV_NAME, ("nccl", "triton_rsag", "triton_peer"), ("", "auto", "invalid")),
+    ):
+        for value in valid:
+            monkeypatch.setenv(name, value)
+            validate_projection_settings(
+                mapping,
+                os.environ[ENV_NAME],
+                os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
+                os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+            )
+        for value in invalid:
+            monkeypatch.setenv(name, value)
+            with pytest.raises(ValueError, match=name):
+                validate_projection_settings(
+                    mapping,
+                    os.environ[ENV_NAME],
+                    os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
+                    os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+                )
+        monkeypatch.setenv(name, "nccl")
+
+    # Agreement precedes parsing, including disabled or malformed local settings.
+    monkeypatch.setattr(projection_ops.dist, "is_initialized", lambda: True)
+    groups = []
+    monkeypatch.setattr(
+        pg_manager,
+        "init_process_group",
+        lambda group, backend: groups.append((group, backend)),
+    )
+    monkeypatch.setattr(pg_manager, "get_process_group", lambda backend, group: group)
+
+    def disagree(values, local, group):
+        values[:] = [local] * len(values)
+        values[-1] = ("4", "nccl", "nccl")
+
+    monkeypatch.setattr(projection_ops.dist, "all_gather_object", disagree)
+    for value in ("1", "bad"):
+        with pytest.raises(ValueError, match="differ across ranks"):
+            validate_projection_settings(dep_mapping(0, 4), value, "nccl", "nccl")
+    assert groups == [(tuple(range(4)), "gloo")] * 2
 
 
 def test_a2a_policy_and_lifecycle(monkeypatch):
     assert DEFAULT_A2A_BACKEND == "flashinfer"
     assert DEFAULT_RS_BACKEND == "triton_peer"
-    for backend in ("nccl", "auto", "flashinfer", "flashinfer_quantized"):
-        assert projection_a2a_backend(backend) == backend
-    for backend in ("", "invalid", "NVLINK"):
-        with pytest.raises(ValueError, match=A2A_ENV_NAME):
-            projection_a2a_backend(backend)
     monkeypatch.setenv(A2A_ENV_NAME, "nccl")
     workspace = ProjectionWorkspace(512, 256, torch.bfloat16, torch.device("cpu"))
-    parallel = projection_mapping(dep_mapping(0, 4), "4")
+    parallel = projection_mapping(0, 4, 4)
     workspace.initialize_a2a(parallel, 256, backend="nccl")
     assert workspace.a2a is None
     assert not workspace.use_flashinfer(parallel, [16] * 4, 256)
     closed = []
     workspace.a2a = SimpleNamespace(close=lambda: closed.append(True))
     for rank in range(4):
-        parallel = projection_mapping(dep_mapping(rank, 4), "4")
+        parallel = projection_mapping(rank, 4, 4)
         for counts, channels, expected in (
             ([1] * 4, 256, True),
             ([16] * 4, 256, True),
@@ -211,12 +259,7 @@ def test_bf16_and_quantized_dispatch_across_peer_envelope(monkeypatch):
 
 
 def test_rsag_policy_and_disabled_initialization(monkeypatch):
-    for backend in ("nccl", "triton_rsag", "triton_peer"):
-        assert projection_rs_backend(backend) == backend
-    for backend in ("", "auto", "invalid"):
-        with pytest.raises(ValueError, match=RS_ENV_NAME):
-            projection_rs_backend(backend)
-    parallel = projection_mapping(dep_mapping(0, 4), "4")
+    parallel = projection_mapping(0, 4, 4)
     workspace = ProjectionWorkspace(512, 256, torch.bfloat16, torch.device("cpu"))
     monkeypatch.setenv(RS_ENV_NAME, "nccl")
     workspace.initialize_reduce_scatter(parallel, [128], backend="nccl")
@@ -330,7 +373,9 @@ def test_disabled_projection_and_shard_loader(monkeypatch):
     mapping = dep_mapping(2, 4)
     monkeypatch.setenv(ENV_NAME, "1")
     local, exchange = make_output_projection(
-        mapping=mapping,
+        parallel=projection_mapping(
+            mapping.rank, mapping.world_size, int(os.environ[ENV_NAME])
+        ),
         input_size=32,
         output_size=16,
         quant_config=None,
@@ -342,7 +387,9 @@ def test_disabled_projection_and_shard_loader(monkeypatch):
     assert local.weight.shape == (16, 32)
     monkeypatch.setenv(ENV_NAME, "4")
     sharded, exchange = make_output_projection(
-        mapping=mapping,
+        parallel=projection_mapping(
+            mapping.rank, mapping.world_size, int(os.environ[ENV_NAME])
+        ),
         input_size=32,
         output_size=16,
         quant_config=None,
@@ -465,7 +512,7 @@ def make_linears(mapping: Mapping, weight, scale, quant):
         os.environ[ENV_NAME] = str(size)
         with torch.device("cuda"):
             linear, exchange = make_output_projection(
-                mapping=mapping,
+                parallel=projection_mapping(mapping.rank, mapping.world_size, size),
                 input_size=k,
                 output_size=n,
                 quant_config=quant,
@@ -701,7 +748,13 @@ def main():
         device_id=torch.device("cuda", torch.cuda.current_device()),
     )
     os.environ[ENV_NAME] = "4"
-    initialize_projection_parallelism(mapping)
+    parallel = validate_projection_settings(
+        mapping,
+        os.environ[ENV_NAME],
+        os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
+        os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
+    )
+    initialize_projection_group(parallel)
     reference_module = None
     if args.reference_module is not None:
         spec = importlib.util.spec_from_file_location(
