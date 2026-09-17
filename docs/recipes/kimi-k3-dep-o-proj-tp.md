@@ -179,26 +179,33 @@ concurrency still depends on cache length, graph pools and temporary kernels.
 
 ## Small tests first
 
-Use the venv's interpreter, not a container-global `torchrun` executable:
+Run from the repository root using the venv's interpreter, not a
+container-global `torchrun` executable:
 
 ```bash
 python -m pytest test/runtime/distributed/test_kimi_k3_o_proj.py -q
 python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  test/runtime/distributed/test_kimi_k3_o_proj.py --benchmark
+  --module test.runtime.distributed.validate_kimi_k3_o_proj
 python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  test/runtime/distributed/test_kimi_k3_o_proj.py \
-  --model <real-model-path> --benchmark
+  --module test.runtime.distributed.validate_kimi_k3_o_proj \
+  --model <real-model-path> --large-tokens
 ```
+
+The pytest file covers configuration and integration contracts. The validation
+runner checks distributed numerics against TP1 and an FP32 reference,
+CUDA-graph replay, empty ranks, and output lifetime across workspace reuse.
+Use `--large-tokens` for backend-boundary checks, including fallback to NCCL.
+Shared helpers provide mapping, weight loading, and projection construction.
 
 The real-weight test loads only representative KDA/MLA output projections,
 not the full checkpoint. For a 16-GPU test, replace `--standalone` with
 `--nnodes=4 --node-rank=<node-rank> --master-addr=<head-node>
 --master-port=<test-port>` on each node. Give tests their own rendezvous port.
 
-The harness compares complete projection operations, including packing,
-all-to-all, GEMM and reduce-scatter. Run final timing measurements without a
-concurrent server workload on those GPUs. Small correctness tests may run
-while baseline deployment is being prepared if memory headroom permits.
+The harness validates complete projection operations, including packing,
+all-to-all, GEMM and reduce-scatter; it does not measure performance.
+Small correctness tests may run while baseline deployment is being prepared
+if memory headroom permits.
 
 ## Full-model checks
 
