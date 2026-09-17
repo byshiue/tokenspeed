@@ -1266,7 +1266,7 @@ class RowParallelLinear(LinearBase):
         return None
 
     def forward(self, input_, scale=None):
-        return self._forward_into(input_, scale, None)
+        return self._forward_into(input_, scale, None, False)
 
     def forward_into(self, input_, scale, out):
         """Project into caller-owned storage; unsupported methods copy the result.
@@ -1274,9 +1274,19 @@ class RowParallelLinear(LinearBase):
         Shares input sharding, bias handling and reduction with ordinary forward.
         Communication consumers may supply persistent symmetric GEMM storage.
         """
-        return self._forward_into(input_, scale, out)
+        return self._forward_into(input_, scale, out, False)
 
-    def _forward_into(self, input_, scale, out):
+    def forward_prepacked_into(self, input_, scale, out):
+        """Use FP8 input with prepared MN-major scales and caller-owned output."""
+        if (
+            out is None
+            or not self.input_is_parallel
+            or not hasattr(self.quant_method, "apply_into")
+        ):
+            raise ValueError("Prepacked input requires a supported pre-sharded linear")
+        return self._forward_into(input_, scale, out, True)
+
+    def _forward_into(self, input_, scale, out, input_scales_prepacked):
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1299,6 +1309,7 @@ class RowParallelLinear(LinearBase):
                 scale,
                 torch.bfloat16 if scale is not None else input_parallel.dtype,
                 out,
+                input_scales_prepacked,
             )
         elif scale is not None:
             output_parallel = self.quant_method.apply(

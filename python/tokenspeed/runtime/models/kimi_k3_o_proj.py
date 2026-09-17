@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication.flashinfer import (
     create_projection_a2a,
     flashinfer_projection_a2a,
     flashinfer_projection_a2a_borrowed,
+    flashinfer_projection_quantized_a2a,
     prepare_borrowed_projection_a2a,
 )
 from tokenspeed_kernel.ops.communication.triton import (
@@ -48,7 +49,9 @@ from tokenspeed_kernel.ops.communication.triton import (
 from tokenspeed_kernel.ops.communication.triton_projection import (
     ProjectionPeerState,
     triton_projection_reduce_scatter,
+    triton_projection_reduce_scatter_after_a2a,
 )
+from tokenspeed_kernel.ops.gemm import fp8_linear_accepts_prepacked_input
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import (
@@ -398,7 +401,20 @@ class KimiOutputProjection:
         # transpose and padding, preserving the original BF16/FP16 values.
         fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
         peer = workspace.peer_state(linear.output_size, max_tokens, fused_a2a)
-        if peer is not None:
+        quantized_a2a = (
+            peer is not None
+            # Smaller batches did not win in shared-buffer paired timings.
+            and max_tokens == 16
+            and self.input_size % 512 == 0
+            and fp8_linear_accepts_prepacked_input(
+                getattr(linear, "_prepared_fp8_linear", None)
+            )
+        )
+        if quantized_a2a:
+            recv, recv_scales = flashinfer_projection_quantized_a2a(
+                workspace.borrowed_a2a, inputs.contiguous()
+            )
+        elif peer is not None:
             recv = flashinfer_projection_a2a_borrowed(
                 workspace.borrowed_a2a, inputs.contiguous()
             )
@@ -408,12 +424,24 @@ class KimiOutputProjection:
             packed = triton_pack_projection_input(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)
         if peer is not None:
-            partial, _ = linear.forward_into(recv, None, peer.input_buffer(max_tokens))
+            if quantized_a2a:
+                partial, _ = linear.forward_prepacked_into(
+                    recv, recv_scales, peer.input_buffer(max_tokens)
+                )
+            else:
+                partial, _ = linear.forward_into(
+                    recv, None, peer.input_buffer(max_tokens)
+                )
+            # The next borrowed A2A waits for all peer reads before this
+            # symmetric GEMM destination can be reused. No trailing fence here.
+            output = triton_projection_reduce_scatter_after_a2a(
+                peer, partial, max_tokens
+            )
         else:
             partial, _ = linear(recv)
-        output = workspace.reduce_scatter(
-            partial.contiguous(), parallel, max_tokens, fused_a2a
-        )
+            output = workspace.reduce_scatter(
+                partial.contiguous(), parallel, max_tokens, fused_a2a
+            )
         return output[: inputs.shape[0]]
 
 

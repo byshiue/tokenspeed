@@ -125,15 +125,38 @@ and compiles against the installed FlashInfer headers before graph capture.
 
 Prepared FP8 GEMMs write directly into persistent symmetric partial-result
 storage when their output shape and layout permit it. Padded or incompatible
-destinations retain a copy fallback. Publication and reuse barriers surround
-the peer-read reduction, which accumulates in FP32 and writes an owned local
-output. Only internal intermediates are borrowed: returned model outputs
+destinations retain a copy fallback. A publication barrier precedes the
+peer-read reduction, which accumulates in FP32 and writes an owned local
+output. In the complete projection path, the next A2A entry barrier supplies
+the reuse fence: every peer has completed the preceding reduction before
+any peer can launch its next GEMM into symmetric storage. NCCL fallback
+shapes and empty groups do not write that storage. Standalone reduction
+calls retain an explicit trailing barrier. This optimization requires the
+same subgroup and serialized stream for A2A, GEMM and reduction.
+Only internal intermediates are borrowed: returned model outputs
 must survive the next layer's workspace reuse.
 
 The TP4 partial buffer needs 896 KiB per GPU at width 7168 and 16 rows per
 rank, excluding synchronization metadata, A2A storage and graph allocations.
 Explicit initialization errors are fatal; never switch collectives after a
 rank-local forward failure. Full-model accuracy remains a separate gate.
+
+### Quantized borrowed exchange
+
+Within the peer-reduction envelope, prepared block-FP8 projections with
+16 physical rows per rank can quantize while redistributing. Each sender
+quantizes complete 128-channel groups, then writes FP8 values and FP32 scales
+to its peers. TP4 channel boundaries must preserve these groups. The GEMM
+consumes the received MN-major scales explicitly; it must not reinterpret
+them as canonical scales or quantize the values a second time.
+
+Values and scales borrow disjoint regions of the existing communicator
+allocation. Its entry and exit barriers, stream discipline and output
+ownership contract remain unchanged. The native module initializes before
+capture. BF16 projections, unsupported prepared plans, smaller batches and
+NCCL fallback shapes retain their existing routes. Shared-buffer paired
+measurements found no gain at 2/4/8 rows, so these shapes keep BF16 exchange.
+This optimization adds no persistent communication allocation.
 
 ## Validation gates
 
