@@ -68,78 +68,57 @@ export the following on **every node before model startup**:
 export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=4
 ```
 
-To opt into fused NVLink A2A on supported single-node projection groups, also
-set `TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=auto` on every node. Use
-`flashinfer` instead to fail startup when NVLink initialization is unavailable,
-or `nccl` (the default) for the reference path. The FlashInfer installation
-must provide `flashinfer.comm.ulysses.UlyssesCommunicator`; older versions
-can use the NCCL fallback without an upgrade.
+With projection TP enabled, omitted backend settings now select BF16
+FlashInfer A2A (`flashinfer`) and custom symmetric reduction (`triton_peer`).
+The thresholds are independent and refer to physical tokens per rank, including
+graph padding—not context length or subgroup-total tokens:
 
-Only balanced physical batches of at most 64 rows per rank use the optional
-path. Larger and uneven batches retain NCCL, including when `flashinfer` is
-requested. No mode-specific prefill/decode branch is added. Graph-padded rows
-count toward the limit. Startup logs report the selected backend and fallback
-reason. Keep the same setting throughout graph capture and replay.
+| Physical rows/rank | A2A | Reduction |
+|---|---|---|
+| 1–512, balanced subgroup | FlashInfer BF16 | Symmetric |
+| 513–8192 | NCCL | Symmetric |
+| Above 8192 | NCCL | NCCL |
 
-Selecting A2A alone leaves GEMM and NCCL ReduceScatter unchanged. Measure the
-complete projection and full-model workload before choosing a backend; an
-isolated communication improvement does not establish an end-to-end gain.
+Uneven subgroups use padded NCCL A2A, but can still use symmetric reduction
+when their maximum count is at most 8192. Entirely empty groups skip both.
+The actual prepared workspace capacity may be smaller than these limits.
 
-To also test the optional ReduceScatter path, set:
+FlashInfer requires the optional Ulysses API and supported NVLink topology.
+The default `flashinfer` setting fails startup if initialization is unavailable.
+Set A2A to `auto` for its startup fallback, or choose `nccl` explicitly.
+Symmetric reduction requires TP4, BF16 partials and supported peer access;
+non-TP4 groups fall back to NCCL reduction. Explicit initialization errors
+are fatal. Never retry another collective after a rank-local forward failure.
 
-```bash
-export TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=triton_rsag
-```
-
-Set it on every node before startup. Unset or `nccl` keeps the existing
-reduction. Enable FlashInfer A2A as above to use RSAG. The NVIDIA RSAG path requires
-NVLink multicast support, BF16 projection outputs, and output widths
-divisible by eight. Explicit initialization failures are fatal.
-
-RSAG is used for balanced physical batches of up to 64 rows per rank when
-FlashInfer A2A is active. Larger or uneven physical batches use NCCL for both
-operations; padded graph rows may still contain inactive requests. If A2A
-falls back to NCCL at startup, RSAG is also disabled and a warning is logged.
-TP4 with output width 7168 reserves up to 3.5 MiB of symmetric payload scratch
-per GPU, shared across layers of that width. Returned outputs are cloned so
-subsequent layers cannot overwrite them.
-
-The conservative cutoff avoids measured regressions when combining NCCL A2A
-with RSAG at some batch sizes. Keep complete-projection timing in the
-comparison when evaluating a wider threshold.
-
-The earlier standalone TP4 experiment reported a 14–17% complete-projection
-latency reduction, but timed single-operation graph replays and included
-submission gaps. Do not treat that result as an isolated reduction speedup;
-use chained-graph measurements for backend selection. Its output differed
-from NCCL by about 0.36% relative L2,
-despite slightly lower error against an FP32 reduction reference. Compare
-full-model logits and generation before treating the two backends as
-interchangeable; NCCL stays the default.
-
-The copy-free TP4 candidate uses:
+To run the NCCL reference, set both backends explicitly:
 
 ```bash
-export TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=flashinfer
-export TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=triton_peer
+export TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=nccl
+export TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=nccl
 ```
 
-For prepared block-FP8 projections, this path always fuses quantization into
-A2A across balanced batches of 1–64 physical rows per rank. It does not switch
-between quantized and BF16 exchange based on per-shape timing. Some shapes
-are slightly faster with BF16 exchange; this policy favors one quantized
-route across the supported range. The complete projection
-also reuses the next A2A entry barrier as its reduction-storage reuse fence;
-standalone reduction diagnostics still include an explicit trailing fence.
-TP4 reduces projection weight storage, but its communication can make it
-slower than independent TP1 projections even with these optimizations.
+`TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=flashinfer_quantized` retains the
+experimental Quant FI + Sym route for compatible prepared block-FP8
+projections within the 512-row FI envelope. It is not the default. The usual
+`flashinfer` path sends BF16 and quantizes separately before FP8 GEMM.
 
-It borrows the A2A receive buffer and lets supported FP8 GEMMs write directly
-into symmetric reduction storage. The final output is owned, not a workspace
-view. The same balanced 1–64 physical rows/rank cutoff applies; larger or
-uneven shapes retain NCCL. Standalone 16-GPU BF16 and real-weight projection
-checks pass; full-model logits and generation still need validation, so the
-backend remains opt-in.
+The optional `triton_rsag` reduction remains available for comparison, retaining
+its balanced 1–64-row FI-only envelope and NCCL fallback. It requires NVLink
+multicast and eight-aligned BF16 output widths. It is distinct from the default
+custom symmetric reduction.
+
+At output width 7168, the TP4 symmetric partial buffer reserves
+`4 * min(workspace_capacity, 8192) * 7168 * 2` bytes per GPU: up to **448 MiB**,
+shared across sequential layers of that width. A2A, generic packing scratch,
+graph pools and synchronization metadata are additional. Buffers initialize
+before cache budgeting and capture. Increasing this capacity can reduce the
+memory available for KV cache.
+
+The large-token backend sweep showed that BF16 FI + Sym is faster than NCCL
+for some balanced shapes, but the table above is a routing policy, not an E2E
+speedup claim. In particular, NCCL A2A + Sym at 513–8192 is a different
+combination from the historical all-FlashInfer sweep and requires its own
+measurement. TP1 can remain faster despite using more weight storage.
 
 This setting changes neither attention cache ownership nor EP placement.
 Unset/`1` preserves the original projection. The value must divide world size
@@ -173,6 +152,10 @@ Initialize process groups, communication buffers and native modules before
 CUDA-graph capture and cache budgeting. Sequential attention layers share
 one workspace. Keep calls on one serialized stream: the next borrowed A2A's
 entry barrier protects reuse of symmetric GEMM output after peer reads.
+When using NCCL A2A with symmetric reduction, an explicit pre-write barrier
+protects transitions from the FI path before GEMM touches symmetric storage;
+the reduction also retains its trailing reuse fence. NCCL A2A alone is not a
+symmetric-buffer reuse fence.
 Never replace or close buffers while captured graphs still reference them;
 explicit close is collective. Returned outputs own their storage and survive
 later workspace reuse. Initialization failures propagate for explicitly

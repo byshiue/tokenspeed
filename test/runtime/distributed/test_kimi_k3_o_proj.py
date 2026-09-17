@@ -54,6 +54,8 @@ from tokenspeed.runtime.layers.attention import o_proj as projection_ops
 from tokenspeed.runtime.layers.attention.o_proj import ProjectionWorkspace
 from tokenspeed.runtime.models.kimi_k3_o_proj import (
     A2A_ENV_NAME,
+    DEFAULT_A2A_BACKEND,
+    DEFAULT_RS_BACKEND,
     ENV_NAME,
     RS_ENV_NAME,
     initialize_projection_parallelism,
@@ -109,7 +111,9 @@ def test_projection_mapping_and_validation():
 
 
 def test_a2a_policy_and_lifecycle(monkeypatch):
-    for backend in ("nccl", "auto", "flashinfer"):
+    assert DEFAULT_A2A_BACKEND == "flashinfer"
+    assert DEFAULT_RS_BACKEND == "triton_peer"
+    for backend in ("nccl", "auto", "flashinfer", "flashinfer_quantized"):
         assert projection_a2a_backend(backend) == backend
     for backend in ("", "invalid", "NVLINK"):
         with pytest.raises(ValueError, match=A2A_ENV_NAME):
@@ -129,8 +133,9 @@ def test_a2a_policy_and_lifecycle(monkeypatch):
             ([16] * 4, 256, True),
             ([17] * 4, 256, True),
             ([64] * 4, 256, True),
-            ([65] * 4, 256, False),
-            ([512] * 4, 256, False),
+            ([65] * 4, 256, True),
+            ([512] * 4, 256, True),
+            ([513] * 4, 256, False),
             ([16, 0, 16, 16], 256, False),
             ([0] * 4, 256, False),
             ([16] * 4, 100, False),
@@ -141,7 +146,7 @@ def test_a2a_policy_and_lifecycle(monkeypatch):
     assert closed == [True]
 
 
-def test_quantized_dispatch_across_peer_envelope(monkeypatch):
+def test_bf16_and_quantized_dispatch_across_peer_envelope(monkeypatch):
     # Shared execution must not read Kimi settings or require a MoE layout.
     for name in (ENV_NAME, A2A_ENV_NAME, RS_ENV_NAME):
         monkeypatch.setenv(name, "invalid-model-setting")
@@ -156,7 +161,7 @@ def test_quantized_dispatch_across_peer_envelope(monkeypatch):
     calls = []
 
     def quantized_a2a(state, inputs):
-        calls.append(inputs.shape[0])
+        calls.append(("quantized", inputs.shape[0]))
         return inputs, None
 
     monkeypatch.setattr(
@@ -170,15 +175,25 @@ def test_quantized_dispatch_across_peer_envelope(monkeypatch):
         "triton_projection_reduce_scatter_after_a2a",
         lambda peer, partial, rows: partial[:rows],
     )
-    # Only the quantized entry point exists: a BF16 dispatch must fail this test.
+    monkeypatch.setattr(
+        projection_ops,
+        "flashinfer_projection_a2a_borrowed",
+        lambda state, inputs: (calls.append(("bf16", inputs.shape[0])) or inputs),
+    )
     linear = SimpleNamespace(
         output_size=128,
         forward_prepacked_into=lambda values, scales, output: (output, None),
+        forward_into=lambda values, scales, output: (output, None),
     )
     for rows in range(1, 65):
         inputs = torch.empty(rows, 512, dtype=torch.bfloat16)
         assert exchange.forward(inputs, linear, [rows] * 4).shape == (rows, 128)
-    assert calls == list(range(1, 65))
+    assert calls == [("bf16", rows) for rows in range(1, 65)]
+    workspace.quantized_a2a = True
+    for rows in (1, 16, 64):
+        inputs = torch.empty(rows, 512, dtype=torch.bfloat16)
+        exchange.forward(inputs, linear, [rows] * 4)
+    assert calls[-3:] == [("quantized", rows) for rows in (1, 16, 64)]
 
     ordinary_mapping = Mapping(rank=0, world_size=4)
     linear, wrapper = projection_ops.make_output_projection(
@@ -210,6 +225,10 @@ def test_rsag_policy_and_disabled_initialization(monkeypatch):
     workspace.rsag_states[128] = object()
     peer = object()
     workspace.peer_states[128] = peer
+    large_workspace = ProjectionWorkspace(8193, 8, torch.bfloat16, torch.device("cpu"))
+    large_workspace.peer_states[128] = peer
+    for rows in (512, 513, 8192, 8193):
+        assert large_workspace.peer_state(128, rows) is (peer if rows <= 8192 else None)
     for rows, width, expected in (
         (1, 128, True),
         (16, 128, True),
@@ -223,11 +242,15 @@ def test_rsag_policy_and_disabled_initialization(monkeypatch):
     ):
         assert workspace.use_rsag(width, rows, True) == expected
         assert not workspace.use_rsag(width, rows, False)
-        assert workspace.peer_state(width, rows, True) is (peer if expected else None)
-        assert workspace.peer_state(width, rows, False) is None
+        assert workspace.peer_state(width, rows) is (
+            peer if width == 128 and 0 < rows <= 512 else None
+        )
+
     monkeypatch.setenv(RS_ENV_NAME, "triton_peer")
     no_peer = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
-    no_peer.initialize_reduce_scatter(parallel, [128], backend="triton_peer")
+    no_peer.initialize_reduce_scatter(
+        projection_ops.projection_mapping(0, 4, 2), [128], backend="triton_peer"
+    )
     assert no_peer.peer_states == {}
     assert no_peer.borrowed_a2a is None
     monkeypatch.setenv(RS_ENV_NAME, "triton_rsag")
@@ -511,9 +534,11 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
     fused = exchange.workspace.use_flashinfer(
         exchange.parallel, counts, exchange.input_size
     )
-    peer = exchange.workspace.peer_state(linear.output_size, rows, fused)
+    peer = exchange.workspace.peer_state(linear.output_size, rows)
     quantized = (
         peer is not None
+        and fused
+        and exchange.workspace.quantized_a2a
         and exchange.input_size % 512 == 0
         and fp8_linear_accepts_prepacked_input(
             getattr(linear, "_prepared_fp8_linear", None)
@@ -531,7 +556,7 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
             recv, recv_scales = flashinfer_projection_quantized_a2a(
                 exchange.workspace.borrowed_a2a, inputs
             )
-        elif peer is not None:
+        elif peer is not None and fused:
             recv = flashinfer_projection_a2a_borrowed(
                 exchange.workspace.borrowed_a2a, inputs
             )
@@ -605,11 +630,58 @@ def profile_projection(
     dist.barrier(group=control_group)
 
 
+def validate_backend_transitions(exchange, linear, baseline, k, world):
+    """Replay mixed backend boundaries with delayed peers and retained outputs."""
+    rank = dist.get_rank()
+    patterns = [
+        [512] * world,
+        [513] * world,
+        [8192] * world,
+        [8193] * world,
+        [0] * world,
+        [512] * world,
+        [513 if r % 4 == 0 else 0 for r in range(world)],
+        [512] * world,
+    ]
+    inputs = [
+        torch.randn(counts[rank], k, device="cuda", dtype=torch.bfloat16)
+        for counts in patterns
+    ]
+    # Different progress within each subgroup stresses cross-backend reuse.
+    delay = torch.ones(262144, device="cuda")
+    expected = [
+        baseline(x)[0] if x.shape[0] else x.new_empty((0, linear.output_size))
+        for x in inputs
+    ]
+    for x, counts in zip(inputs, patterns):
+        exchange.forward(x, linear, counts)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = []
+        for x, counts in zip(inputs, patterns):
+            if rank % 4 == 0:
+                for _ in range(4):
+                    delay.mul_(1.0001)
+            outputs.append(exchange.forward(x, linear, counts))
+    for _ in range(5):
+        graph.replay()
+        for actual, reference in zip(outputs, expected):
+            if actual.numel():
+                relative = (
+                    actual.float() - reference.float()
+                ).norm() / reference.float().norm()
+                assert relative < 0.015
+    torch.cuda.synchronize()
+    del outputs, graph
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--large-tokens", action="store_true")
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--layer", type=int, choices=(0, 3))
@@ -664,13 +736,17 @@ def main():
             )
         reference_weight = reference_weight.cuda()
         exchange.workspace = ProjectionWorkspace(
-            512, k, torch.bfloat16, torch.device("cuda")
+            8193 if args.large_tokens else 512, k, torch.bfloat16, torch.device("cuda")
         )
         exchange.workspace.initialize_a2a(
-            exchange.parallel, k, backend=os.environ.get(A2A_ENV_NAME, "nccl")
+            exchange.parallel,
+            k,
+            backend=os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND),
         )
         exchange.workspace.initialize_reduce_scatter(
-            exchange.parallel, [n], backend=os.environ.get(RS_ENV_NAME, "nccl")
+            exchange.parallel,
+            [n],
+            backend=os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND),
         )
         reference_exchange = None
         if reference_module is not None:
@@ -707,6 +783,8 @@ def main():
             [r % 4 for r in range(world)],
             [0] * world,
         ]
+        if args.large_tokens:
+            patterns += [[rows] * world for rows in (512, 513, 8192, 8193, 512, 513)]
         if args.benchmark:
             patterns += [
                 [256] * world,
@@ -729,13 +807,13 @@ def main():
             )
             using_peer = (
                 exchange.workspace.peer_state(
-                    n, max(counts[r] for r in exchange.parallel.tp_group), fused_a2a
+                    n, max(counts[r] for r in exchange.parallel.tp_group)
                 )
                 is not None
             )
             custom_reduction = using_rsag or using_peer
             reduction_errors = torch.zeros(2, device="cuda", dtype=torch.float32)
-            if custom_reduction:
+            if custom_reduction and fused_a2a:
                 # Same quantized GEMM partials: isolate reduction rounding from
                 # weight/activation quantization and TP1 accumulation changes.
                 partial, _ = linear(
@@ -840,7 +918,9 @@ def main():
                 "counts": counts,
                 "reference_relative_l2": reference_relative_l2.item(),
                 "reduction_l2_vs_fp32": (
-                    reduction_errors.tolist() if custom_reduction else None
+                    reduction_errors.tolist()
+                    if custom_reduction and fused_a2a
+                    else None
                 ),
                 "rs_backend": (
                     "triton_peer"
@@ -897,6 +977,8 @@ def main():
                     )
             if rank == 0:
                 print(json.dumps(record), flush=True)
+        if args.large_tokens:
+            validate_backend_transitions(exchange, linear, baseline, k, world)
         if args.profile:
             profile_baseline = (
                 baseline

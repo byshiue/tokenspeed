@@ -67,8 +67,9 @@ from tokenspeed.runtime.layers.linear import RowParallelLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
-FLASHINFER_MAX_TOKENS = 64
-RSAG_MAX_TOKENS = FLASHINFER_MAX_TOKENS
+FLASHINFER_MAX_TOKENS = 512
+PEER_MAX_TOKENS = 8192
+RSAG_MAX_TOKENS = 64
 
 
 def projection_mapping(rank: int, world_size: int, tp_size: int) -> DenseLayerMapping:
@@ -108,6 +109,7 @@ class ProjectionWorkspace:
         self.send = torch.empty(max_tokens * max_input_size, dtype=dtype, device=device)
         self.recv = torch.empty_like(self.send)
         self.a2a = None
+        self.quantized_a2a = False
         self.a2a_reason = None
         self._a2a_initialized = False
         self.rsag_states = {}
@@ -131,10 +133,8 @@ class ProjectionWorkspace:
                 "Projection reduction backend must be nccl, triton_rsag, or triton_peer"
             )
         if backend == "triton_peer":
-            if self.a2a is None or parallel.tp_size != 4:
-                logger.warning(
-                    "Projection peer reduction requires fused TP4 A2A; using NCCL"
-                )
+            if parallel.tp_size != 4:
+                logger.warning("Projection peer reduction requires TP4; using NCCL")
                 self._rs_initialized = True
                 return
             if self.send.dtype != torch.bfloat16 or any(
@@ -144,11 +144,12 @@ class ProjectionWorkspace:
                     "Projection peer reduction requires BF16 and positive widths"
                 )
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
+            if self.a2a is not None:
+                self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
             for width in sorted(set(output_sizes)):
                 state = ProjectionPeerState(
                     group,
-                    min(self.max_tokens, FLASHINFER_MAX_TOKENS),
+                    min(self.max_tokens, PEER_MAX_TOKENS),
                     width,
                     self.send.device,
                 )
@@ -157,7 +158,8 @@ class ProjectionWorkspace:
                 triton_projection_reduce_scatter(state, probe, 1)
                 self.peer_states[width] = state
             logger.info(
-                "Projection ReduceScatter: triton_peer, direct GEMM and borrowed A2A"
+                "Projection ReduceScatter: triton_peer, up to %s rows/rank",
+                min(self.max_tokens, PEER_MAX_TOKENS),
             )
         if backend == "triton_rsag":
             if self.send.dtype != torch.bfloat16 or any(
@@ -210,9 +212,9 @@ class ProjectionWorkspace:
             and 0 < max_tokens <= min(self.max_tokens, RSAG_MAX_TOKENS)
         )
 
-    def peer_state(self, output_size: int, rows: int, fused_a2a: bool):
+    def peer_state(self, output_size: int, rows: int):
         """Select the same prepared fast path from shared physical counts."""
-        if fused_a2a and 0 < rows <= min(self.max_tokens, FLASHINFER_MAX_TOKENS):
+        if 0 < rows <= min(self.max_tokens, PEER_MAX_TOKENS):
             return self.peer_states.get(output_size)
         return None
 
@@ -224,7 +226,7 @@ class ProjectionWorkspace:
         fused_a2a: bool,
     ) -> torch.Tensor:
         """Return owned output rows; never expose the reusable RSAG buffer."""
-        peer = self.peer_state(partial.shape[1], max_tokens, fused_a2a)
+        peer = self.peer_state(partial.shape[1], max_tokens)
         if peer is not None:
             return triton_projection_reduce_scatter(peer, partial, max_tokens)
         if self.use_rsag(partial.shape[1], max_tokens, fused_a2a):
@@ -247,15 +249,16 @@ class ProjectionWorkspace:
         """
         if self._a2a_initialized:
             return
-        if backend not in ("nccl", "auto", "flashinfer"):
-            raise ValueError("Projection A2A backend must be nccl, auto, or flashinfer")
+        if backend not in ("nccl", "auto", "flashinfer", "flashinfer_quantized"):
+            raise ValueError("Invalid projection A2A backend")
+        self.quantized_a2a = backend == "flashinfer_quantized"
         if backend != "nccl":
             self.a2a, self.a2a_reason = create_projection_a2a(
                 group=pg_manager.get_process_group("nccl", parallel.tp_group),
                 max_elems=min(self.max_tokens, FLASHINFER_MAX_TOKENS) * max_input_size,
                 dtype=self.send.dtype,
                 device=self.send.device,
-                backend=backend,
+                backend="flashinfer" if self.quantized_a2a else backend,
             )
             logger.info(
                 "Projection A2A: %s (%s)",
@@ -348,10 +351,11 @@ class DistributedOutputProjection:
         # One row already has rank-major byte order. Other shapes fuse the
         # transpose and padding, preserving the original BF16/FP16 values.
         fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
-        peer = workspace.peer_state(linear.output_size, max_tokens, fused_a2a)
+        peer = workspace.peer_state(linear.output_size, max_tokens)
         quantized_a2a = (
             peer is not None
-            # Use one quantized route throughout the supported peer envelope.
+            and fused_a2a
+            and workspace.quantized_a2a
             and self.input_size % 512 == 0
             and fp8_linear_accepts_prepacked_input(
                 getattr(linear, "_prepared_fp8_linear", None)
@@ -361,7 +365,7 @@ class DistributedOutputProjection:
             recv, recv_scales = flashinfer_projection_quantized_a2a(
                 workspace.borrowed_a2a, inputs.contiguous()
             )
-        elif peer is not None:
+        elif peer is not None and fused_a2a:
             recv = flashinfer_projection_a2a_borrowed(
                 workspace.borrowed_a2a, inputs.contiguous()
             )
@@ -371,6 +375,11 @@ class DistributedOutputProjection:
             packed = triton_pack_projection_input(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)
         if peer is not None:
+            if not fused_a2a:
+                # A preceding FI reduction may have deferred its reuse fence.
+                # NCCL A2A is not that fence: protect direct GEMM writes here,
+                # including transitions through empty or NCCL-only batches.
+                peer.handle.barrier(channel=1)
             if quantized_a2a:
                 partial, _ = linear.forward_prepacked_into(
                     recv, recv_scales, peer.input_buffer(max_tokens)
@@ -379,11 +388,13 @@ class DistributedOutputProjection:
                 partial, _ = linear.forward_into(
                     recv, None, peer.input_buffer(max_tokens)
                 )
-            # The next borrowed A2A waits for all peer reads before this
-            # symmetric GEMM destination can be reused. No trailing fence here.
-            output = triton_projection_reduce_scatter_after_a2a(
-                peer, partial, max_tokens
-            )
+            if fused_a2a:
+                # Next FI A2A or the NCCL path's pre-write fence protects reuse.
+                output = triton_projection_reduce_scatter_after_a2a(
+                    peer, partial, max_tokens
+                )
+            else:
+                output = triton_projection_reduce_scatter(peer, partial, max_tokens)
         else:
             partial, _ = linear(recv)
             output = workspace.reduce_scatter(

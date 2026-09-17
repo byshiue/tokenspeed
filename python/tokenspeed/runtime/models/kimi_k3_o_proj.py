@@ -56,6 +56,8 @@ logger = logging.getLogger(__name__)
 ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
 A2A_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND"
 RS_ENV_NAME = "TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND"
+DEFAULT_A2A_BACKEND = "flashinfer"
+DEFAULT_RS_BACKEND = "triton_peer"
 
 
 def projection_rs_backend(value: str) -> str:
@@ -65,8 +67,8 @@ def projection_rs_backend(value: str) -> str:
 
 
 def projection_a2a_backend(value: str) -> str:
-    if value not in ("nccl", "auto", "flashinfer"):
-        raise ValueError(f"{A2A_ENV_NAME} must be nccl, auto, or flashinfer")
+    if value not in ("nccl", "auto", "flashinfer", "flashinfer_quantized"):
+        raise ValueError(f"Invalid {A2A_ENV_NAME}: {value}")
     return value
 
 
@@ -94,8 +96,8 @@ def projection_mapping(mapping: Mapping, value: str) -> DenseLayerMapping:
 def initialize_projection_parallelism(mapping: Mapping) -> None:
     """Agree on the setting before constructing/loading projection shards."""
     value = os.environ.get(ENV_NAME, "1")
-    a2a_value = os.environ.get(A2A_ENV_NAME, "nccl")
-    rs_value = os.environ.get(RS_ENV_NAME, "nccl")
+    a2a_value = os.environ.get(A2A_ENV_NAME, DEFAULT_A2A_BACKEND)
+    rs_value = os.environ.get(RS_ENV_NAME, DEFAULT_RS_BACKEND)
     if dist.is_initialized() and mapping.world_size > 1:
         # Every rank participates, even when its local setting is disabled or
         # malformed. Reject disagreement before entering differently sized groups.
