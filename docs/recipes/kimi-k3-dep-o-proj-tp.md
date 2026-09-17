@@ -103,15 +103,9 @@ export TOKENSPEED_O_PROJ_A2A_BACKEND=nccl
 export TOKENSPEED_O_PROJ_RS_BACKEND=nccl
 ```
 
-`TOKENSPEED_O_PROJ_A2A_BACKEND=flashinfer_quantized` retains the
-experimental Quant FI + Sym route for compatible prepared block-FP8
-projections within the 512-row FI envelope. It is not the default. The usual
-`flashinfer` path sends BF16 and quantizes separately before FP8 GEMM.
-
-The optional `triton_rsag` reduction remains available for comparison, retaining
-its balanced 1–64-row FI-only envelope and NCCL fallback. It requires NVLink
-multicast and eight-aligned BF16 output widths. It is distinct from the default
-custom symmetric reduction.
+The FlashInfer path exchanges BF16 values and quantizes separately before FP8
+GEMM. Supported A2A choices are `nccl`, `auto`, and `flashinfer`; reduction
+choices are `nccl` and `triton_peer`.
 
 At output width 7168, the TP4 symmetric partial buffer reserves
 `4 * min(workspace_capacity, 8192) * 7168 * 2` bytes per GPU: up to **448 MiB**,
@@ -171,8 +165,8 @@ The supported block-FP8 `apply_into()` path writes GEMM output directly into
 caller-owned symmetric storage, removing the intermediate D2D copy before
 reduction. Unsupported direct-output plans still compute a temporary result
 and copy it into `out`; accepting an output buffer alone does not guarantee
-copy elimination. Quantized A2A sends FP8 activations and FP32 per-128-channel
-scales; the GEMM consumes those scales without quantizing a second time.
+copy elimination. FlashInfer A2A preserves the BF16 inputs; activation
+quantization remains part of the ordinary FP8 GEMM path.
 
 For each `[7168, 12288]` block-FP8 projection, weights and checkpoint scales
 occupy about 84.02 MiB per GPU at TP1 versus 21.01 MiB at TP4. These figures

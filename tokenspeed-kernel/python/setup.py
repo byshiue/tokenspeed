@@ -1038,7 +1038,6 @@ setup(
         # Runtime-JIT adapter for borrowed FlashInfer A2A output storage.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "ulysses_borrowed.cu",
-            "projection_quantized_alltoall.cu",
         ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

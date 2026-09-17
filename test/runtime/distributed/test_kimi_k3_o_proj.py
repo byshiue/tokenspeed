@@ -40,10 +40,10 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.flashinfer import (
     flashinfer_projection_a2a,
     flashinfer_projection_a2a_borrowed,
-    flashinfer_projection_quantized_a2a,
 )
-from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
-from tokenspeed_kernel.ops.gemm import fp8_linear_accepts_prepacked_input
+from tokenspeed_kernel.ops.communication.triton import (
+    triton_pack_channel_shards_for_a2a,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -118,10 +118,10 @@ def test_projection_mapping_and_validation(monkeypatch):
     for name, valid, invalid in (
         (
             A2A_ENV_NAME,
-            ("nccl", "auto", "flashinfer", "flashinfer_quantized"),
-            ("", "invalid", "NVLINK"),
+            ("nccl", "auto", "flashinfer"),
+            ("", "invalid", "NVLINK", "flashinfer_quantized"),
         ),
-        (RS_ENV_NAME, ("nccl", "triton_rsag", "triton_peer"), ("", "auto", "invalid")),
+        (RS_ENV_NAME, ("nccl", "triton_peer"), ("", "auto", "invalid", "triton_rsag")),
     ):
         for value in valid:
             monkeypatch.setenv(name, value)
@@ -194,7 +194,7 @@ def test_a2a_policy_and_lifecycle(monkeypatch):
     assert closed == [True]
 
 
-def test_bf16_and_quantized_dispatch_across_peer_envelope(monkeypatch):
+def test_bf16_dispatch_across_peer_envelope(monkeypatch):
     # Shared execution must not read Kimi settings or require a MoE layout.
     for name in (ENV_NAME, A2A_ENV_NAME, RS_ENV_NAME):
         monkeypatch.setenv(name, "invalid-model-setting")
@@ -208,16 +208,6 @@ def test_bf16_and_quantized_dispatch_across_peer_envelope(monkeypatch):
     )
     calls = []
 
-    def quantized_a2a(state, inputs):
-        calls.append(("quantized", inputs.shape[0]))
-        return inputs, None
-
-    monkeypatch.setattr(
-        projection_ops, "flashinfer_projection_quantized_a2a", quantized_a2a
-    )
-    monkeypatch.setattr(
-        projection_ops, "fp8_linear_accepts_prepacked_input", lambda plan: True
-    )
     monkeypatch.setattr(
         projection_ops,
         "triton_projection_reduce_scatter_after_a2a",
@@ -230,19 +220,12 @@ def test_bf16_and_quantized_dispatch_across_peer_envelope(monkeypatch):
     )
     linear = SimpleNamespace(
         output_size=128,
-        forward_prepacked_into=lambda values, scales, output: (output, None),
         forward_into=lambda values, scales, output: (output, None),
     )
     for rows in range(1, 65):
         inputs = torch.empty(rows, 512, dtype=torch.bfloat16)
         assert exchange.forward(inputs, linear, [rows] * 4).shape == (rows, 128)
     assert calls == [("bf16", rows) for rows in range(1, 65)]
-    workspace.quantized_a2a = True
-    for rows in (1, 16, 64):
-        inputs = torch.empty(rows, 512, dtype=torch.bfloat16)
-        exchange.forward(inputs, linear, [rows] * 4)
-    assert calls[-3:] == [("quantized", rows) for rows in (1, 16, 64)]
-
     ordinary_mapping = Mapping(rank=0, world_size=4)
     linear, wrapper = projection_ops.make_output_projection(
         parallel=parallel,
@@ -258,33 +241,30 @@ def test_bf16_and_quantized_dispatch_across_peer_envelope(monkeypatch):
     assert not linear.reduce_results
 
 
-def test_rsag_policy_and_disabled_initialization(monkeypatch):
+def test_peer_policy_and_disabled_initialization(monkeypatch):
     parallel = projection_mapping(0, 4, 4)
     workspace = ProjectionWorkspace(512, 256, torch.bfloat16, torch.device("cpu"))
     monkeypatch.setenv(RS_ENV_NAME, "nccl")
     workspace.initialize_reduce_scatter(parallel, [128], backend="nccl")
-    assert workspace.rsag_states == {}
+    assert workspace.peer_states == {}
     # Policy depends on padded subgroup capacity, not local valid rows.
-    workspace.rsag_states[128] = object()
     peer = object()
     workspace.peer_states[128] = peer
     large_workspace = ProjectionWorkspace(8193, 8, torch.bfloat16, torch.device("cpu"))
     large_workspace.peer_states[128] = peer
     for rows in (512, 513, 8192, 8193):
         assert large_workspace.peer_state(128, rows) is (peer if rows <= 8192 else None)
-    for rows, width, expected in (
-        (1, 128, True),
-        (16, 128, True),
-        (17, 128, True),
-        (64, 128, True),
-        (65, 128, False),
-        (256, 128, False),
-        (257, 128, False),
-        (0, 128, False),
-        (16, 256, False),
+    for rows, width in (
+        (1, 128),
+        (16, 128),
+        (17, 128),
+        (64, 128),
+        (65, 128),
+        (256, 128),
+        (257, 128),
+        (0, 128),
+        (16, 256),
     ):
-        assert workspace.use_rsag(width, rows, True) == expected
-        assert not workspace.use_rsag(width, rows, False)
         assert workspace.peer_state(width, rows) is (
             peer if width == 128 and 0 < rows <= 512 else None
         )
@@ -296,16 +276,12 @@ def test_rsag_policy_and_disabled_initialization(monkeypatch):
     )
     assert no_peer.peer_states == {}
     assert no_peer.borrowed_a2a is None
-    monkeypatch.setenv(RS_ENV_NAME, "triton_rsag")
-    no_a2a = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
-    no_a2a.initialize_reduce_scatter(parallel, [128], backend="triton_rsag")
-    assert no_a2a.rsag_states == {}
     bad_dtype = ProjectionWorkspace(16, 256, torch.float16, torch.device("cpu"))
     with pytest.raises(ValueError, match="BF16"):
-        bad_dtype.initialize_reduce_scatter(parallel, [128], backend="triton_rsag")
+        bad_dtype.initialize_reduce_scatter(parallel, [128], backend="triton_peer")
     bad_width = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
-    with pytest.raises(ValueError, match="aligned"):
-        bad_width.initialize_reduce_scatter(parallel, [127], backend="triton_rsag")
+    with pytest.raises(ValueError, match="positive"):
+        bad_width.initialize_reduce_scatter(parallel, [0], backend="triton_peer")
 
 
 def test_peer_reduction_reuse_fence_contract(monkeypatch):
@@ -582,28 +558,14 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
         exchange.parallel, counts, exchange.input_size
     )
     peer = exchange.workspace.peer_state(linear.output_size, rows)
-    quantized = (
-        peer is not None
-        and fused
-        and exchange.workspace.quantized_a2a
-        and exchange.input_size % 512 == 0
-        and fp8_linear_accepts_prepacked_input(
-            getattr(linear, "_prepared_fp8_linear", None)
-        )
-    )
-    recv_scales = None
 
     def pack():
         nonlocal packed
-        packed = triton_pack_projection_input(inputs, send)
+        packed = triton_pack_channel_shards_for_a2a(inputs, send)
 
     def exchange_inputs():
-        nonlocal recv, recv_scales
-        if quantized:
-            recv, recv_scales = flashinfer_projection_quantized_a2a(
-                exchange.workspace.borrowed_a2a, inputs
-            )
-        elif peer is not None and fused:
+        nonlocal recv
+        if peer is not None and fused:
             recv = flashinfer_projection_a2a_borrowed(
                 exchange.workspace.borrowed_a2a, inputs
             )
@@ -613,10 +575,6 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
             all_to_all_single(recv, packed, exchange.parallel.tp_group, backend=None)
 
     def gemm():
-        if quantized:
-            return linear.forward_prepacked_into(
-                recv, recv_scales, peer.input_buffer(rows)
-            )
         if peer is not None:
             return linear.forward_into(recv, None, peer.input_buffer(rows))
         return linear(recv)
@@ -625,7 +583,7 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
     exchange_inputs()
     partial, _ = gemm()
     stages = {
-        "quantize_all_to_all" if quantized else "all_to_all": exchange_inputs,
+        "all_to_all": exchange_inputs,
         "gemm": gemm,
         # Isolated reduction needs its own trailing reuse fence; complete
         # projection timings instead reuse the next A2A's entry barrier.
@@ -633,9 +591,6 @@ def measure_components(exchange, linear, inputs, counts, iterations: int):
             partial,
             exchange.parallel,
             rows,
-            exchange.workspace.use_flashinfer(
-                exchange.parallel, counts, exchange.input_size
-            ),
         ),
     }
     if not fused:
@@ -855,16 +810,13 @@ def main():
             expected = baseline(x)[0] if counts[rank] else x.new_empty((0, n))
             actual = exchange.forward(x, linear, counts)
             fused_a2a = exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
-            using_rsag = exchange.workspace.use_rsag(
-                n, max(counts[r] for r in exchange.parallel.tp_group), fused_a2a
-            )
             using_peer = (
                 exchange.workspace.peer_state(
                     n, max(counts[r] for r in exchange.parallel.tp_group)
                 )
                 is not None
             )
-            custom_reduction = using_rsag or using_peer
+            custom_reduction = using_peer
             reduction_errors = torch.zeros(2, device="cuda", dtype=torch.float32)
             if custom_reduction and fused_a2a:
                 # Same quantized GEMM partials: isolate reduction rounding from
@@ -975,11 +927,7 @@ def main():
                     if custom_reduction and fused_a2a
                     else None
                 ),
-                "rs_backend": (
-                    "triton_peer"
-                    if using_peer
-                    else "triton_rsag" if using_rsag else "nccl"
-                ),
+                "rs_backend": ("triton_peer" if using_peer else "nccl"),
                 "a2a_backend": (
                     "flashinfer"
                     if exchange.workspace.use_flashinfer(exchange.parallel, counts, k)

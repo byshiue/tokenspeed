@@ -285,9 +285,7 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
-    def apply_into(
-        self, layer, x, bias, block_scale, output_dtype, out, input_scales_prepacked
-    ):
+    def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
         """Apply into caller-owned storage, using direct block-FP8 GEMM output."""
         dtype = output_dtype or x.dtype
         if out.dtype != dtype or out.device != x.device:
@@ -295,17 +293,11 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.block_quant:
             if tuple(out.shape) != (*x.shape[:-1], layer.weight.shape[0]):
                 raise ValueError("Linear output destination has incompatible shape")
-            return self._apply_block(
-                layer, x, bias, block_scale, dtype, out, input_scales_prepacked
-            )
-        if input_scales_prepacked:
-            raise ValueError("Prepacked activation scales require block-FP8 weights")
+            return self._apply_block(layer, x, bias, block_scale, dtype, out)
         out.copy_(self.apply(layer, x, bias, block_scale, dtype))
         return out
 
-    def _apply_block(
-        self, layer, x, bias, block_scale, output_dtype, out, input_scales_prepacked
-    ):
+    def _apply_block(self, layer, x, bias, block_scale, output_dtype, out):
         """Share quantization and prepared-plan dispatch for both output routes."""
         input_2d = x.view(-1, x.shape[-1])
         output_shape = [*x.shape[:-1], layer.weight.shape[0]]
@@ -313,8 +305,6 @@ class Fp8LinearMethod(LinearMethodBase):
         output_dtype = output_dtype or x.dtype
         plan = getattr(layer, "_prepared_fp8_linear", None)
         if plan is None:
-            if input_scales_prepacked:
-                raise ValueError("Prepacked activation scales require a prepared plan")
             output = tokenspeed_kernel.mm(
                 input_2d,
                 layer.weight,
@@ -336,7 +326,6 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
                 out_dtype=output_dtype,
                 out=destination,
-                input_scales_prepacked=input_scales_prepacked,
             )
         return output.to(dtype=output_dtype).view(*output_shape)
 
@@ -350,9 +339,7 @@ class Fp8LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
 
         if self.block_quant:
-            return self._apply_block(
-                layer, x, bias, block_scale, output_dtype, None, False
-            )
+            return self._apply_block(layer, x, bias, block_scale, output_dtype, None)
         else:
             input = x
             weight = layer.weight

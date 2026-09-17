@@ -33,7 +33,7 @@ logger = logging.getLogger(__file__)
 
 
 @triton.jit
-def _pack_projection_input_kernel(
+def _pack_channel_shards_for_a2a_kernel(
     source,
     destination,
     N: tl.constexpr,
@@ -54,10 +54,10 @@ def _pack_projection_input_kernel(
     tl.store(destination + offsets, values, offsets < P * M * D)
 
 
-def triton_pack_projection_input(
+def triton_pack_channel_shards_for_a2a(
     inputs: torch.Tensor, workspace: torch.Tensor
 ) -> torch.Tensor:
-    """Pack token-major rows into equal-size destination-rank messages.
+    """Split channels across peers and zero-pad destination-rank-major A2A messages.
 
     Args:
         inputs: Local ``[N, P*D]`` rows; arbitrary positive strides are allowed.
@@ -70,7 +70,7 @@ def triton_pack_projection_input(
         it aliases workspace. Neither case changes dtype or quantization.
     """
     if inputs.ndim != 2 or workspace.ndim != 3:
-        raise ValueError("Projection packing expects [N,K] and [P,M,D]")
+        raise ValueError("Channel-shard A2A packing expects [N,K] and [P,M,D]")
     peers, rows, shard = workspace.shape
     if (
         peers < 1
@@ -82,10 +82,10 @@ def triton_pack_projection_input(
         or inputs.dtype != workspace.dtype
         or inputs.device != workspace.device
     ):
-        raise ValueError("Incompatible projection packing workspace")
+        raise ValueError("Incompatible channel-shard A2A packing workspace")
     if rows == 1 and inputs.shape[0] == 1 and inputs.is_contiguous():
         return inputs.view(peers, shard)
-    _pack_projection_input_kernel[(triton.cdiv(workspace.numel(), 1024),)](
+    _pack_channel_shards_for_a2a_kernel[(triton.cdiv(workspace.numel(), 1024),)](
         inputs,
         workspace,
         inputs.shape[0],
@@ -100,7 +100,7 @@ def triton_pack_projection_input(
 
 
 __all__ = [
-    "triton_pack_projection_input",
+    "triton_pack_channel_shards_for_a2a",
     "create_state",
     "get_token_dist",
     "reduce_scatter",
