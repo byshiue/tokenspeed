@@ -76,23 +76,6 @@ def flashinfer_projection_a2a_borrowed(prepared, inputs: torch.Tensor) -> torch.
     return prepared.exchange(inputs)
 
 
-@register_kernel(
-    "communication",
-    "projection_quantized_a2a",
-    name="flashinfer_projection_quantized_a2a",
-    solution="flashinfer",
-    signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
-)
-def flashinfer_projection_quantized_a2a(prepared, inputs: torch.Tensor):
-    """Return borrowed TP4 FP8 rows and MN-major 128-channel FP32 scales.
-
-    Inputs are contiguous BF16 [N,K], with equal positive N on all peers and
-    K divisible by 512. Preparation precedes capture; consumers and subsequent
-    exchanges must use the same serialized stream.
-    """
-    return prepared.exchange_quantized(inputs)
-
-
 _custom_allreduce = None
 
 if current_platform().is_nvidia:

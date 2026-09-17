@@ -292,15 +292,6 @@ def quantize_fp8_group32_for_linear(
     )
 
 
-def fp8_linear_accepts_prepacked_input(plan: object | None) -> bool:
-    """Whether an opaque plan accepts FP8 values and contiguous MN-major scales."""
-    return (
-        isinstance(plan, _PreparedFp8Linear)
-        and plan.prepacked_scales
-        and plan.override == "flashinfer_mm_fp8_blockscale"
-    )
-
-
 def fp8_linear(
     plan: object,
     x: torch.Tensor,
@@ -311,7 +302,6 @@ def fp8_linear(
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     out: torch.Tensor | None,
-    input_scales_prepacked: bool,
 ) -> torch.Tensor:
     """Execute a block-FP8 linear operation through a prepared plan.
 
@@ -325,26 +315,15 @@ def fp8_linear(
         bias: Optional output bias.
         out_dtype: Requested output dtype.
         out: Optional destination for the result, or None to allocate it.
-        input_scales_prepacked: Whether supplied activation scales already use
-            contiguous MN-major layout. False retains the canonical contract.
     Returns:
         The linear output matrix ``[M, N]``.
     """
     typed_plan = _require_fp8_linear_plan(plan)
-    if input_scales_prepacked and (
-        not fp8_linear_accepts_prepacked_input(plan)
-        or input_scales is None
-        or x.dtype != torch.float8_e4m3fn
-    ):
-        raise ValueError(
-            "Prepacked input requires an eligible plan, FP8 values and scales"
-        )
     override = typed_plan.override
-    prepacked_scales = typed_plan.prepacked_scales and (
-        input_scales_prepacked
-        or (
-            input_scales is None and use_flashinfer_fp8_blockscale_prepacked(x.shape[0])
-        )
+    prepacked_scales = (
+        typed_plan.prepacked_scales
+        and input_scales is None
+        and use_flashinfer_fp8_blockscale_prepacked(x.shape[0])
     )
     if typed_plan.prepacked_scales and not prepacked_scales:
         override = None

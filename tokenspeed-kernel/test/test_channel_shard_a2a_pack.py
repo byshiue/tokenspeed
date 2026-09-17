@@ -22,7 +22,9 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_input
+from tokenspeed_kernel.ops.communication.triton import (
+    triton_pack_channel_shards_for_a2a,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
@@ -39,7 +41,7 @@ from tokenspeed_kernel.ops.communication.triton import triton_pack_projection_in
         (0, 8, True),
     ],
 )
-def test_projection_pack_and_replay(peers, width, rows, padded, strided):
+def test_channel_shard_a2a_pack_and_replay(peers, width, rows, padded, strided):
     storage = torch.randn(
         rows, width * (2 if strided else 1), device="cuda", dtype=torch.bfloat16
     )
@@ -55,14 +57,14 @@ def test_projection_pack_and_replay(peers, width, rows, padded, strided):
         )
         return expected.flatten(0, 1)
 
-    result = triton_pack_projection_input(inputs, scratch)
+    result = triton_pack_channel_shards_for_a2a(inputs, scratch)
     torch.testing.assert_close(result, reference(), rtol=0, atol=0)
     assert result.data_ptr() == (
         inputs.data_ptr() if rows == padded == 1 and not strided else scratch.data_ptr()
     )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = triton_pack_projection_input(inputs, scratch)
+        captured = triton_pack_channel_shards_for_a2a(inputs, scratch)
     for scale in (1.0, -2.0, 0.0):
         inputs.mul_(scale)
         scratch.fill_(17)
