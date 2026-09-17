@@ -56,10 +56,6 @@ class BorrowedProjectionA2A:
             "tokenspeed_projection_ulysses_borrowed_v1",
             [Path(__file__).with_name("ulysses_borrowed.cu")],
         ).build_and_load()
-        self.quantized_module = gen_jit_spec(
-            "tokenspeed_projection_quantized_a2a_v1",
-            [Path(__file__).with_name("projection_quantized_alltoall.cu")],
-        ).build_and_load()
         pointer = comm._out_ptrs[comm.rank]
         self.buffer = torch.as_tensor(
             _CudaBufferView(pointer, comm.max_elems * comm.dtype.itemsize),
@@ -67,37 +63,6 @@ class BorrowedProjectionA2A:
         ).view(comm.dtype)
         if self.buffer.data_ptr() != pointer:
             raise RuntimeError("Projection IPC view unexpectedly copied storage")
-
-    def exchange_quantized(self, inputs):
-        """Return borrowed FP8 rows and MN-major FP32 128-channel scales.
-
-        Both views share the communicator allocation and must be consumed on
-        the same serialized stream before its next exchange.
-        """
-        rows, channels = inputs.shape
-        comm = self.comm
-        values_count = rows * channels
-        scale_count = (channels // 512) * (4 * rows)
-        offset = comm.max_elems
-        storage = self.buffer.view(torch.uint8)
-        if (
-            comm.world_size != 4
-            or channels % 512
-            or rows <= 0
-            or inputs.dtype != torch.bfloat16
-            or not inputs.is_contiguous()
-            or inputs.device != self.buffer.device
-            or values_count > offset
-            or offset % 4
-            or offset + scale_count * 4 > storage.numel()
-        ):
-            raise ValueError("Invalid quantized projection exchange shape or storage")
-        self.quantized_module.quant_a2a(comm._fa, inputs, offset, 0)
-        values = storage[:values_count].view(torch.float8_e4m3fn)
-        scales = storage[offset : offset + scale_count * 4].view(torch.float32)
-        return values.view(4 * rows, channels // 4), scales.view(
-            channels // 512, 4 * rows
-        )
 
     def exchange(self, inputs):
         rows, channels = inputs.shape
