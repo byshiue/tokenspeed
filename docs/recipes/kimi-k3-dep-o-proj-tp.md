@@ -75,16 +75,15 @@ or `nccl` (the default) for the reference path. The FlashInfer installation
 must provide `flashinfer.comm.ulysses.UlyssesCommunicator`; older versions
 can use the NCCL fallback without an upgrade.
 
-Only balanced physical batches of at most 16 rows per rank use the optional
+Only balanced physical batches of at most 64 rows per rank use the optional
 path. Larger and uneven batches retain NCCL, including when `flashinfer` is
 requested. No mode-specific prefill/decode branch is added. Graph-padded rows
 count toward the limit. Startup logs report the selected backend and fallback
 reason. Keep the same setting throughout graph capture and replay.
 
-This changes projection A2A only: GEMM and NCCL ReduceScatter stay unchanged.
-The earlier 16-requests/rank prototype reduced complete projection latency
-by about 13.8%, not full-model latency. Full-model correctness and performance
-validation are still required before changing the default.
+Selecting A2A alone leaves GEMM and NCCL ReduceScatter unchanged. Measure the
+complete projection and full-model workload before choosing a backend; an
+isolated communication improvement does not establish an end-to-end gain.
 
 To also test the optional ReduceScatter path, set:
 
@@ -97,11 +96,11 @@ reduction. Enable FlashInfer A2A as above to use RSAG. The NVIDIA RSAG path requ
 NVLink multicast support, BF16 projection outputs, and output widths
 divisible by eight. Explicit initialization failures are fatal.
 
-RSAG is used for balanced physical batches of up to 16 rows per rank when
+RSAG is used for balanced physical batches of up to 64 rows per rank when
 FlashInfer A2A is active. Larger or uneven physical batches use NCCL for both
 operations; padded graph rows may still contain inactive requests. If A2A
 falls back to NCCL at startup, RSAG is also disabled and a warning is logged.
-TP4 with output width 7168 reserves up to 896 KiB of symmetric payload scratch
+TP4 with output width 7168 reserves up to 3.5 MiB of symmetric payload scratch
 per GPU, shared across layers of that width. Returned outputs are cloned so
 subsequent layers cannot overwrite them.
 
@@ -125,16 +124,19 @@ export TOKENSPEED_KIMI_K3_O_PROJ_A2A_BACKEND=flashinfer
 export TOKENSPEED_KIMI_K3_O_PROJ_RS_BACKEND=triton_peer
 ```
 
-For prepared block-FP8 projections, this path fuses quantization into A2A at
-16 physical rows per rank. Smaller batches retain BF16 exchange because
-shared-buffer measurements did not show a gain. The complete projection
+For prepared block-FP8 projections, this path always fuses quantization into
+A2A across balanced batches of 1–64 physical rows per rank. It does not switch
+between quantized and BF16 exchange based on per-shape timing. Some shapes
+are slightly faster with BF16 exchange; this policy favors one quantized
+route across the supported range. The complete projection
 also reuses the next A2A entry barrier as its reduction-storage reuse fence;
 standalone reduction diagnostics still include an explicit trailing fence.
-See the performance notes for paired timings and the TP1 memory tradeoff.
+TP4 reduces projection weight storage, but its communication can make it
+slower than independent TP1 projections even with these optimizations.
 
 It borrows the A2A receive buffer and lets supported FP8 GEMMs write directly
 into symmetric reduction storage. The final output is owned, not a workspace
-view. The same balanced 1–16 physical rows/rank cutoff applies; larger or
+view. The same balanced 1–64 physical rows/rank cutoff applies; larger or
 uneven shapes retain NCCL. Standalone 16-GPU BF16 and real-weight projection
 checks pass; full-model logits and generation still need validation, so the
 backend remains opt-in.
@@ -144,6 +146,50 @@ Unset/`1` preserves the original projection. The value must divide world size
 and projection dimensions, respect quantization alignment, and agree on all
 ranks. Projection TP requires attention TP1/DP-world, linear-attention TP1,
 MoE EP-world and PP1.
+
+## Execution and buffer contract
+
+The reusable wrapper is `DistributedOutputProjection` in
+`tokenspeed.runtime.layers.attention.o_proj`. It takes an explicit projection
+mapping and per-rank physical token counts; workspace initialization takes
+explicit A2A and reduction backends. It reads no Kimi environment settings and
+does not require any particular MoE layout. Kimi configuration parsing, rank
+agreement and attention/MoE layout validation stay in the model integration.
+
+Inputs contain locally owned tokens and all attention-output channels. Within
+each contiguous TP subgroup, A2A changes token ownership into channel-shard
+ownership. `RowParallelLinear` projects the subgroup tokens, and reduce-scatter
+returns complete outputs to the original token owners before residual,
+normalization or AttnRes processing. The Linear's own reduction is disabled to
+avoid reducing twice. Weight shards must preserve the resolved quantization
+block boundaries. KDA/MLA gating remains before this exchange.
+
+Every subgroup rank participates when any peer has tokens, including ranks
+with empty local inputs. Uneven counts use equal-size padded NCCL messages;
+an entirely empty subgroup skips communication. Selection depends on shared
+physical counts, including graph padding, not on forward mode.
+
+Initialize process groups, communication buffers and native modules before
+CUDA-graph capture and cache budgeting. Sequential attention layers share
+one workspace. Keep calls on one serialized stream: the next borrowed A2A's
+entry barrier protects reuse of symmetric GEMM output after peer reads.
+Never replace or close buffers while captured graphs still reference them;
+explicit close is collective. Returned outputs own their storage and survive
+later workspace reuse. Initialization failures propagate for explicitly
+requested backends; never switch collectives after a rank-local forward error.
+
+The supported block-FP8 `apply_into()` path writes GEMM output directly into
+caller-owned symmetric storage, removing the intermediate D2D copy before
+reduction. Unsupported direct-output plans still compute a temporary result
+and copy it into `out`; accepting an output buffer alone does not guarantee
+copy elimination. Quantized A2A sends FP8 activations and FP32 per-128-channel
+scales; the GEMM consumes those scales without quantizing a second time.
+
+For each `[7168, 12288]` block-FP8 projection, weights and checkpoint scales
+occupy about 84.02 MiB per GPU at TP1 versus 21.01 MiB at TP4. These figures
+exclude prepared scales, communication buffers and the rest of the model.
+Additional saved memory may increase serving capacity, but the maximum safe
+concurrency still depends on cache length, graph pools and temporary kernels.
 
 ## Small tests first
 
