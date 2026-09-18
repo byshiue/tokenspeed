@@ -1,5 +1,9 @@
 # Kimi-K3 Buffered Replay：统一 Decode 实现计划
 
+评审入口请见 [Replay-SSM 设计](kda-replay-ssm-design.md)：汇总 cache/scheduler
+职责、kernel 接口、当前 PR 状态与验收差距。本文保留实现和实验历史；涉及旧版
+computed frontier 的记录，应以该设计引用的上游 #1597 修复为准。
+
 状态：实现中，buffered replay 尚未通过完整模型验收，默认不启用。已实现 LCM-owned history、
 固定地址 metadata、统一 decode/accepted commit、跨 rank 失败检查，以及
 accepted/quiescent endpoint 物化。M14 接通 mixed batch 中的 buffered decode
