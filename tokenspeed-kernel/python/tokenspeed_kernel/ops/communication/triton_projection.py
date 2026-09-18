@@ -41,7 +41,12 @@ def owner_reduce(
     i = tl.program_id(0) * B + tl.arange(0, B)
     total = tl.full((B,), 0, tl.float32)
     for peer in tl.static_range(P):
+        # Peer addresses are allocation bases (storage_offset=0) from symmetric
+        # memory. Recover their 16-byte alignment after the indirect load so
+        # Triton can vectorize BF16 reads; owner offsets and tails may still
+        # require narrower accesses.
         ptr = tl.load(PTRS + peer).to(tl.pointer_type(Y.dtype.element_ty))
+        ptr = tl.multiple_of(ptr, 16)
         total += tl.load(ptr + R * M * H + i, mask=i < M * H, other=0).to(tl.float32)
     tl.store(Y + i, total, mask=i < M * H)
 
