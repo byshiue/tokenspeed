@@ -236,23 +236,23 @@ pip install flash-linear-attention
 Notes:
 
 - K3 uses the cache-group scheduler and KDA state groups.
-- On Blackwell, `TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND=deep_gemm` opts the
-  block-FP8 attention projections into DeepGEMM: KDA fused QKV/gates and output,
-  and MLA fused QKV-a/gate, Q-b, and output. Unset it (or use `auto`) to keep
-  the existing backend selection. Shared experts and routed experts are
-  unchanged; this switch does not change tensor-parallel mapping.
-- This option is **not numerically equivalent** to the default FP8 path.
-  At loading time, it rewrites local FP8 weights and their 128x128 scales
-  using power-of-two scales. Activations also use power-of-two scales at
-  runtime. Conversion happens after weight assembly/sharding and before
-  warmup or CUDA-graph capture; checkpoint files are not modified.
-  Allow temporary GPU memory for FP32 weight conversion during loading.
-  Validate model accuracy on your workload before deploying it. Faster
-  projection GEMMs alone do not establish an end-to-end speedup.
-- The opt-in requires a serialized block-FP8 attention checkpoint, aligned
-  local weight dimensions, Blackwell, and DeepGEMM. Unsupported combinations
-  fail instead of silently falling back. Do not combine it with
-  `TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0=1`.
+- On Blackwell, `--dense-gemm-backend trtllm_cutedsl` opts the
+  block-FP8 attention projections into TRT-LLM CuTe-DSL: KDA fused QKV/gates and output,
+  and MLA fused QKV-a/gate, Q-b, and output. Omit it (or use `auto`) to keep
+  the existing backend selection. This shared option applies across models
+  to standard 128x128 block-FP8 dense linears. BF16/NVFP4 linears, MXFP8,
+  per-tensor FP8, specialized grouped projections, and routed experts are
+  unchanged; it does not change tensor-parallel mapping.
+- This backend preserves checkpoint FP8 values and their FP32 128x128 block
+  scales; it does not requantize weights or convert scales to E8M0.
+  Activations use the existing 1x128 FP8 quantization path. The kernel uses
+  FP32 accumulation and BF16 output. Validate model accuracy on your workload;
+  preserving the quantization contract does not guarantee bitwise equality
+  across GEMM implementations.
+- It requires Blackwell, CuTe-DSL with TVM-FFI support, BF16 outputs, and aligned
+  local weight dimensions. Kernel variants compile during preparation before
+  CUDA-graph capture. Unsupported selected linears fail instead of silently
+  falling back. Faster GEMMs alone do not establish an end-to-end speedup.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.

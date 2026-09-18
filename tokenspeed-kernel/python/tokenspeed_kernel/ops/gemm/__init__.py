@@ -35,6 +35,7 @@ import tokenspeed_kernel.ops.gemm.ll_bf16  # noqa: F401
 import tokenspeed_kernel.ops.gemm.routed_gemv  # noqa: F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: F401
 import tokenspeed_kernel.ops.gemm.trtllm  # noqa: F401
+import tokenspeed_kernel.ops.gemm.trtllm_cutedsl  # noqa: F401
 import torch
 from tokenspeed_kernel.ops.gemm.deep_gemm import (
     _warmup_deep_gemm_fp8_linears,
@@ -107,7 +108,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
-    "prepare_requantized_deep_gemm_fp8_linear",
+    "prepare_trtllm_cutedsl_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
 ]
@@ -293,63 +294,44 @@ def quantize_fp8_group32_for_linear(
     )
 
 
-def prepare_requantized_deep_gemm_fp8_linear(
+def prepare_trtllm_cutedsl_fp8_linear(
     weight: torch.Tensor,
     weight_scales: torch.Tensor,
     block_size: tuple[int, int] | list[int],
 ) -> object:
-    """Requantize local FP8 weights in place and prepare a DeepGEMM plan.
-
-    This startup-only, explicitly lossy operation rewrites both FP8 codes and
-    canonical FP32 scales. Already power-of-two scales need no requantization.
-    Call after checkpoint assembly/sharding and before warmup or graph capture.
+    """Prepare original-scale block-FP8 GEMM and compile before graph capture.
 
     Args:
-        weight: Contiguous CUDA E4M3 weight matrix in [N, K] layout.
-        weight_scales: Positive finite FP32 scales, one per 128x128 block.
-        block_size: Must be (128, 128); partial blocks are not supported.
-
+        weight: Contiguous CUDA E4M3 [N,K], with N and K divisible by 128.
+        weight_scales: Canonical FP32 [N/128,K/128] checkpoint scales.
+        block_size: Must be (128,128).
     Returns:
-        An opaque plan for fp8_linear with matching online UE8M0 quantization.
+        An opaque fp8_linear plan; weight values and scales are not modified.
     """
-    from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
-        is_ue8m0,
-        requantize_to_ue8m0_,
-    )
-
     platform = current_platform()
-    if (
-        not platform.is_nvidia
-        or not platform.is_blackwell_plus
-        or ceil_to_ue8m0 is None
-        or transform_sf_into_required_layout is None
-        or KernelRegistry.get().get_by_name("deep_gemm_mm_fp8_blockscale") is None
-    ):
-        raise RuntimeError("Requantized DeepGEMM FP8 requires Blackwell and DeepGEMM")
-    if os.environ.get("TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0") == "1":
-        raise ValueError("DeepGEMM FP8 requantization requires UE8M0 to remain enabled")
+    if not platform.is_nvidia or not platform.is_blackwell:
+        raise RuntimeError("TRT-LLM CuTe-DSL block-FP8 requires Blackwell")
     if (
         tuple(block_size) != (128, 128)
         or weight.ndim != 2
         or weight.dtype != torch.float8_e4m3fn
         or not weight.is_cuda
         or not weight.is_contiguous()
-        or any(dim == 0 or dim % 128 for dim in weight.shape)
+        or any(d == 0 or d % 128 for d in weight.shape)
         or weight_scales.dtype != torch.float32
         or weight_scales.device != weight.device
         or weight_scales.shape != (weight.shape[0] // 128, weight.shape[1] // 128)
     ):
         raise ValueError(
-            "DeepGEMM FP8 requires aligned E4M3 weights and canonical 128x128 FP32 scales"
+            "TRT-LLM CuTe-DSL requires aligned E4M3 weights and canonical 128x128 FP32 scales"
         )
-    if not bool((torch.isfinite(weight_scales) & (weight_scales > 0)).all()):
-        raise ValueError("DeepGEMM FP8 weight scales must be positive and finite")
-    with torch.no_grad():
-        if not is_ue8m0(weight_scales):
-            requantize_to_ue8m0_(weight, weight_scales, (128, 128))
-        return prepare_fp8_linear(
-            weight, weight_scales, (128, 128), scale_format="ue8m0"
-        )
+    from tokenspeed_kernel.thirdparty.trtllm_blockwise import prepare
+
+    prepare(weight.device)
+    return _PreparedFp8Linear(
+        override="trtllm_cutedsl_mm_fp8_blockscale",
+        block_size=(128, 128),
+    )
 
 
 def fp8_linear(
@@ -1146,6 +1128,13 @@ def _online_quantize_mxfp8(
             scale_ue8m0=_platform.is_blackwell_plus,
             enable_pdl=enable_pdl,
         )
+    elif kernel_name == "trtllm_cutedsl_mm_fp8_blockscale":
+        from tokenspeed_kernel.ops.gemm.fp8_utils import (
+            flashinfer_fp8_blockscale_quantize_prepacked,
+        )
+
+        values, scales = flashinfer_fp8_blockscale_quantize_prepacked(A, block_k)
+        return values[: A.shape[0]], scales[:, : A.shape[0]].T
     elif kernel_name == "flashinfer_mm_fp8_blockscale":
         from tokenspeed_kernel.ops.gemm.fp8_utils import per_token_group_quant_fp8
 

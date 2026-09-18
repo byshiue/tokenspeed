@@ -60,6 +60,7 @@ global_server_args_dict: dict = {
     "max_model_len": ServerArgs.max_model_len,
     "max_num_seqs": ServerArgs.max_num_seqs,
     "moe_backend": ServerArgs.moe_backend,
+    "dense_gemm_backend": ServerArgs.dense_gemm_backend,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
@@ -108,6 +109,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "max_model_len": server_args.max_model_len,
             "max_num_seqs": server_args.max_num_seqs,
             "moe_backend": server_args.moe_backend,
+            "dense_gemm_backend": server_args.dense_gemm_backend,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,
@@ -236,8 +238,6 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
-    # Opt-in: requantizes Kimi-K3 attention FP8 weights to power-of-two scales.
-    TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND = EnvStr("auto")
 
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)

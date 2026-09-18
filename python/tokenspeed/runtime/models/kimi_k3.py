@@ -108,10 +108,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
-from tokenspeed.runtime.layers.dense.fp8 import (
-    Fp8LinearMethod,
-    RequantizedDeepGemmFp8LinearMethod,
-)
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
 )
@@ -178,7 +175,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -187,26 +184,6 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
-
-
-def _use_deep_gemm_fp8_projections() -> bool:
-    backend = envs.TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND.get()
-    if backend not in {"auto", "deep_gemm"}:
-        raise ValueError(
-            "TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND must be auto or deep_gemm"
-        )
-    return backend == "deep_gemm"
-
-
-def _enable_deep_gemm_fp8_projection(layer: nn.Module) -> None:
-    method = layer.quant_method
-    if not isinstance(method, Fp8LinearMethod) or tuple(
-        method.quant_config.weight_block_size or ()
-    ) != (128, 128):
-        raise ValueError(
-            "Kimi-K3 DeepGEMM projections require FP8 128x128 checkpoint weights"
-        )
-    layer.quant_method = RequantizedDeepGemmFp8LinearMethod(method.quant_config)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -434,18 +411,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 quant_config=quant_config,
                 prefix=fused_prefix,
             )
-
-        if _use_deep_gemm_fp8_projections():
-            if q_lora_rank is None:
-                raise ValueError(
-                    "Kimi-K3 DeepGEMM projections require the q-lora MLA path"
-                )
-            for projection in (
-                self.fused_qkv_a_proj_with_mqa,
-                self.q_b_proj,
-                self.o_proj,
-            ):
-                _enable_deep_gemm_fp8_projection(projection)
 
     def _split_fused_qkv_a(
         self, qkv_gate: torch.Tensor
@@ -1207,10 +1172,13 @@ class KimiLinearKDA(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
-        if _use_deep_gemm_fp8_projections():
-            if not merged_fp8:
-                raise ValueError("Kimi-K3 DeepGEMM QKV requires a block-FP8 checkpoint")
-            self.qkvgb_proj.quant_method = RequantizedDeepGemmFp8LinearMethod(
+        if (
+            merged_fp8
+            and global_server_args_dict["dense_gemm_backend"] == "trtllm_cutedsl"
+        ):
+            # The merged buffer is not a LinearBase. Register the ordinary
+            # FP8 method so loading and warmup discover it like other linears.
+            self.qkvgb_proj.quant_method = Fp8LinearMethod(
                 Fp8Config(
                     is_checkpoint_fp8_serialized=True,
                     activation_scheme="dynamic",
@@ -1219,7 +1187,6 @@ class KimiLinearKDA(nn.Module):
                     scale_fmt=None,
                 )
             )
-            _enable_deep_gemm_fp8_projection(self.o_proj)
 
     def fuse_conv_weights(self) -> None:
         """Concatenate the loaded q/k/v conv kernels into ``self.conv_weights``."""
@@ -1236,7 +1203,7 @@ class KimiLinearKDA(nn.Module):
         proj_local = self.local_num_heads * self.head_dim
         if isinstance(
             getattr(self.qkvgb_proj, "quant_method", None),
-            RequantizedDeepGemmFp8LinearMethod,
+            Fp8LinearMethod,
         ):
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
@@ -3443,7 +3410,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     merged.verify_fp8_load_complete()
                     if isinstance(
                         getattr(merged, "quant_method", None),
-                        RequantizedDeepGemmFp8LinearMethod,
+                        Fp8LinearMethod,
                     ):
                         # The loader prepares this plan with the other FP8
                         # linears after assembly. Do not cache stale FI scales.

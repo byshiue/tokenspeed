@@ -18,39 +18,31 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Original-scale TRT-LLM CuTe-DSL FP8 correctness and CUDA graph coverage."""
+
 import pytest
 import torch
-from tokenspeed_kernel import fp8_linear, prepare_requantized_deep_gemm_fp8_linear
-from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
-    is_ue8m0,
-    per_token_group_quant_fp8_ue8m0,
+from tokenspeed_kernel import fp8_linear, prepare_trtllm_cutedsl_fp8_linear
+from tokenspeed_kernel.ops.gemm.fp8_utils import (
+    flashinfer_fp8_blockscale_quantize_prepacked,
 )
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
-    not current_platform().is_blackwell_plus, reason="Requires Blackwell DeepGEMM"
+    not current_platform().is_blackwell, reason="Requires Blackwell CuTe-DSL"
 )
 
 
-@pytest.mark.parametrize("m", [1, 32, 128, 512])
-def test_requantized_linear_and_graph(m):
+@pytest.mark.parametrize("m", [1, 32, 64, 128, 256, 512])
+def test_original_scales_and_graph(m):
     torch.manual_seed(42)
     n, k = 256, 512
     weight = (torch.randn(n, k, device="cuda") * 32).to(torch.float8_e4m3fn)
-    scales = torch.full((n // 128, k // 128), 0.013, device="cuda")
-    original = weight.float() * scales.repeat_interleave(128, 0).repeat_interleave(
-        128, 1
-    )
-    plan = prepare_requantized_deep_gemm_fp8_linear(weight, scales, (128, 128))
-    assert is_ue8m0(scales)
-    converted = weight.float() * scales.repeat_interleave(128, 0).repeat_interleave(
-        128, 1
-    )
-    assert (converted - original).norm() / original.norm() < 0.06
-    saved_weight, saved_scales = weight.clone(), scales.clone()
-    prepare_requantized_deep_gemm_fp8_linear(weight, scales, (128, 128))
-    assert torch.equal(weight.float(), saved_weight.float())
-    assert torch.equal(scales, saved_scales)
+    scales = torch.rand(n // 128, k // 128, device="cuda") * 0.01 + 0.01
+    original_weight, original_scales = weight.clone(), scales.clone()
+    plan = prepare_trtllm_cutedsl_fp8_linear(weight, scales, (128, 128))
+    assert torch.equal(weight.view(torch.uint8), original_weight.view(torch.uint8))
+    assert torch.equal(scales, original_scales)
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
 
     def run():
@@ -64,18 +56,14 @@ def test_requantized_linear_and_graph(m):
             out_dtype=torch.bfloat16,
         )
 
-    for _ in range(3):
-        eager = run()
-    reference = x.float() @ converted.T
-    assert (eager.float() - reference).norm() / reference.norm() < 0.06
-    # Separate GEMM correctness from the deliberately changed quantization.
-    quantized, input_scales = per_token_group_quant_fp8_ue8m0(x, 128)
-    quantized_reference = (
-        quantized.float() * input_scales.repeat_interleave(128, dim=1)
-    ) @ converted.T
-    assert (
-        eager.float() - quantized_reference
-    ).norm() / quantized_reference.norm() < 0.005
+    eager = run()
+    q, s = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
+    dq = q[:m].float() * s[:, :m].T.repeat_interleave(128, dim=1)
+    dw = weight.float() * scales.repeat_interleave(128, 0).repeat_interleave(128, 1)
+    reference = dq @ dw.T
+    assert (eager.float() - reference).norm() / reference.norm() < 0.005
+
+    # Capture after preparation, without warming this particular M again.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = run()
@@ -87,17 +75,12 @@ def test_requantized_linear_and_graph(m):
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
-def test_requantization_rejects_invalid_scales_and_alignment():
+def test_alignment_and_zero_weights():
     weight = torch.zeros((128, 256), device="cuda", dtype=torch.float8_e4m3fn)
-    scales = torch.ones((1, 2), device="cuda")
-    for invalid in (0.0, -1.0, float("nan"), float("inf")):
-        scales.fill_(invalid)
-        with pytest.raises(ValueError, match="positive and finite"):
-            prepare_requantized_deep_gemm_fp8_linear(weight, scales, (128, 128))
-    scales.fill_(1)
+    scales = torch.full((1, 2), 0.013, device="cuda")
     with pytest.raises(ValueError, match="aligned"):
-        prepare_requantized_deep_gemm_fp8_linear(weight, scales, (64, 128))
-    plan = prepare_requantized_deep_gemm_fp8_linear(weight, scales, (128, 128))
+        prepare_trtllm_cutedsl_fp8_linear(weight, scales, (64, 128))
+    plan = prepare_trtllm_cutedsl_fp8_linear(weight, scales, (128, 128))
     x = torch.ones((1, 256), device="cuda", dtype=torch.bfloat16)
     output = fp8_linear(
         plan, x, weight, scales, input_scales=None, bias=None, out_dtype=torch.bfloat16

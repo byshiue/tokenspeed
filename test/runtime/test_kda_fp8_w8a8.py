@@ -100,29 +100,21 @@ def _load(module, ckpt) -> None:
         module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
 
 
-def test_deep_gemm_merged_preparation_and_dispatch(monkeypatch) -> None:
+def test_trtllm_cutedsl_merged_preparation_and_dispatch(monkeypatch) -> None:
     from tokenspeed_kernel.platform import current_platform
 
-    from tokenspeed.runtime.layers.dense.fp8 import RequantizedDeepGemmFp8LinearMethod
+    from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
     from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
-    from tokenspeed.runtime.models.kimi_k3 import (
-        KimiLinearKDA,
-        _use_deep_gemm_fp8_projections,
-    )
+    from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
+    from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    monkeypatch.delenv("TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND", raising=False)
-    assert not _use_deep_gemm_fp8_projections()
-    monkeypatch.setenv("TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND", "typo")
-    with pytest.raises(ValueError, match="auto or deep_gemm"):
-        _use_deep_gemm_fp8_projections()
-    monkeypatch.setenv("TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND", "deep_gemm")
-    assert _use_deep_gemm_fp8_projections()
-    if not current_platform().is_blackwell_plus:
-        pytest.skip("DeepGEMM preparation requires Blackwell")
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "trtllm_cutedsl")
+    if not current_platform().is_blackwell:
+        pytest.skip("TRT-LLM CuTe-DSL preparation requires Blackwell")
     module = _build_fp8_merged(0)
     _load(module, _make_ckpt_segments(torch.Generator().manual_seed(42)))
     module.verify_fp8_load_complete()
-    method = RequantizedDeepGemmFp8LinearMethod(
+    method = Fp8LinearMethod(
         Fp8Config(
             is_checkpoint_fp8_serialized=True,
             activation_scheme="dynamic",
