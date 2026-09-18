@@ -46,6 +46,10 @@ from tokenspeed_kernel.ops.communication.triton_projection import (
     triton_projection_reduce_scatter,
     triton_projection_reduce_scatter_after_a2a,
 )
+from tokenspeed_kernel.ops.communication.trtllm_projection import (
+    ProjectionLamportState,
+    trtllm_projection_reduce_scatter,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
 from tokenspeed.runtime.distributed.mapping import (
@@ -66,6 +70,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 FLASHINFER_MAX_TOKENS = 512
 PEER_MAX_TOKENS = 8192
+LAMPORT_MAX_TOKENS = 128
 
 
 def projection_mapping(rank: int, world_size: int, tp_size: int) -> DenseLayerMapping:
@@ -109,9 +114,9 @@ def validate_projection_settings(
             )
     if a2a_value not in ("nccl", "auto", "flashinfer"):
         raise ValueError(f"Invalid output projection A2A backend: {a2a_value}")
-    if rs_value not in ("nccl", "triton_peer"):
+    if rs_value not in ("nccl", "triton_peer", "trtllm_lamport"):
         raise ValueError(
-            "Output projection reduction backend must be nccl or triton_peer"
+            "Output projection reduction backend must be nccl, triton_peer or trtllm_lamport"
         )
     try:
         size = int(value)
@@ -151,6 +156,7 @@ class ProjectionWorkspace:
         self.a2a_reason = None
         self._a2a_initialized = False
         self.peer_states = {}
+        self.lamport_states = {}
         self.borrowed_a2a = None
         self._rs_initialized = False
 
@@ -165,8 +171,29 @@ class ProjectionWorkspace:
         """
         if self._rs_initialized:
             return
-        if backend not in ("nccl", "triton_peer"):
-            raise ValueError("Projection reduction backend must be nccl or triton_peer")
+        if backend not in ("nccl", "triton_peer", "trtllm_lamport"):
+            raise ValueError("Invalid projection reduction backend")
+        if backend == "trtllm_lamport":
+            if parallel.tp_size != 4 or self.send.dtype != torch.bfloat16:
+                raise ValueError("Lamport projection reduction requires TP4 BF16")
+            group = pg_manager.get_process_group("nccl", parallel.tp_group)
+            if self.a2a is not None:
+                self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
+            for width in sorted(set(output_sizes)):
+                state = ProjectionLamportState(
+                    group,
+                    min(self.max_tokens, LAMPORT_MAX_TOKENS),
+                    width,
+                    self.send.device,
+                )
+                self.lamport_states[width] = state
+                probe = state.input_buffer(1)
+                probe.zero_()
+                trtllm_projection_reduce_scatter(state, probe, 1)
+            logger.info(
+                "Projection ReduceScatter: trtllm_lamport, up to %s rows/rank; NCCL above",
+                min(self.max_tokens, LAMPORT_MAX_TOKENS),
+            )
         if backend == "triton_peer":
             if parallel.tp_size != 4:
                 logger.warning("Projection peer reduction requires TP4; using NCCL")
@@ -204,6 +231,12 @@ class ProjectionWorkspace:
             return self.peer_states.get(output_size)
         return None
 
+    def lamport_state(self, output_size: int, rows: int):
+        """Select one-shot IPC scratch using shared physical row counts."""
+        if 0 < rows <= min(self.max_tokens, LAMPORT_MAX_TOKENS):
+            return self.lamport_states.get(output_size)
+        return None
+
     def reduce_scatter(
         self,
         partial: torch.Tensor,
@@ -211,6 +244,9 @@ class ProjectionWorkspace:
         max_tokens: int,
     ) -> torch.Tensor:
         """Return owned output rows; never expose reusable communication storage."""
+        lamport = self.lamport_state(partial.shape[1], max_tokens)
+        if lamport is not None:
+            return trtllm_projection_reduce_scatter(lamport, partial, max_tokens)
         peer = self.peer_state(partial.shape[1], max_tokens)
         if peer is not None:
             return triton_projection_reduce_scatter(peer, partial, max_tokens)
@@ -257,6 +293,9 @@ class ProjectionWorkspace:
 
     def close(self) -> None:
         """Collectively release IPC resources after all referencing graphs die."""
+        for state in self.lamport_states.values():
+            state.close()
+        self.lamport_states.clear()
         if self.peer_states:
             torch.cuda.synchronize(self.send.device)
             dist.barrier(group=next(iter(self.peer_states.values())).group)
@@ -324,7 +363,8 @@ class DistributedOutputProjection:
         # transpose and padding, preserving the original BF16/FP16 values.
         fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
         peer = workspace.peer_state(linear.output_size, max_tokens)
-        if peer is not None and fused_a2a:
+        lamport = workspace.lamport_state(linear.output_size, max_tokens)
+        if (peer is not None or lamport is not None) and fused_a2a:
             recv = flashinfer_projection_a2a_borrowed(
                 workspace.borrowed_a2a, inputs.contiguous()
             )
@@ -333,7 +373,14 @@ class DistributedOutputProjection:
         else:
             packed = triton_pack_channel_shards_for_a2a(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)
-        if peer is not None:
+        if lamport is not None:
+            # This destination is local: the native Lamport kernel publishes
+            # GEMM results into its own IPC ring and protects ring reuse.
+            partial, _ = linear.forward_into(
+                recv, None, lamport.input_buffer(max_tokens)
+            )
+            output = trtllm_projection_reduce_scatter(lamport, partial, max_tokens)
+        elif peer is not None:
             if not fused_a2a:
                 # A preceding FI reduction may have deferred its reuse fence.
                 # NCCL A2A is not that fence: protect direct GEMM writes here,

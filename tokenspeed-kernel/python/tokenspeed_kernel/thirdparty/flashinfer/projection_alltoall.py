@@ -152,3 +152,12 @@ def flashinfer_projection_a2a(comm, inputs: torch.Tensor) -> torch.Tensor:
     return comm.scatter_heads(
         inputs.view(1, rows, channels // head_dim, head_dim)
     ).view(rows * comm.world_size, channels // comm.world_size)
+
+
+def flashinfer_projection_gather_channels(comm, inputs: torch.Tensor) -> torch.Tensor:
+    """Inverse exchange: [P*M,N/P] token shards become owned [M,N] rows."""
+    rows, channels = inputs.shape
+    head_dim = 128 if channels % 128 == 0 else 8
+    return comm.gather_heads(inputs.view(1, rows, channels // head_dim, head_dim)).view(
+        rows // comm.world_size, channels * comm.world_size
+    )

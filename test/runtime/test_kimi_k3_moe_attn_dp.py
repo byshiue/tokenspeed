@@ -203,6 +203,7 @@ def test_k3_rejects_unsupported_transport_layout(monkeypatch, backend, dp, match
 @pytest.mark.parametrize("with_norm", [False, True])
 @pytest.mark.parametrize("use_alltoall", [False, True])
 @pytest.mark.parametrize("nvfp4", [False, True])
+@pytest.mark.parametrize("shared_tp", [False, True])
 @pytest.mark.parametrize(
     "graph_phase,capture_mode", [(False, False), (True, False), (True, True)]
 )
@@ -214,6 +215,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     with_norm: bool,
     use_alltoall: bool,
     nvfp4: bool,
+    shared_tp: bool,
     graph_phase: bool,
     capture_mode: bool,
 ) -> None:
@@ -234,11 +236,34 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         yield
         events.append("branch_done")
 
+    @contextmanager
+    def branch_after_main():
+        events.append("branch_after_main")
+        with branch():
+            yield
+
     def shared(value, *, down_out):
         events.append("shared")
         return value * 3
 
-    fork = SimpleNamespace(scope=scope, branch=branch)
+    def shared_gather(value, physical_counts):
+        events.append("shared_gather")
+        assert physical_counts == list(counts)
+        return value
+
+    def shared_reduce(value, local_rows):
+        events.append("shared_reduce")
+        assert local_rows == rows
+        return value
+
+    fork = SimpleNamespace(
+        scope=scope,
+        branch=branch,
+        branch_after_main=branch_after_main,
+        join=lambda: events.append("join_branch"),
+        record_checkpoint=lambda: events.append("record_gather"),
+        join_checkpoint=lambda: events.append("join_gather"),
+    )
     monkeypatch.setattr(kimi_k3, "get_is_cuda_graph_phase", lambda: graph_phase)
     monkeypatch.setattr(kimi_k3, "get_is_capture_mode", lambda: capture_mode)
     group = (0, 1)
@@ -373,6 +398,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         routed_expert_up_proj=SimpleNamespace(forward_add3=up),
     )
     monkeypatch.setattr(kimi_k3, "all_gather", gather)
+    layer.shared_experts.shared_parallel = object() if shared_tp else None
+    layer.shared_experts.shared_workspace = SimpleNamespace(
+        gather_inputs=shared_gather, reduce_outputs=shared_reduce
+    )
     monkeypatch.setattr(kimi_k3, "reduce_scatter", scatter)
     monkeypatch.setattr(
         kimi_k3, "all_reduce", mock.Mock(side_effect=AssertionError("all-reduce"))
@@ -404,10 +433,32 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         quantizer.assert_not_called()
     if rows and with_norm:
         expected_events.append("norm")
-    expected_events = ["fork", *expected_events, "branch"]
-    if rows:
-        expected_events.append("shared")
-    expected_events.extend(["branch_done", "join"])
+    if shared_tp:
+        expected_events.insert(1 if nvfp4 and rows else 0, "join_gather")
+        before_bmm = expected_events.index("experts")
+        expected_events[before_bmm:before_bmm] = [
+            "join_branch",
+            "branch_after_main",
+            "branch",
+            "shared_reduce",
+            "branch_done",
+        ]
+        expected_events.insert(expected_events.index("experts") + 1, "join_branch")
+        expected_events = [
+            "fork",
+            "branch",
+            "shared_gather",
+            "record_gather",
+            "shared",
+            "branch_done",
+            *expected_events,
+            "join",
+        ]
+    else:
+        expected_events = ["fork", *expected_events, "branch"]
+        if rows:
+            expected_events.append("shared")
+        expected_events.extend(["branch_done", "join"])
     if rows:
         expected_events.append("up")
     assert events == expected_events
@@ -419,7 +470,10 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
         layer.gate.assert_not_called()
         topk.assert_not_called()
         layer.routed_expert_down_proj.assert_not_called()
-        layer.shared_experts.assert_not_called()
+        if shared_tp:
+            layer.shared_experts.assert_called_once_with(hidden, down_out=None)
+        else:
+            layer.shared_experts.assert_not_called()
 
 
 def test_attn_dp_all_idle_skips_collectives(monkeypatch) -> None:

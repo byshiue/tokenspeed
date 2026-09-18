@@ -95,7 +95,11 @@ def test_projection_mapping_and_validation(monkeypatch):
             ("nccl", "auto", "flashinfer"),
             ("", "invalid", "NVLINK", "flashinfer_quantized"),
         ),
-        (RS_ENV_NAME, ("nccl", "triton_peer"), ("", "auto", "invalid", "triton_rsag")),
+        (
+            RS_ENV_NAME,
+            ("nccl", "triton_peer", "trtllm_lamport"),
+            ("", "auto", "invalid", "triton_rsag"),
+        ),
     ):
         for value in valid:
             monkeypatch.setenv(name, value)
@@ -221,6 +225,15 @@ def test_peer_policy_and_disabled_initialization(monkeypatch):
     monkeypatch.setenv(RS_ENV_NAME, "nccl")
     workspace.initialize_reduce_scatter(parallel, [128], backend="nccl")
     assert workspace.peer_states == {}
+    assert workspace.lamport_states == {}
+    lamport = object()
+    workspace.lamport_states[128] = lamport
+    for rows in (0, 1, 64, 128, 129, 512):
+        assert workspace.lamport_state(128, rows) is (
+            lamport if 0 < rows <= 128 else None
+        )
+    assert workspace.lamport_state(256, 64) is None
+    workspace.lamport_states.clear()
     # Policy depends on padded subgroup capacity, not local valid rows.
     peer = object()
     workspace.peer_states[128] = peer
@@ -253,6 +266,8 @@ def test_peer_policy_and_disabled_initialization(monkeypatch):
     bad_dtype = ProjectionWorkspace(16, 256, torch.float16, torch.device("cpu"))
     with pytest.raises(ValueError, match="BF16"):
         bad_dtype.initialize_reduce_scatter(parallel, [128], backend="triton_peer")
+    with pytest.raises(ValueError, match="TP4 BF16"):
+        bad_dtype.initialize_reduce_scatter(parallel, [128], backend="trtllm_lamport")
     bad_width = ProjectionWorkspace(16, 256, torch.bfloat16, torch.device("cpu"))
     with pytest.raises(ValueError, match="positive"):
         bad_width.initialize_reduce_scatter(parallel, [0], backend="triton_peer")
