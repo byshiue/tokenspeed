@@ -236,6 +236,9 @@ class Envs:
     # Model download
     TOKENSPEED_USE_MODELSCOPE = EnvBool(False)
 
+    # Opt-in: requantizes Kimi-K3 attention FP8 weights to power-of-two scales.
+    TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND = EnvStr("auto")
+
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")

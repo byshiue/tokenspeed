@@ -24,6 +24,7 @@
 
 
 import logging
+import warnings
 
 import tokenspeed_kernel
 import torch
@@ -362,3 +363,30 @@ class Fp8LinearMethod(LinearMethodBase):
 
     def prepared_linear_plan(self, layer: torch.nn.Module) -> object | None:
         return getattr(layer, "_prepared_fp8_linear", None)
+
+
+class RequantizedDeepGemmFp8LinearMethod(Fp8LinearMethod):
+    """Explicitly lossy DeepGEMM preparation; execution uses the ordinary FP8 path.
+
+    Models opt in per projection after constructing the checkpoint loaders.
+    Preparation is repeated after a reload, never lazily inside forward/capture.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not self.block_quant or not self.quant_config.is_checkpoint_fp8_serialized:
+            raise ValueError(
+                "DeepGEMM requantization requires serialized block-FP8 weights"
+            )
+        warnings.warn(
+            "Opt-in DeepGEMM FP8 projection preparation changes weight and activation "
+            "quantization to power-of-two scales; model accuracy must be validated.",
+            UserWarning,
+            stacklevel=1,
+        )
+        layer._prepared_fp8_linear = (
+            tokenspeed_kernel.prepare_requantized_deep_gemm_fp8_linear(
+                layer.weight.data,
+                layer.weight_scale_inv.data,
+                self.quant_config.weight_block_size,
+            )
+        )

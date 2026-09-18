@@ -29,6 +29,8 @@ asserted structurally unchanged.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -96,6 +98,54 @@ def _load(module, ckpt) -> None:
     for name, (codes, scales) in ckpt.items():
         module.weight.weight_loader(module.weight, codes, name)
         module.weight_scale_inv.weight_loader(module.weight_scale_inv, scales, name)
+
+
+def test_deep_gemm_merged_preparation_and_dispatch(monkeypatch) -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    from tokenspeed.runtime.layers.dense.fp8 import RequantizedDeepGemmFp8LinearMethod
+    from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+    from tokenspeed.runtime.models.kimi_k3 import (
+        KimiLinearKDA,
+        _use_deep_gemm_fp8_projections,
+    )
+
+    monkeypatch.delenv("TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND", raising=False)
+    assert not _use_deep_gemm_fp8_projections()
+    monkeypatch.setenv("TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND", "typo")
+    with pytest.raises(ValueError, match="auto or deep_gemm"):
+        _use_deep_gemm_fp8_projections()
+    monkeypatch.setenv("TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND", "deep_gemm")
+    assert _use_deep_gemm_fp8_projections()
+    if not current_platform().is_blackwell_plus:
+        pytest.skip("DeepGEMM preparation requires Blackwell")
+    module = _build_fp8_merged(0)
+    _load(module, _make_ckpt_segments(torch.Generator().manual_seed(42)))
+    module.verify_fp8_load_complete()
+    method = RequantizedDeepGemmFp8LinearMethod(
+        Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            ignored_layers=None,
+            weight_block_size=[128, 128],
+            scale_fmt=None,
+        )
+    )
+    method.process_weights_after_loading(module)
+    assert method.prepared_linear_plan(module) is not None
+    x = torch.randn(32, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    output = method.apply(module, x, bias=None, block_scale=None, output_dtype=None)
+    reference = x.float() @ _dequant(module.weight, module.weight_scale_inv).T
+    assert (output.float() - reference).norm() / reference.norm() < 0.06
+    assert torch.count_nonzero(output[:, module.used_rows :]) == 0
+    module.quant_method = method
+    attention = SimpleNamespace(
+        local_num_heads=NUM_HEADS // TP_SIZE, head_dim=HEAD_DIM, qkvgb_proj=module
+    )
+    parts = KimiLinearKDA._project_qkvfab(attention, x, attnres_partial_args=None)
+    torch.testing.assert_close(
+        torch.cat(parts, dim=-1), output[:, : module.used_rows], rtol=0, atol=0
+    )
 
 
 def _dequant(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:

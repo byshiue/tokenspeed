@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_fp8_linear,
     prepare_nvfp4_a16_weights,
+    prepare_requantized_deep_gemm_fp8_linear,
     warmup_prepared_fp8_linears,
 )
 from tokenspeed_kernel.ops.layernorm import (
@@ -113,6 +114,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_requantized_deep_gemm_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
     # residual

@@ -107,6 +107,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_requantized_deep_gemm_fp8_linear",
     "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
 ]
@@ -290,6 +291,65 @@ def quantize_fp8_group32_for_linear(
         override="triton_quantize_fp8_group32_ue8m0",
         solution=None,
     )
+
+
+def prepare_requantized_deep_gemm_fp8_linear(
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor,
+    block_size: tuple[int, int] | list[int],
+) -> object:
+    """Requantize local FP8 weights in place and prepare a DeepGEMM plan.
+
+    This startup-only, explicitly lossy operation rewrites both FP8 codes and
+    canonical FP32 scales. Already power-of-two scales need no requantization.
+    Call after checkpoint assembly/sharding and before warmup or graph capture.
+
+    Args:
+        weight: Contiguous CUDA E4M3 weight matrix in [N, K] layout.
+        weight_scales: Positive finite FP32 scales, one per 128x128 block.
+        block_size: Must be (128, 128); partial blocks are not supported.
+
+    Returns:
+        An opaque plan for fp8_linear with matching online UE8M0 quantization.
+    """
+    from tokenspeed_kernel.ops.moe.deep_gemm.ue8m0 import (
+        is_ue8m0,
+        requantize_to_ue8m0_,
+    )
+
+    platform = current_platform()
+    if (
+        not platform.is_nvidia
+        or not platform.is_blackwell_plus
+        or ceil_to_ue8m0 is None
+        or transform_sf_into_required_layout is None
+        or KernelRegistry.get().get_by_name("deep_gemm_mm_fp8_blockscale") is None
+    ):
+        raise RuntimeError("Requantized DeepGEMM FP8 requires Blackwell and DeepGEMM")
+    if os.environ.get("TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0") == "1":
+        raise ValueError("DeepGEMM FP8 requantization requires UE8M0 to remain enabled")
+    if (
+        tuple(block_size) != (128, 128)
+        or weight.ndim != 2
+        or weight.dtype != torch.float8_e4m3fn
+        or not weight.is_cuda
+        or not weight.is_contiguous()
+        or any(dim == 0 or dim % 128 for dim in weight.shape)
+        or weight_scales.dtype != torch.float32
+        or weight_scales.device != weight.device
+        or weight_scales.shape != (weight.shape[0] // 128, weight.shape[1] // 128)
+    ):
+        raise ValueError(
+            "DeepGEMM FP8 requires aligned E4M3 weights and canonical 128x128 FP32 scales"
+        )
+    if not bool((torch.isfinite(weight_scales) & (weight_scales > 0)).all()):
+        raise ValueError("DeepGEMM FP8 weight scales must be positive and finite")
+    with torch.no_grad():
+        if not is_ue8m0(weight_scales):
+            requantize_to_ue8m0_(weight, weight_scales, (128, 128))
+        return prepare_fp8_linear(
+            weight, weight_scales, (128, 128), scale_format="ue8m0"
+        )
 
 
 def fp8_linear(

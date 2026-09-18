@@ -236,6 +236,23 @@ pip install flash-linear-attention
 Notes:
 
 - K3 uses the cache-group scheduler and KDA state groups.
+- On Blackwell, `TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND=deep_gemm` opts the
+  block-FP8 attention projections into DeepGEMM: KDA fused QKV/gates and output,
+  and MLA fused QKV-a/gate, Q-b, and output. Unset it (or use `auto`) to keep
+  the existing backend selection. Shared experts and routed experts are
+  unchanged; this switch does not change tensor-parallel mapping.
+- This option is **not numerically equivalent** to the default FP8 path.
+  At loading time, it rewrites local FP8 weights and their 128x128 scales
+  using power-of-two scales. Activations also use power-of-two scales at
+  runtime. Conversion happens after weight assembly/sharding and before
+  warmup or CUDA-graph capture; checkpoint files are not modified.
+  Allow temporary GPU memory for FP32 weight conversion during loading.
+  Validate model accuracy on your workload before deploying it. Faster
+  projection GEMMs alone do not establish an end-to-end speedup.
+- The opt-in requires a serialized block-FP8 attention checkpoint, aligned
+  local weight dimensions, Blackwell, and DeepGEMM. Unsupported combinations
+  fail instead of silently falling back. Do not combine it with
+  `TOKENSPEED_DISABLE_DEEP_GEMM_UE8M0=1`.
 - KDA dispatch is vendor-neutral at the runtime boundary. The kernel registry
   selects the existing FLA-derived NVIDIA implementation or the native AMD
   implementation, including each backend's preferred recurrent-state layout.

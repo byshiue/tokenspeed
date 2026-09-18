@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel import fp8_linear
 from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
@@ -107,6 +108,10 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
+from tokenspeed.runtime.layers.dense.fp8 import (
+    Fp8LinearMethod,
+    RequantizedDeepGemmFp8LinearMethod,
+)
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
 )
@@ -139,6 +144,7 @@ from tokenspeed.runtime.layers.moe.utils import (
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
     preprocess_fp8_pb_wo_weights,
 )
@@ -172,7 +178,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 from tokenspeed.runtime.utils import add_prefix, ceil_div, make_layers
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
@@ -181,6 +187,27 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+def _use_deep_gemm_fp8_projections() -> bool:
+    backend = envs.TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND.get()
+    if backend not in {"auto", "deep_gemm"}:
+        raise ValueError(
+            "TOKENSPEED_KIMI_K3_FP8_GEMM_BACKEND must be auto or deep_gemm"
+        )
+    return backend == "deep_gemm"
+
+
+def _enable_deep_gemm_fp8_projection(layer: nn.Module) -> None:
+    method = layer.quant_method
+    if not isinstance(method, Fp8LinearMethod) or tuple(
+        method.quant_config.weight_block_size or ()
+    ) != (128, 128):
+        raise ValueError(
+            "Kimi-K3 DeepGEMM projections require FP8 128x128 checkpoint weights"
+        )
+    layer.quant_method = RequantizedDeepGemmFp8LinearMethod(method.quant_config)
+
 
 # ===----------------------------------------------------------------------=== #
 # Multimodal vision path
@@ -407,6 +434,18 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 quant_config=quant_config,
                 prefix=fused_prefix,
             )
+
+        if _use_deep_gemm_fp8_projections():
+            if q_lora_rank is None:
+                raise ValueError(
+                    "Kimi-K3 DeepGEMM projections require the q-lora MLA path"
+                )
+            for projection in (
+                self.fused_qkv_a_proj_with_mqa,
+                self.q_b_proj,
+                self.o_proj,
+            ):
+                _enable_deep_gemm_fp8_projection(projection)
 
     def _split_fused_qkv_a(
         self, qkv_gate: torch.Tensor
@@ -1168,6 +1207,20 @@ class KimiLinearKDA(nn.Module):
             prefix=add_prefix("o_proj", prefix),
         )
 
+        if _use_deep_gemm_fp8_projections():
+            if not merged_fp8:
+                raise ValueError("Kimi-K3 DeepGEMM QKV requires a block-FP8 checkpoint")
+            self.qkvgb_proj.quant_method = RequantizedDeepGemmFp8LinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="dynamic",
+                    ignored_layers=None,
+                    weight_block_size=[128, 128],
+                    scale_fmt=None,
+                )
+            )
+            _enable_deep_gemm_fp8_projection(self.o_proj)
+
     def fuse_conv_weights(self) -> None:
         """Concatenate the loaded q/k/v conv kernels into ``self.conv_weights``."""
         self.conv_weights = torch.cat(
@@ -1181,7 +1234,22 @@ class KimiLinearKDA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project every KDA hidden-state consumer."""
         proj_local = self.local_num_heads * self.head_dim
-        if attnres_partial_args is None:
+        if isinstance(
+            getattr(self.qkvgb_proj, "quant_method", None),
+            RequantizedDeepGemmFp8LinearMethod,
+        ):
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            output = fp8_linear(
+                self.qkvgb_proj._prepared_fp8_linear,
+                hidden_states,
+                self.qkvgb_proj.weight,
+                self.qkvgb_proj.weight_scale_inv,
+                input_scales=None,
+                bias=None,
+                out_dtype=hidden_states.dtype,
+            )
+        elif attnres_partial_args is None:
             output = kimi3_qkvfab_projection(
                 hidden_states,
                 self.qkvgb_proj.weight,
@@ -3373,6 +3441,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 merged = self_attn.qkvgb_proj
                 if getattr(merged, "fp8_block_quant", False):
                     merged.verify_fp8_load_complete()
+                    if isinstance(
+                        getattr(merged, "quant_method", None),
+                        RequantizedDeepGemmFp8LinearMethod,
+                    ):
+                        # The loader prepares this plan with the other FP8
+                        # linears after assembly. Do not cache stale FI scales.
+                        continue
                     # Prepack the block scales for the flashinfer w8a8 GEMM
                     # (the same preparation Fp8LinearMethod does for
                     # LinearBase layers); rows are 128-padded at construction
