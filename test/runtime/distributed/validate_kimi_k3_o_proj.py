@@ -55,6 +55,8 @@ def validate_backend_transitions(exchange, linear, baseline, k, world):
     """Replay mixed backend boundaries with delayed peers and retained outputs."""
     rank = dist.get_rank()
     patterns = [
+        [128] * world,
+        [129] * world,
         [512] * world,
         [513] * world,
         [8192] * world,
@@ -173,6 +175,8 @@ def main():
             [32] * world,
             [64] * world,
             [65] * world,
+            [128] * world,
+            [129] * world,
             [257] * world,
             [7 if r == 0 else 0 for r in range(world)],
             [r % 4 for r in range(world)],
@@ -198,7 +202,13 @@ def main():
                 )
                 is not None
             )
-            custom_reduction = using_peer
+            using_lamport = (
+                exchange.workspace.lamport_state(
+                    n, max(counts[r] for r in exchange.parallel.tp_group)
+                )
+                is not None
+            )
+            custom_reduction = using_peer or using_lamport
             reduction_errors = torch.zeros(2, device="cuda", dtype=torch.float32)
             if custom_reduction and fused_a2a:
                 # Same quantized GEMM partials: isolate reduction rounding from
@@ -291,7 +301,11 @@ def main():
                     if custom_reduction and fused_a2a
                     else None
                 ),
-                "rs_backend": ("triton_peer" if using_peer else "nccl"),
+                "rs_backend": (
+                    "trtllm_lamport"
+                    if using_lamport
+                    else "triton_peer" if using_peer else "nccl"
+                ),
                 "a2a_backend": (
                     "flashinfer"
                     if exchange.workspace.use_flashinfer(exchange.parallel, counts, k)

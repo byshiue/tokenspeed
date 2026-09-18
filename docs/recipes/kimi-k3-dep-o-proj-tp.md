@@ -108,7 +108,29 @@ export TOKENSPEED_O_PROJ_RS_BACKEND=nccl
 
 The FlashInfer path exchanges BF16 values and quantizes separately before FP8
 GEMM. Supported A2A choices are `nccl`, `auto`, and `flashinfer`; reduction
-choices are `nccl` and `triton_peer`.
+choices are `nccl`, `triton_peer`, and experimental `trtllm_lamport`.
+
+To evaluate native TRT-LLM one-shot Lamport reduce-scatter while retaining FI
+A2A, set `TOKENSPEED_O_PROJ_RS_BACKEND=trtllm_lamport`. This opt-in requires
+TP4, BF16 partials and working CUDA IPC/native TRT-LLM communication objects.
+It supports up to 128 physical rows/rank, including padding; larger batches
+use NCCL reduction. A2A selection is unchanged. Initialization errors are
+fatal, not rank-local fallbacks. The default remains `triton_peer`.
+
+Lamport uses local GEMM output plus a separately published IPC ring. Its
+native protocol handles publication and ring reuse, replacing the explicit
+symmetric-memory barrier and peer-read reduction. It does not add residual
+or normalization math. IPC scratch is shared across sequential layers of
+the same output width and allocated before cache sizing and graph capture.
+At width 7168 and capacity 128 it reserves about 114 MiB/GPU of IPC scratch,
+plus 7 MiB of local GEMM partials. Calls must stay on one serialized stream,
+and collective close must occur only after all referencing graphs are gone.
+The 128-row bound limits memory use; it is not a measured crossover point.
+
+Run the standalone validator above with the same RS environment override and
+`--large-tokens` to exercise the 128/129-row Lamport/NCCL transition as well as
+the A2A boundaries. Projection microbenchmarks alone do not establish a
+full-model speedup.
 
 At output width 7168, the TP4 symmetric partial buffer reserves
 `4 * min(workspace_capacity, 8192) * 7168 * 2` bytes per GPU: up to **448 MiB**,
@@ -159,6 +181,12 @@ When using NCCL A2A with symmetric reduction, an explicit pre-write barrier
 protects transitions from the FI path before GEMM touches symmetric storage;
 the reduction also retains its trailing reuse fence. NCCL A2A alone is not a
 symmetric-buffer reuse fence.
+The peer reduction preserves the 16-byte alignment of symmetric allocation
+bases through its indirect pointer loads, allowing vectorized BF16 reads.
+Owner offsets and masked tails still determine the safe access width;
+unaligned slices are supported. Accumulation remains FP32 in peer-rank order,
+with the final result stored as BF16. This changes neither synchronization
+nor buffer ownership.
 Never replace or close buffers while captured graphs still reference them;
 explicit close is collective. Returned outputs own their storage and survive
 later workspace reuse. Initialization failures propagate for explicitly
@@ -234,3 +262,36 @@ token counts, outputs and source/dependency versions.
 
 Record measured results and limitations in the job's local runbook. This guide
 does not claim that full-model validation or a speedup has already passed.
+
+## Shared-expert TP4 experiment
+
+Shared-expert sharding is independent of attention output projection. To compare
+it against unchanged DEP16, keep attention projections unsharded in both runs:
+
+```bash
+export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=1
+# Baseline: 1; shared-expert TP4: 4.
+export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4
+```
+
+Use attention TP1/DP16, routed MoE TP1/EP16, PP1. The shared MLP stays on the
+existing auxiliary-stream path. Shared AllGather overlaps local routing;
+dispatch waits for a gather-only event, not the following shared GEMMs.
+Shared GEMMs may overlap dispatch. Routed BMM waits for shared GEMMs;
+auxiliary ReduceScatter waits for dispatch, then overlaps routed BMM. Combine
+waits for ReduceScatter. This prevents peer-polling shared and routed
+collectives from starving each other of SM resources, without overlapping
+the two GEMM paths. Gate/up and down weights are sharded directly;
+AllGather and ReduceScatter restore token ownership without an intermediate
+AllToAll. Up to 128 padded tokens per rank use TRT-LLM one-shot collectives;
+larger shapes use NCCL. See [the design](../design/shared-expert-tp.md).
+
+Run `test/runtime/distributed/validate_kimi_k3_shared_expert_tp.py` with 16
+distributed workers and explicit `--model MODEL_DIR --layer 1` before measuring
+the full model. It checks real BF16 shared-expert weights from the NVFP4
+checkpoint, uneven/empty peers, auxiliary-stream CUDA graphs and the fallback
+boundary. It does not validate full-model generation.
+
+C64 per rank means 1,024 active requests across DEP16. First verify cache
+admission at that capacity. A failed capacity check is not an E2E measurement;
+neither a shared-MLP microbenchmark nor fewer active requests substitutes for it.
