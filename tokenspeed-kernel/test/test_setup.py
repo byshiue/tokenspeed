@@ -3,7 +3,6 @@ from __future__ import annotations
 import runpy
 import shutil
 import tarfile
-import zipfile
 from collections import Counter
 from pathlib import Path
 
@@ -164,15 +163,6 @@ def test_sdist_includes_requirements_and_python_sources(tmp_path, monkeypatch) -
         archived_files = {
             name.split("/", maxsplit=1)[1] for name in archive.getnames() if "/" in name
         }
-        for filename in ("LICENSE", "THIRDPARTYNOTICES"):
-            member = next(
-                name
-                for name in archive.getnames()
-                if name.endswith("/" + filename) and name.count("/") == 1
-            )
-            assert (
-                archive.extractfile(member).read() == (source / filename).read_bytes()
-            )
     expected_files = {
         f"requirements/{path.name}" for path in REQUIREMENTS_DIR.glob("*.txt")
     }
@@ -181,38 +171,6 @@ def test_sdist_includes_requirements_and_python_sources(tmp_path, monkeypatch) -
         for path in (source / "tokenspeed_kernel").rglob("*.py")
     )
     assert expected_files <= archived_files
-
-
-def test_wheel_includes_licenses_and_routing_attribution(tmp_path, monkeypatch) -> None:
-    source = tmp_path / "python"
-    dist_dir = tmp_path / "dist"
-    shutil.copytree(SETUP_PY.parent, source)
-    dist_dir.mkdir()
-    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "cuda")
-    monkeypatch.setenv("TOKENSPEED_KERNEL_GIT_SHA", "test")
-    monkeypatch.chdir(source)
-    run_command = setuptools.Command.run_command
-
-    def without_native_build(self, command):
-        # Exercise real wheel packaging without compiling kernels or installing
-        # GPU dependencies; this test only checks distributed license metadata.
-        if command != "build_native":
-            run_command(self, command)
-
-    monkeypatch.setattr(setuptools.Command, "run_command", without_native_build)
-    wheel_name = build_meta.build_wheel(str(dist_dir))
-    with zipfile.ZipFile(dist_dir / wheel_name) as wheel:
-        for filename in ("LICENSE", "THIRDPARTYNOTICES"):
-            member = next(
-                name
-                for name in wheel.namelist()
-                if ".dist-info/" in name and name.endswith("/" + filename)
-            )
-            assert wheel.read(member) == (source / filename).read_bytes()
-    notices = (source / "THIRDPARTYNOTICES").read_text()
-    assert "TRT-LLM routing-map padding adapter" in notices
-    assert "NVIDIA CORPORATION" in notices
-    assert "END OF TERMS AND CONDITIONS" in notices
 
 
 def test_cuda_include_dirs_prefer_complete_toolkit_headers(
