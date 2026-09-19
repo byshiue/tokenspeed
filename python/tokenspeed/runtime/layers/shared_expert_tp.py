@@ -21,18 +21,18 @@
 """Shared-expert intermediate-channel sharding with local token ownership."""
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.ops.communication.trtllm_shared import (
     SharedExpertGatherState,
+    SharedExpertReduceState,
     trtllm_shared_expert_allgather,
+    trtllm_shared_expert_reduce_scatter,
 )
 
-from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single, reduce_scatter
+from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
-)
-from tokenspeed.runtime.layers.attention.o_proj import (
-    ProjectionWorkspace,
-    projection_mapping,
 )
 
 
@@ -54,7 +54,43 @@ def shared_expert_mapping(mapping, value):
         raise ValueError(
             "Shared-expert TP4 requires attention TP1/DPworld, MoE TP1/EPworld, PP1"
         )
-    return projection_mapping(mapping.rank, mapping.world_size, 4)
+    return DenseLayerMapping(
+        rank=mapping.rank,
+        world_size=mapping.world_size,
+        tp_size=4,
+        dp_size=mapping.world_size // 4,
+    )
+
+
+def validate_shared_expert_settings(mapping, value):
+    """Agree on raw settings world-wide before parsing or creating subgroups.
+
+    Disabled and malformed settings must participate too: a rank-local return
+    could otherwise leave enabled peers blocked in communicator construction.
+    Returns the shared-expert mapping, or None when every rank disables TP.
+    """
+    if dist.is_initialized() and mapping.world_size > 1:
+        pg_manager.init_process_group(mapping.world_group, backend="gloo")
+        values = [None] * mapping.world_size
+        dist.all_gather_object(
+            values,
+            value,
+            group=pg_manager.get_process_group("gloo", mapping.world_group),
+        )
+        if len(set(values)) != 1:
+            raise ValueError(f"Shared-expert TP settings differ across ranks: {values}")
+    return shared_expert_mapping(mapping, value)
+
+
+def initialize_shared_expert_group(parallel):
+    """Initialize and warm shared AllGather/ReduceScatter before graph capture."""
+    pg_manager.init_process_group(parallel.tp_group, backend=None)
+    probe = torch.zeros((1, 1), dtype=torch.bfloat16, device="cuda")
+    received = torch.empty(
+        (parallel.tp_size, 1), dtype=probe.dtype, device=probe.device
+    )
+    all_gather_single(received, probe, parallel.tp_group, backend=None)
+    reduce_scatter(received, parallel.tp_group, backend=None)
 
 
 class SharedExpertWorkspace:
@@ -74,10 +110,12 @@ class SharedExpertWorkspace:
         self.gather = SharedExpertGatherState(
             group, min(capacity, 128), hidden, device, True
         )
-        self.reduction = ProjectionWorkspace(capacity, hidden, torch.bfloat16, device)
-        self.reduction.initialize_reduce_scatter(
-            parallel, [hidden], backend="trtllm_lamport"
+        self.reduction = SharedExpertReduceState(
+            group, min(capacity, 128), hidden, device
         )
+        probe = self.reduction.input_buffer(1)
+        probe.zero_()
+        trtllm_shared_expert_reduce_scatter(self.reduction, probe, 1)
 
     def forward(self, inputs, counts, compute):
         """Gather padded tokens, compute sharded MLP, reduce to owned rows.
@@ -143,7 +181,10 @@ class SharedExpertWorkspace:
             raise ValueError("Shared-expert partials must match padded subgroup rows")
         if rows == 0:
             return partial.new_empty((0, self.hidden))
-        owned = self.reduction.reduce_scatter(partial, self.parallel, rows)
+        if rows <= 128:
+            owned = trtllm_shared_expert_reduce_scatter(self.reduction, partial, rows)
+        else:
+            owned = reduce_scatter(partial, self.parallel.tp_group, backend=None)
         return owned[:local_rows]
 
     def close(self):

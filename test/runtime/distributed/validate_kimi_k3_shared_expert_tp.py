@@ -24,7 +24,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from test.runtime.distributed.kimi_k3_o_proj_helpers import dep_mapping
+from test.runtime.distributed.shared_expert_helpers import dep_mapping
 
 import torch
 import torch.distributed as dist
@@ -33,9 +33,9 @@ from safetensors import safe_open
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.attention.o_proj import initialize_projection_group
 from tokenspeed.runtime.layers.shared_expert_tp import (
     SharedExpertWorkspace,
+    initialize_shared_expert_group,
     shared_expert_mapping,
 )
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLP
@@ -99,7 +99,7 @@ def main():
         mlps.append(mlp)
     baseline, candidate = mlps
     parallel = candidate.shared_parallel
-    initialize_projection_group(parallel)
+    initialize_shared_expert_group(parallel)
     candidate.shared_workspace = SharedExpertWorkspace(
         parallel, 129, 7168, torch.device("cuda")
     )

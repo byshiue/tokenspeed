@@ -259,12 +259,9 @@ class Envs:
     TOKENSPEED_NVTX = EnvBool(False)
     TOKENSPEED_DP_SAMPLING_BACKEND = EnvStr(None)
 
-    # Output-projection parallelism. Keep raw strings so every rank can agree
+    # Shared-expert parallelism. Keep raw strings so every rank can agree
     # before strict validation; EnvInt would silently default malformed input.
-    TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvStr("1")
     TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvStr("1")
-    TOKENSPEED_O_PROJ_A2A_BACKEND = EnvStr("flashinfer")
-    TOKENSPEED_O_PROJ_RS_BACKEND = EnvStr("triton_peer")
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
