@@ -302,14 +302,6 @@ class KimiLinearMLP(nn.Module):
         )
         self.is_shared_expert = is_shared_expert
 
-    def forward_shared_tp(self, x: torch.Tensor, counts: list[int]) -> torch.Tensor:
-        """Run the same sharded MLP for eager/prefill/graph batches, including idle peers."""
-        if self.shared_workspace is None:
-            raise RuntimeError(
-                "Shared-expert communication must be prepared before forward"
-            )
-        return self.shared_workspace.forward(x, counts, self)
-
     def forward(
         self, x: torch.Tensor, down_out: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -2035,7 +2027,6 @@ class KimiLinearMoE(nn.Module):
             return prefix_sum
 
         shared_workspace = None
-        shared_input = hidden_states
         if self.shared_experts.shared_parallel is not None:
             shared_workspace = self.shared_experts.shared_workspace
             if shared_workspace is None:

@@ -54,7 +54,6 @@ def test_empty_owner_participates_but_empty_group_skips():
     workspace.send = torch.empty(8, 2, dtype=torch.bfloat16)
     workspace.gather = object()
     workspace.reduction = object()
-    compute = mock.Mock(side_effect=lambda x, down_out: x)
     with mock.patch(
         "tokenspeed.runtime.layers.shared_expert_tp.trtllm_shared_expert_allgather",
         return_value=torch.zeros(8, 2, dtype=torch.bfloat16),
@@ -62,14 +61,18 @@ def test_empty_owner_participates_but_empty_group_skips():
         "tokenspeed.runtime.layers.shared_expert_tp.trtllm_shared_expert_reduce_scatter",
         return_value=torch.ones(2, 2, dtype=torch.bfloat16),
     ) as reduction:
-        output = workspace.forward(
-            torch.empty(0, 2, dtype=torch.bfloat16), [0, 2, 1, 0] + [0] * 4, compute
+        gathered = workspace.gather_inputs(
+            torch.empty(0, 2, dtype=torch.bfloat16), [0, 2, 1, 0] + [0] * 4
         )
+        output = workspace.reduce_outputs(gathered, 0)
         assert output.shape == (0, 2)
         gather.assert_called_once()
         reduction.assert_called_once()
         assert torch.count_nonzero(workspace.send[:2]) == 0
-        workspace.forward(torch.empty(0, 2, dtype=torch.bfloat16), [0] * 8, compute)
+        gathered = workspace.gather_inputs(
+            torch.empty(0, 2, dtype=torch.bfloat16), [0] * 8
+        )
+        assert workspace.reduce_outputs(gathered, 0).shape == (0, 2)
         assert gather.call_count == 1
         assert reduction.call_count == 1
 
@@ -136,15 +139,16 @@ def test_uneven_subgroups_restore_token_owners(tp_size):
             start = parallel.tp_rank * rows
             return packed[start : start + rows].clone() * sum(range(1, tp_size + 1))
 
-        compute = mock.Mock(side_effect=lambda x, down_out: x * (parallel.tp_rank + 1))
         with mock.patch(
             f"{module}.all_gather_single", side_effect=gather
         ) as ag, mock.patch(f"{module}.reduce_scatter", side_effect=reduce) as rs:
-            output = workspace.forward(inputs[rank], counts, compute)
+            gathered = workspace.gather_inputs(inputs[rank], counts)
+            partial = gathered * (parallel.tp_rank + 1)
+            output = workspace.reduce_outputs(partial, counts[rank])
             torch.testing.assert_close(
                 output, inputs[rank] * sum(range(1, tp_size + 1))
             )
-            assert ag.call_count == rs.call_count == compute.call_count == int(rows > 0)
+            assert ag.call_count == rs.call_count == int(rows > 0)
             workspace.received.zero_()
             torch.testing.assert_close(
                 output, inputs[rank] * sum(range(1, tp_size + 1))
