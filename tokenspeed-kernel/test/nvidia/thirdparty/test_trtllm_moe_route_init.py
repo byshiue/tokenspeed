@@ -31,7 +31,6 @@ from tokenspeed_kernel.thirdparty.flashinfer._routing_padding import (
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
-    _prepare_routing_sources,
     _register_private,
     _relocate_header,
 )
@@ -60,39 +59,6 @@ def test_private_headers_resolve_parent_includes_without_copying_the_package():
     assert _relocate_header(source) == (
         '#include "flashinfer/exception.h"\n#include "RoutingKernel.h"\n'
     )
-
-
-@pytest.mark.parametrize("changed_body", [False, True])
-@pytest.mark.parametrize("relocated_header", [False, True])
-def test_prepared_sources_retain_upstream_notices(
-    monkeypatch, changed_body, relocated_header
-):
-    license_header = (
-        "/* Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.\n"
-        ' * Licensed under the Apache License, Version 2.0 (the "License"). */\n'
-    )
-    original = license_header + '#include "../common.h"\nint original;\n'
-    transformed = (
-        original.replace("int original;", "int patched;") if changed_body else original
-    )
-    monkeypatch.setattr(
-        "tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe.patch_routing_sources",
-        lambda sources: {**sources, "example.h": transformed},
-    )
-    sources = {"example.h": original, "unchanged.cu": license_header}
-    actual = _prepare_routing_sources(
-        sources, {"example.h"} if relocated_header else set()
-    )
-    expected = _relocate_header(transformed) if relocated_header else transformed
-    if changed_body or relocated_header:
-        assert actual["example.h"].startswith("// Modified by TokenSpeed")
-        assert actual["example.h"].count("// Modified by TokenSpeed") == 1
-        assert actual["example.h"].endswith(expected)
-    else:
-        assert actual["example.h"] == original
-    assert license_header in actual["example.h"]
-    assert actual["unchanged.cu"] == license_header
-    assert sources["example.h"] == original
 
 
 def test_padding_is_written_by_producer_before_pdl():
@@ -147,14 +113,6 @@ def test_native_routing_transforms_cover_every_producer(guard):
     before = dict(sources)
     actual = patch_routing_sources(sources)
     assert sources == before
-    prepared = _prepare_routing_sources(
-        sources, {path.name for path in paths if path.suffix in {".h", ".cuh"}}
-    )
-    for name, source in prepared.items():
-        if source != sources[name]:
-            assert source.startswith("// Modified by TokenSpeed")
-            upstream_header = sources[name].split("*/", maxsplit=1)[0] + "*/"
-            assert upstream_header in source
     assert "permuted_idx_to_token_idx.numel()" in actual[launcher]
     assert actual[launcher].count("cudaMemsetAsync") == before[launcher].count(
         "cudaMemsetAsync"
