@@ -48,8 +48,10 @@ to bypass capacity failures.
 The forward chain is AllGather, gate/up, activation, down, ReduceScatter.
 TRT-LLM one-shot collectives cover up to 128 padded rows/rank, with NCCL above
 that limit. Persistent scratch is initialized before graph capture. Empty
-owners still participate when their subgroup is active. See
-[the design contract](../design/shared-expert-tp.md) for stream ordering.
+owners still participate when their subgroup is active. AllGather completes
+before routed dispatch; shared GEMMs finish before routed BMM. Shared
+ReduceScatter runs after dispatch and completes before combine, so shared
+collectives never overlap routed dispatch/combine.
 
 Run the CPU contract and orchestration tests:
 
