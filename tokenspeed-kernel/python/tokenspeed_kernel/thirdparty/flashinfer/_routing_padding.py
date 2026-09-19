@@ -22,6 +22,12 @@
 
 The private JIT module recompiles the routing producers with their headers.
 Installed FlashInfer sources and its other modules are never modified.
+
+The native source patterns come from FlashInfer's NVIDIA TRT-LLM routing code
+(https://github.com/flashinfer-ai/flashinfer), licensed under Apache-2.0. See
+the FlashInfer entry in the distributed THIRDPARTYNOTICES for source paths,
+upstream copyrights and license terms. The MIT header above covers TokenSpeed's
+original adapter and padding helpers, not the upstream code being transformed.
 """
 
 import re

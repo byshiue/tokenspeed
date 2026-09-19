@@ -54,6 +54,26 @@ def _relocate_header(source: str) -> str:
     )
 
 
+def _prepare_routing_sources(
+    sources: dict[str, str], headers: set[str]
+) -> dict[str, str]:
+    patched = patch_routing_sources(sources)
+    for name, source in patched.items():
+        if name in headers:
+            source = _relocate_header(source)
+        if source != sources[name]:
+            # Also mark headers changed only by include relocation. Retain the
+            # complete upstream copyright/license header after this notice.
+            source = (
+                "// Modified by TokenSpeed (LightSeek Foundation) for its routing-map\n"
+                "// padding adapter: padding initialization and/or private-JIT include relocation.\n"
+                "// Original copyright and license notices are retained below.\n"
+                + source
+            )
+        patched[name] = source
+    return patched
+
+
 def _routing_initialized_spec(*args, **kwargs):
     from filelock import FileLock
     from flashinfer.jit import env as jit_env
@@ -66,9 +86,7 @@ def _routing_initialized_spec(*args, **kwargs):
     # must resolve to our private RoutingKernel/runner rather than installed ones.
     headers = {path.name: path for path in header_root.iterdir() if path.is_file()}
     inputs = {key: path.read_text() for key, path in (native_sources | headers).items()}
-    patched = patch_routing_sources(inputs)
-    for key in headers:
-        patched[key] = _relocate_header(patched[key])
+    patched = _prepare_routing_sources(inputs, set(headers))
     digest = hashlib.sha256()
     for key, source in sorted(patched.items()):
         digest.update(key.encode() + b"\0" + source.encode() + b"\0")
