@@ -53,7 +53,7 @@ shared reduction with routed BMM.
 
 One workspace is
 prepared by the model before memory profiling and graph capture, shared by
-sequential shared-expert layers. It is separate from attention-projection
+sequential shared-expert layers. It is separate from other main-stream
 scratch: concurrent main/auxiliary users must never alias IPC buffers.
 The same count-driven path handles eager, prefill and captured decode.
 
@@ -78,6 +78,6 @@ routed BMM, and reduction between dispatch and combine, including empty
 owners and eager/warmup/capture execution. The distributed validator exercises
 the same event generations and auxiliary reduction during repeated replay.
 Down-GEMM sharding changes BF16 rounding, so numerical tolerance is explicit.
-Projection microbenchmark gains do not establish full-model speedup: measure
+Shared-MLP microbenchmark gains do not establish full-model speedup: measure
 decode with real routed experts on the concurrent main stream and verify the
 requested number of active requests is actually admitted.
