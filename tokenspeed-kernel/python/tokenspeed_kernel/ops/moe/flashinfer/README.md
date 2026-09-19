@@ -41,16 +41,3 @@ partitions, PDL on/off, changing routing within one captured shape, graph replay
 after workspace corruption, and output equality with the upstream operator.
 Expert-partition tests retain the loader's global activation input scales while
 sharding expert weights, and select SiTU through FlashInfer's activation enum.
-
-## Source attribution and licenses
-
-The routing kernels come from FlashInfer's NVIDIA TRT-LLM implementation under
-Apache-2.0. TokenSpeed's original Python adapter and inline padding helpers use
-MIT. The adapter preserves upstream copyright and license headers and marks
-every modified native file, including headers changed only by include relocation.
-
-The package's `THIRDPARTYNOTICES` lists the upstream source paths and NVIDIA
-copyrights and includes the Apache-2.0 terms. Both source distributions and
-wheels include that file and the package's MIT `LICENSE`. Redistributing JIT
-sources or binaries separately requires carrying the applicable notices and
-license texts with those artifacts.
