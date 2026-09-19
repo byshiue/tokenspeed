@@ -24,45 +24,113 @@ import functools
 import inspect
 
 import pytest
+from tokenspeed_kernel.thirdparty.flashinfer._routing_padding import (
+    _patch_producer,
+    patch_routing_sources,
+)
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
-    _initialize_routing_map,
     _register_private,
+    _relocate_header,
 )
 
-_ALLOCATION = """
-  void prepare_routing_common() {
-    expanded_idx_to_permuted_idx = alloc_tensor({num_tokens * top_k}, dl_int32, device);
-    permuted_idx_to_token_idx =
-        alloc_tensor({max_num_padded_tokens + 1}, dl_int32, hidden_states.device());
-    prepare_other_workspace();
+_PRODUCER = """
+  params.mPtrCtaIdxXyToMnLimit[ctaOffset[e] + cta] = min(mnLimit1, mnLimit2);
+  if (threadIdx.x == 0) {
+    int32_t permutedIdxSize;
+    if (params.mIsPow2) {
+      permutedIdxSize = mulLog2<int32_t>(numNonExitingCtas, params.mPaddingLog2);
+    } else {
+      permutedIdxSize = mulTileN<int32_t>(numNonExitingCtas, params.mTileTokensDim);
+    }
+    params.mPtrPermutedIdxSize[0] = permutedIdxSize;
+    params.mPtrNumNonExitingCtas[0] = numNonExitingCtas;
   }
+  params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;
+  cudaTriggerProgrammaticLaunchCompletion();
 """
 
 _CLONE_VALUE = object()
 
 
-@pytest.mark.parametrize("guard", [" + 1", ""])
-def test_initializer_uses_native_capacity_and_stream(guard):
-    source = _ALLOCATION.replace(" + 1", guard)
-    actual = _initialize_routing_map(source)
-    assert actual.count("cudaMemsetAsync(") == 1
-    assert "permuted_idx_to_token_idx.numel()" in actual
-    assert "get_stream(hidden_states.device())" in actual
-    assert "data_ptr(), 0xff," in actual
-    assert actual.index("cudaMemsetAsync(") > actual.index("alloc_tensor({max_num")
-    assert actual.index("cudaMemsetAsync(") < actual.index("prepare_other_workspace()")
-    # The original allocation, including upstream's optional guard, is retained.
-    assert source[: source.index("    prepare_other_workspace")] in actual
+def test_private_headers_resolve_parent_includes_without_copying_the_package():
+    source = '#include "../../exception.h"\n#include "RoutingKernel.h"\n'
+    assert _relocate_header(source) == (
+        '#include "flashinfer/exception.h"\n#include "RoutingKernel.h"\n'
+    )
+
+
+def test_padding_is_written_by_producer_before_pdl():
+    actual = _patch_producer(_PRODUCER, 1)
+    assert (
+        "initializeRouteTilePadding(params, min(mnLimit1, mnLimit2), mnLimit1)"
+        in actual
+    )
+    assert (
+        "  initializeRouteMapSlack(params, numNonExitingCtas);\n  if (threadIdx.x == 0)"
+        in actual
+    )
+    assert actual.index("initializeRouteMapSlack") < actual.index(
+        "cudaTriggerProgrammatic"
+    )
+    assert "params.mPtrPermutedIdxToTokenIdx[permutedIdx] = tokenIdx;" in actual
+    assert "cudaMemset" not in actual
 
 
 @pytest.mark.parametrize(
-    "source", ["", _ALLOCATION * 2, _ALLOCATION.replace("dl_int32", "dl_int64")]
+    "source",
+    ["", _PRODUCER * 2, _PRODUCER.replace("min(mnLimit1, mnLimit2)", "mnLimit1")],
 )
-def test_unrecognized_native_allocation_fails_closed(source):
-    with pytest.raises(RuntimeError, match="expected exactly one"):
-        _initialize_routing_map(source)
+def test_unrecognized_producer_fails_closed(source):
+    with pytest.raises(RuntimeError, match="Unsupported FlashInfer routing"):
+        _patch_producer(source, 1)
+
+
+def test_changed_publication_fails_closed():
+    with pytest.raises(RuntimeError, match="count publishers"):
+        _patch_producer(_PRODUCER.replace("mPtrPermutedIdxSize", "anotherSize"), 1)
+
+
+def test_missing_native_sources_fail_closed():
+    with pytest.raises(RuntimeError, match="missing"):
+        patch_routing_sources({})
+
+
+@pytest.mark.parametrize("guard", [" + 1", ""])
+def test_native_routing_transforms_cover_every_producer(guard):
+    env = pytest.importorskip("flashinfer.jit.env")
+    paths = list((env.FLASHINFER_INCLUDE_DIR / "flashinfer/trtllm/fused_moe").iterdir())
+    paths += list(env.FLASHINFER_CSRC_DIR.glob("trtllm_fused_moe_*.cu"))
+    paths += list(
+        (env.FLASHINFER_CSRC_DIR / "fused_moe/trtllm_backend").glob("*routing*.cu")
+    )
+    sources = {path.name: path.read_text() for path in paths if path.is_file()}
+    launcher = "trtllm_fused_moe_kernel_launcher.cu"
+    sources[launcher] = sources[launcher].replace(
+        "max_num_padded_tokens + 1", "max_num_padded_tokens" + guard
+    )
+    before = dict(sources)
+    actual = patch_routing_sources(sources)
+    assert sources == before
+    assert "permuted_idx_to_token_idx.numel()" in actual[launcher]
+    assert actual[launcher].count("cudaMemsetAsync") == before[launcher].count(
+        "cudaMemsetAsync"
+    )
+    for name, count in (
+        ("RoutingKernel.cuh", 3),
+        ("trtllm_fused_moe_routing_custom.cu", 2),
+        ("trtllm_fused_moe_routing_llama4.cu", 1),
+    ):
+        assert actual[name].count("initializeRouteTilePadding(params,") == count
+        assert actual[name].count("initializeRouteMapSlack(params,") == count
+    # No API change to Runner::run, and unrelated callers remain opted out.
+    assert "int32_t mRouteMapCapacity{0}" in actual["runner.h"]
+    assert "row < params.mRouteMapCapacity" in actual["RoutingKernel.cuh"]
+    with pytest.raises(RuntimeError, match="route-map allocation"):
+        patch_routing_sources({**sources, launcher: ""})
+    with pytest.raises(RuntimeError, match="map writers"):
+        patch_routing_sources({**sources, "new_routing.cu": _PRODUCER})
 
 
 def test_function_rebinding_does_not_mutate_upstream():
