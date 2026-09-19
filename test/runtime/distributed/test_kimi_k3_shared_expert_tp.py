@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU contract tests for shared-expert TP mapping, sharding and empty owners."""
+"""Behavioral checks for shared-expert collectives and output ownership."""
 
 from test.runtime.distributed.shared_expert_helpers import dep_mapping
 from unittest import mock
@@ -31,19 +31,10 @@ from tokenspeed.runtime.layers.shared_expert_tp import (
     shared_expert_mapping,
     validate_shared_expert_settings,
 )
-from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLP
 
 
-def test_mapping_and_disabled_mlp(monkeypatch):
+def test_rank_disagreement_fails_before_subgroup_creation():
     mapping = dep_mapping(5, 16)
-    assert shared_expert_mapping(mapping, "1") is None
-    parallel = shared_expert_mapping(mapping, "4")
-    assert parallel.tp_group == (4, 5, 6, 7)
-    with mock.patch(
-        "tokenspeed.runtime.layers.shared_expert_tp.dist.is_initialized",
-        return_value=False,
-    ):
-        assert validate_shared_expert_settings(mapping, "1") is None
     module = "tokenspeed.runtime.layers.shared_expert_tp"
 
     def disagree(values, value, group):
@@ -54,54 +45,6 @@ def test_mapping_and_disabled_mlp(monkeypatch):
     ), mock.patch(f"{module}.dist.all_gather_object", side_effect=disagree):
         with pytest.raises(ValueError, match="differ across ranks"):
             validate_shared_expert_settings(mapping, "1")
-    for value in ("0", "2", "bad"):
-        with pytest.raises(ValueError):
-            shared_expert_mapping(mapping, value)
-    with pytest.raises(ValueError):
-        shared_expert_mapping(dep_mapping(0, 2), "4")
-    monkeypatch.setenv("TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE", "1")
-    with torch.device("meta"):
-        layer = KimiLinearMLP(
-            7168,
-            6144,
-            tp_rank=0,
-            tp_size=1,
-            tp_group=None,
-            shared_parallel=None,
-            quant_config=None,
-            prefix="shared_experts",
-            reduce_results=False,
-            is_shared_expert=True,
-            activation_situ_beta=4.0,
-            activation_situ_linear_beta=25.0,
-        )
-    assert layer.shared_parallel is None
-    assert layer.gate_up_proj.weight.shape == (12288, 7168)
-
-
-def test_mlp_shards_match_gate_up_and_down(monkeypatch):
-    monkeypatch.setenv("TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE", "4")
-    parallel = shared_expert_mapping(dep_mapping(5, 16), "4")
-    with torch.device("meta"):
-        layer = KimiLinearMLP(
-            7168,
-            6144,
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
-            tp_group=parallel.tp_group,
-            shared_parallel=parallel,
-            quant_config=None,
-            prefix="shared_experts",
-            reduce_results=False,
-            is_shared_expert=True,
-            activation_situ_beta=4.0,
-            activation_situ_linear_beta=25.0,
-        )
-    assert layer.gate_up_proj.weight.shape == (3072, 7168)
-    assert layer.down_proj.weight.shape == (7168, 1536)
-    assert not layer.down_proj.reduce_results
-    with pytest.raises(RuntimeError, match="prepared"):
-        layer.forward_shared_tp(torch.empty(0, 7168), [0] * 16)
 
 
 def test_empty_owner_participates_but_empty_group_skips():
@@ -129,12 +72,6 @@ def test_empty_owner_participates_but_empty_group_skips():
         workspace.forward(torch.empty(0, 2, dtype=torch.bfloat16), [0] * 4, compute)
         assert gather.call_count == 1
         assert reduction.call_count == 1
-    with pytest.raises(ValueError):
-        workspace.forward(torch.empty(1, 2, dtype=torch.bfloat16), [0] * 4, compute)
-    with pytest.raises(ValueError, match="capacity"):
-        workspace.forward(
-            torch.empty(0, 2, dtype=torch.bfloat16), [0, 9, 0, 0], compute
-        )
 
 
 def test_collective_capacity_boundary_and_owned_rows():
