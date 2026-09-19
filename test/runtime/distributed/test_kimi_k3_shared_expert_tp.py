@@ -49,7 +49,7 @@ def test_rank_disagreement_fails_before_subgroup_creation():
 
 def test_empty_owner_participates_but_empty_group_skips():
     workspace = SharedExpertWorkspace.__new__(SharedExpertWorkspace)
-    workspace.parallel = shared_expert_mapping(dep_mapping(0, 4), "4")
+    workspace.parallel = shared_expert_mapping(dep_mapping(0, 8), "4")
     workspace.capacity, workspace.hidden = 8, 2
     workspace.send = torch.empty(8, 2, dtype=torch.bfloat16)
     workspace.gather = object()
@@ -63,20 +63,20 @@ def test_empty_owner_participates_but_empty_group_skips():
         return_value=torch.ones(2, 2, dtype=torch.bfloat16),
     ) as reduction:
         output = workspace.forward(
-            torch.empty(0, 2, dtype=torch.bfloat16), [0, 2, 1, 0], compute
+            torch.empty(0, 2, dtype=torch.bfloat16), [0, 2, 1, 0] + [0] * 4, compute
         )
         assert output.shape == (0, 2)
         gather.assert_called_once()
         reduction.assert_called_once()
         assert torch.count_nonzero(workspace.send[:2]) == 0
-        workspace.forward(torch.empty(0, 2, dtype=torch.bfloat16), [0] * 4, compute)
+        workspace.forward(torch.empty(0, 2, dtype=torch.bfloat16), [0] * 8, compute)
         assert gather.call_count == 1
         assert reduction.call_count == 1
 
 
 def test_collective_capacity_boundary_and_owned_rows():
     workspace = SharedExpertWorkspace.__new__(SharedExpertWorkspace)
-    workspace.parallel = shared_expert_mapping(dep_mapping(0, 4), "4")
+    workspace.parallel = shared_expert_mapping(dep_mapping(0, 8), "4")
     workspace.capacity, workspace.hidden = 129, 2
     workspace.gather, workspace.reduction = object(), object()
     workspace.received = torch.empty(4 * 129, 2, dtype=torch.bfloat16)
@@ -93,7 +93,7 @@ def test_collective_capacity_boundary_and_owned_rows():
     ) as nccl_rs:
         for rows in (128, 129):
             inputs = torch.ones(rows, 2, dtype=torch.bfloat16)
-            assert workspace.gather_inputs(inputs, [rows] * 4).shape == (4 * rows, 2)
+            assert workspace.gather_inputs(inputs, [rows] * 8).shape == (4 * rows, 2)
             partial = inputs.repeat(4, 1)
             output = workspace.reduce_outputs(partial, rows - 1)
             partial.zero_()
@@ -103,3 +103,50 @@ def test_collective_capacity_boundary_and_owned_rows():
         nccl_ag.assert_called_once()
         native_rs.assert_called_once()
         nccl_rs.assert_called_once()
+
+
+@pytest.mark.parametrize("tp_size", [2, 4, 8])
+def test_uneven_subgroups_restore_token_owners(tp_size):
+    """Exercise real packing/slicing with simulated NCCL and distinct rank data."""
+    world = 16
+    counts = [r % 3 if r < world - tp_size else 0 for r in range(world)]
+    inputs = [
+        torch.arange(n * 2, dtype=torch.bfloat16).reshape(n, 2) + r * 10
+        for r, n in enumerate(counts)
+    ]
+    module = "tokenspeed.runtime.layers.shared_expert_tp"
+    for rank in range(world):
+        parallel = shared_expert_mapping(dep_mapping(rank, world), str(tp_size))
+        workspace = SharedExpertWorkspace(parallel, 2, 2, torch.device("cpu"))
+        rows = max(counts[r] for r in parallel.tp_group)
+        packed = torch.zeros(tp_size, rows, 2, dtype=torch.bfloat16)
+        for owner, peer in enumerate(parallel.tp_group):
+            packed[owner, : counts[peer]] = inputs[peer]
+        packed = packed.reshape(tp_size * rows, 2)
+
+        def gather(out, send, group, backend):
+            assert group == parallel.tp_group
+            torch.testing.assert_close(send[: counts[rank]], inputs[rank])
+            assert torch.count_nonzero(send[counts[rank] :]) == 0
+            out.copy_(packed)
+
+        def reduce(partial, group, backend):
+            assert group == parallel.tp_group
+            torch.testing.assert_close(partial, packed * (parallel.tp_rank + 1))
+            start = parallel.tp_rank * rows
+            return packed[start : start + rows].clone() * sum(range(1, tp_size + 1))
+
+        compute = mock.Mock(side_effect=lambda x, down_out: x * (parallel.tp_rank + 1))
+        with mock.patch(
+            f"{module}.all_gather_single", side_effect=gather
+        ) as ag, mock.patch(f"{module}.reduce_scatter", side_effect=reduce) as rs:
+            output = workspace.forward(inputs[rank], counts, compute)
+            torch.testing.assert_close(
+                output, inputs[rank] * sum(range(1, tp_size + 1))
+            )
+            assert ag.call_count == rs.call_count == compute.call_count == int(rows > 0)
+            workspace.received.zero_()
+            torch.testing.assert_close(
+                output, inputs[rank] * sum(range(1, tp_size + 1))
+            )
+        workspace.close()

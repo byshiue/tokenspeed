@@ -47,9 +47,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layer", type=int, required=True)
+    parser.add_argument("--tp-size", type=int, required=True)
     args = parser.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-    assert world == 16
+    assert 1 < args.tp_size < world and world % args.tp_size == 0
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     torch.set_default_dtype(torch.bfloat16)
     mapping = dep_mapping(rank, world)
@@ -74,7 +75,7 @@ def main():
     assert all(w.dtype == torch.bfloat16 for w in weights)
     config = json.loads((args.model / "config.json").read_text())["text_config"]
     mlps = []
-    for size in ("1", "4"):
+    for size in ("1", str(args.tp_size)):
         parallel = shared_expert_mapping(mapping, size)
         with torch.device("cuda"):
             mlp = KimiLinearMLP(
@@ -103,7 +104,7 @@ def main():
     candidate.shared_workspace = SharedExpertWorkspace(
         parallel, 129, 7168, torch.device("cuda")
     )
-    shard = 6144 // 4
+    shard = weights[0].shape[0] // args.tp_size
     start = parallel.tp_rank * shard
     torch.testing.assert_close(
         candidate.gate_up_proj.weight,
@@ -124,11 +125,15 @@ def main():
     for rows in (0, 1, 32, 64, 128, 129):
         for pattern in ("balanced", "uneven", "empty_group"):
             counts = [
-                rows if pattern == "balanced" else (rows * (r % 4) // 3)
+                (
+                    rows
+                    if pattern == "balanced"
+                    else (rows * (r % args.tp_size) // (args.tp_size - 1))
+                )
                 for r in range(world)
             ]
             if pattern == "empty_group":
-                counts = [0 if r < 4 else rows for r in range(world)]
+                counts = [0 if r < args.tp_size else rows for r in range(world)]
             x = (
                 torch.randn(
                     counts[rank],
@@ -168,7 +173,7 @@ def main():
             for factor in (1.0, 0.0, -1.0, 0.5):
                 x.copy_(original * factor)
                 expected = baseline(x, down_out=None)
-                if rank % 4 == 0:
+                if rank % args.tp_size == 0:
                     torch.cuda._sleep(100000)
                 graph.replay()
                 err = (

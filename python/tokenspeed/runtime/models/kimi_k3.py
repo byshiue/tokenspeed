@@ -259,8 +259,10 @@ class KimiLinearMLP(nn.Module):
         self.shared_parallel = shared_parallel
         self.shared_workspace = None
         if self.shared_parallel is not None:
-            if intermediate_size % 4:
-                raise ValueError("Shared-expert intermediate channels must divide TP4")
+            if intermediate_size % self.shared_parallel.tp_size:
+                raise ValueError(
+                    "Shared-expert intermediate channels must be divisible by TP size"
+                )
             if (
                 not is_shared_expert
                 or reduce_results
@@ -3252,7 +3254,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
             workspace = shared_mlps[0].shared_workspace
             weight = shared_mlps[0].gate_up_proj.weight
             if weight.dtype != torch.bfloat16:
-                raise ValueError("Shared-expert TP4 currently requires BF16 weights")
+                raise ValueError("Shared-expert TP currently requires BF16 weights")
             if workspace is None:
                 workspace = SharedExpertWorkspace(
                     shared_mlps[0].shared_parallel,

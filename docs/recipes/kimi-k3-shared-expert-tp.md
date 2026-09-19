@@ -1,9 +1,14 @@
-# Kimi-K3 DEP16 with TP4 shared experts
+# Kimi-K3 DEP16 with sharded shared experts
 
 This recipe shards only the BF16 shared-expert MLP. Attention and caches remain
 TP1/DP16, and routed experts remain TP1/EP16. Use real checkpoint weights and
 the full model by default; reduced-depth performance tests are not full-model
 capacity or accuracy results.
+
+Set `TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE` to a positive divisor strictly
+smaller than world size. `1` disables sharding; DEP16 supports TP2, TP4 and TP8.
+The shared MLP intermediate width must also be divisible by the selected TP
+size. The command below uses TP4 as an example.
 
 ## Allocation and launch
 
@@ -46,8 +51,9 @@ to bypass capacity failures.
 ## Communication and validation
 
 The forward chain is AllGather, gate/up, activation, down, ReduceScatter.
-TRT-LLM one-shot collectives cover up to 128 padded rows/rank, with NCCL above
-that limit. Persistent scratch is initialized before graph capture. Empty
+For TP4 with hidden width 7168, TRT-LLM one-shot collectives cover up to 128
+padded rows/rank. Other TP sizes, hidden widths and larger batches use NCCL.
+Persistent scratch is initialized before graph capture. Empty
 owners still participate when their subgroup is active. AllGather completes
 before routed dispatch; shared GEMMs finish before routed BMM. Shared
 ReduceScatter runs after dispatch and completes before combine, so shared
@@ -62,8 +68,9 @@ python -m pytest -q test/runtime/distributed/test_kimi_k3_shared_expert_tp.py \
 ```
 
 Use `test/runtime/distributed/validate_kimi_k3_shared_expert_tp.py` under
-`torchrun` with 16 workers and explicit `--model MODEL_DIR --layer 1` for
-real-weight validation. It covers exact weight shards, uneven/empty owners,
+`torchrun` with 16 workers and explicit `--model MODEL_DIR --layer 1 --tp-size 4`
+for real-weight validation; repeat with `--tp-size 2` and `--tp-size 8`.
+It covers exact weight shards, uneven/empty owners,
 the 128/129-row backend boundary, and changing inputs during graph replay.
 
 For E2E comparison, use fixed per-rank request affinity, identical prompts and

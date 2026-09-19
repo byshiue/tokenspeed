@@ -115,10 +115,12 @@ The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch a
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
 
 Kimi-K3 can independently shard its BF16 shared-expert MLP with
-`TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4` (unset or `1` preserves existing
-behavior). AllGather and ReduceScatter restore local token ownership around
+`TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE` (unset or `1` preserves existing
+behavior). The size must divide world size and be strictly smaller than it;
+DEP16 supports TP2, TP4 and TP8, with matching intermediate-channel divisibility.
+AllGather and ReduceScatter restore local token ownership around
 the sharded MLP. Attention and caches remain TP1/DP16; routed MoE remains EP16.
-See the [shared-expert TP4 runbook](../recipes/kimi-k3-shared-expert-tp.md).
+See the [shared-expert TP runbook](../recipes/kimi-k3-shared-expert-tp.md).
 
 ### DeepEP all-to-all
 
