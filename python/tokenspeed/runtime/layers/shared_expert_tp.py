@@ -125,21 +125,6 @@ class SharedExpertWorkspace:
             probe.zero_()
             trtllm_shared_expert_reduce_scatter(self.reduction, probe, 1)
 
-    def forward(self, inputs, counts, compute):
-        """Gather padded tokens, compute sharded MLP, reduce to owned rows.
-
-        inputs is local BF16 [tokens,H]; counts is the agreed physical world
-        row list; compute maps gathered inputs to BF16 full-hidden partials.
-        The returned local rows own their output storage.
-        Overlapping callers must instead schedule these same stages with
-        explicit dependencies separating shared and routed collectives.
-        """
-        gathered = self.gather_inputs(inputs, counts)
-        if gathered.shape[0] == 0:
-            return inputs.new_empty((0, self.hidden))
-        partial = compute(gathered, down_out=None)
-        return self.reduce_outputs(partial, inputs.shape[0])
-
     def gather_inputs(self, inputs, counts):
         """Return borrowed padded subgroup inputs before forking MLP compute.
 
