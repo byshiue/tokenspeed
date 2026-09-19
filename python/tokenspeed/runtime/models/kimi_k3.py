@@ -61,6 +61,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel import fp8_linear
 from tokenspeed_kernel.ops.activation.triton import (
     attnres_combine,
     attnres_partial,
@@ -115,6 +116,7 @@ from tokenspeed.runtime.layers.attention.o_proj import (
     projection_mapping,
     validate_projection_settings,
 )
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
 )
@@ -147,6 +149,7 @@ from tokenspeed.runtime.layers.moe.utils import (
     get_moe_backend,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
     preprocess_fp8_pb_wo_weights,
 )
@@ -1256,6 +1259,22 @@ class KimiLinearKDA(nn.Module):
             reduce_results=False,  # layer-level AR owns ordinary attention TP
         )
 
+        if (
+            merged_fp8
+            and global_server_args_dict["dense_gemm_backend"] == "trtllm_cutedsl"
+        ):
+            # The merged buffer is not a LinearBase. Register the ordinary
+            # FP8 method so loading and warmup discover it like other linears.
+            self.qkvgb_proj.quant_method = Fp8LinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="dynamic",
+                    ignored_layers=None,
+                    weight_block_size=[128, 128],
+                    scale_fmt=None,
+                )
+            )
+
     def fuse_conv_weights(self) -> None:
         """Concatenate the loaded q/k/v conv kernels into ``self.conv_weights``."""
         self.conv_weights = torch.cat(
@@ -1269,7 +1288,22 @@ class KimiLinearKDA(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project every KDA hidden-state consumer."""
         proj_local = self.local_num_heads * self.head_dim
-        if attnres_partial_args is None:
+        if isinstance(
+            getattr(self.qkvgb_proj, "quant_method", None),
+            Fp8LinearMethod,
+        ):
+            if attnres_partial_args is not None:
+                attnres_partial_dual(*attnres_partial_args)
+            output = fp8_linear(
+                self.qkvgb_proj._prepared_fp8_linear,
+                hidden_states,
+                self.qkvgb_proj.weight,
+                self.qkvgb_proj.weight_scale_inv,
+                input_scales=None,
+                bias=None,
+                out_dtype=hidden_states.dtype,
+            )
+        elif attnres_partial_args is None:
             output = kimi3_qkvfab_projection(
                 hidden_states,
                 self.qkvgb_proj.weight,
@@ -2626,7 +2660,7 @@ class KimiLinearDecoderLayer(nn.Module):
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
     ) -> bool:
         # Split beats fused at decode: 47 us/step faster at bs = 8 (aux-stream partial).
-        if getattr(self, "_dflash_attnres_capture_fallback", False):
+        if self._dflash_attnres_capture_fallback:
             return False
 
         # B1 already fuses the post-attention mix into the all-reduce.
@@ -3444,9 +3478,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
         self.model.dflash_aux_stream = stream
         self.model._refresh_dflash_capture_fallback()
         logger.info(
-            "DFLASH/DSpark target capture: layers=%s stream=%s",
-            tuple(self.model.layers_to_capture),
-            stream,
+            "DFLASH/DSpark target capture: layers="
+            f"{tuple(self.model.layers_to_capture)!s} stream={stream!s}",
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
@@ -3726,6 +3759,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 merged = self_attn.qkvgb_proj
                 if getattr(merged, "fp8_block_quant", False):
                     merged.verify_fp8_load_complete()
+                    if isinstance(
+                        getattr(merged, "quant_method", None),
+                        Fp8LinearMethod,
+                    ):
+                        # The loader prepares this plan with the other FP8
+                        # linears after assembly. Do not cache stale FI scales.
+                        continue
                     # Prepack the block scales for the flashinfer w8a8 GEMM
                     # (the same preparation Fp8LinearMethod does for
                     # LinearBase layers); rows are 128-padded at construction
@@ -4033,10 +4073,10 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 pass
         if dropped_vision_weights:
             logger.warning(
-                "Dropping %d vision weights: multimodal path is inactive.",
-                dropped_vision_weights,
+                f"Dropping {dropped_vision_weights:d} vision weights: multimodal path "
+                "is inactive.",
             )
-        logger.debug("Loaded %d Kimi-K3 vision tensors.", loaded_vision_weights)
+        logger.debug(f"Loaded {loaded_vision_weights:d} Kimi-K3 vision tensors.")
 
 
 EntryClass = [KimiK3ForConditionalGeneration]

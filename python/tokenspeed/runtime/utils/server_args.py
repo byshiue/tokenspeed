@@ -212,6 +212,9 @@ class ServerArgs:
     enable_expert_distribution_metrics: bool = False
     enable_eplb: bool = False
 
+    # Dense GEMM selection is independent of routed-expert kernels.
+    dense_gemm_backend: str = "auto"
+
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
@@ -510,6 +513,8 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
+        if self.dense_gemm_backend not in {"auto", "trtllm_cutedsl"}:
+            raise ValueError("--dense-gemm-backend must be auto or trtllm_cutedsl")
         if self.sampling_backend is None:
             # ``flashinfer`` is the only built-in backend that respects per-request
             # ``temperature`` / ``top_p`` / ``top_k``. ``greedy`` is argmax-only
@@ -585,15 +590,12 @@ class ServerArgs:
             if attn_dp_size is not None:
                 world_size *= attn_dp_size
             logger.info(
-                "Inferred world_size (%s) from attn_tp_size (%s) x attn_cp_size (%s) x attn_dp_size (%s) x pp_size (%s)",
-                world_size,
-                attn_tp_size,
-                attn_cp_size,
-                attn_dp_size,
-                pp_size,
+                f"Inferred world_size ({world_size!s}) from attn_tp_size ("
+                f"{attn_tp_size!s}) x attn_cp_size ({attn_cp_size!s}) x attn_dp_size ("
+                f"{attn_dp_size!s}) x pp_size ({pp_size!s})",
             )
         else:
-            logger.info("Specified world_size (%s)", world_size)
+            logger.info(f"Specified world_size ({world_size!s})")
 
         # Pipeline stages are the outermost split: every per-layer-type
         # parallelism resolves inside one stage's world.
@@ -624,7 +626,7 @@ class ServerArgs:
         if self.enable_expert_parallel and self.ep_size == 1:
             self.ep_size = stage_world_size
             logger.info(
-                "--enable-expert-parallel: auto-setting ep_size=%s", stage_world_size
+                f"--enable-expert-parallel: auto-setting ep_size={stage_world_size!s}",
             )
 
         # MoE parallel sizes default to consuming the full stage world unless
@@ -694,7 +696,7 @@ class ServerArgs:
                     "attention context parallelism"
                 )
 
-        logger.info("Parallelism configuration:\n%s", self.mapping)
+        logger.info(f"Parallelism configuration:\n{self.mapping!s}")
 
     def resolve_cache(self):
         # Handle KVStore settings.
@@ -768,9 +770,9 @@ class ServerArgs:
             self.comm_fusion_max_num_tokens = -1
             self.enable_allreduce_fusion = False
             logger.info(
-                "allreduce is forbidden due to different attn_tp_size: %s and dense_tp_size: %s!",
-                self.mapping.attn.tp_size,
-                self.mapping.dense.tp_size,
+                "allreduce is forbidden due to different attn_tp_size: "
+                f"{self.mapping.attn.tp_size!s} and dense_tp_size: "
+                f"{self.mapping.dense.tp_size!s}!",
             )
 
     def resolve_disaggregation(self):
@@ -840,8 +842,8 @@ class ServerArgs:
         elif self.disaggregation_mode == "decode":
             # Prefix caching stays configurable for decode servers.
             logger.info(
-                "enable_prefix_caching=%r for decode server",
-                self.enable_prefix_caching,
+                f"enable_prefix_caching={self.enable_prefix_caching!r} for decode "
+                "server",
             )
         elif self.disaggregation_mode == "encode":
             # Encode server: vision tower only, no LM / KV pool / prefix cache.
@@ -869,8 +871,8 @@ class ServerArgs:
         if self.disaggregation_mode == "encode":
             self.enable_kvstore = False
             logger.info(
-                "%s instance has set enable_kvstore to False!",
-                self.disaggregation_mode,
+                f"{self.disaggregation_mode!s} instance has set enable_kvstore to "
+                "False!",
             )
         elif not self.disable_kvstore:
             self.enable_kvstore = True
@@ -1457,6 +1459,16 @@ class ServerArgs:
             "--enable-eplb",
             action="store_true",
             help="Enable EPLB algorithm",
+        )
+        parser.add_argument(
+            "--dense-gemm-backend",
+            type=str,
+            default=ServerArgs.dense_gemm_backend,
+            choices=["auto", "trtllm_cutedsl"],
+            help="Backend for standard 128x128 block-FP8 dense linears. "
+            "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
+            "weights and FP32 scales without requantization. "
+            "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
             "--moe-backend",
