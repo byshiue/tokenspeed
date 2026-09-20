@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Bounded one-shot collectives for Kimi shared-expert TP4."""
+"""Bounded one-shot collectives for shared-expert tensor parallelism."""
 
 from ctypes import c_void_p
 
@@ -29,27 +29,38 @@ from tokenspeed_kernel.signature import format_signatures
 
 
 class SharedExpertGatherState:
-    """Own TP4 BF16 AllGather IPC scratch for serialized auxiliary-stream calls."""
+    """Own BF16 AllGather IPC scratch for serialized auxiliary-stream calls."""
 
     def __init__(self, group, max_rows, hidden, device, oneshot):
         from tokenspeed_kernel.thirdparty.cuda.trtllm import (
             trtllm_create_ipc_workspace_for_allgather_fusion,
         )
 
-        if group.size() != 4 or not 0 < max_rows <= 128 or hidden != 7168:
+        self.tp_size = group.size()
+        if self.tp_size not in (2, 4, 8, 16) or not 0 < max_rows <= 128:
             raise ValueError(
-                "Shared-expert one-shot gather requires TP4, H7168, 1..128 rows"
+                "Shared-expert one-shot gather requires TP2/4/8/16 and 1..128 rows"
             )
+        if hidden <= 0 or hidden % 128:
+            raise ValueError(
+                "Shared-expert gather width must be a positive multiple of 128"
+            )
+        if self.tp_size * max_rows * hidden * 2 >= 2**31 - 2**21:
+            raise ValueError("Shared-expert gather exceeds one-shot Lamport capacity")
         self.max_rows = max_rows
         self.group, self.hidden, self.oneshot = group, hidden, oneshot
         # Plain gather has no normalization semantics: subdividing rows is an
-        # exact view that satisfies the fused wrapper's <=2112 hidden limit.
-        self.kernel_hidden = hidden if hidden <= 2112 else 1792
-        assert hidden % self.kernel_hidden == 0
+        # exact view. Choose the largest divisor satisfying the fused wrapper's
+        # <=2112 hidden limit and 128-element q_lora_rank alignment.
+        self.kernel_hidden = next(
+            width
+            for width in range(min(hidden, 2112) // 128 * 128, 0, -128)
+            if hidden % width == 0
+        )
         self.handles, self.workspace = trtllm_create_ipc_workspace_for_allgather_fusion(
             tp_rank=group.rank(),
-            tp_size=4,
-            max_token_num=4 * max_rows * hidden // self.kernel_hidden,
+            tp_size=self.tp_size,
+            max_token_num=self.tp_size * max_rows * hidden // self.kernel_hidden,
             hidden_dim=self.kernel_hidden,
             use_fp32_lamport=False,
             group=group,
@@ -57,11 +68,11 @@ class SharedExpertGatherState:
         )
         self.control_ptr = self.workspace[-1].item()
         self.out = torch.empty(
-            (4 * max_rows, hidden), dtype=torch.bfloat16, device=device
+            (self.tp_size * max_rows, hidden), dtype=torch.bfloat16, device=device
         )
 
     def gather(self, inputs):
-        """Return borrowed [4*M,H] BF16 rows, valid until the next gather."""
+        """Return borrowed [TP*M,H] BF16 rows, valid until the next gather."""
         if (
             inputs.dtype != torch.bfloat16
             or not inputs.is_contiguous()
@@ -72,17 +83,17 @@ class SharedExpertGatherState:
         from tokenspeed_kernel.thirdparty.cuda.trtllm import trtllm_allgather_fusion
 
         local = inputs.view(-1, self.kernel_hidden)
-        out = self.out[: 4 * inputs.shape[0]]
+        out = self.out[: self.tp_size * inputs.shape[0]]
         trtllm_allgather_fusion(
             allgather_in=local,
-            world_size=4,
+            world_size=self.tp_size,
             world_rank=self.group.rank(),
             hidden_dim=self.kernel_hidden,
             workspace_ptrs=self.workspace,
             trigger_completion_at_end=False,
             num_token_current_rank=local.shape[0],
             allgather_out=out.view(-1, self.kernel_hidden),
-            num_token_all_group=4 * local.shape[0],
+            num_token_all_group=self.tp_size * local.shape[0],
             launch_with_pdl=False,
             pattern_code=0,
             use_oneshot=self.oneshot,
@@ -123,7 +134,7 @@ class SharedExpertGatherState:
     signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
 )
 def trtllm_shared_expert_allgather(state, inputs):
-    """Gather BF16 [M,H] rows into borrowed [4*M,H] subgroup-rank order.
+    """Gather BF16 [M,H] rows into borrowed [TP*M,H] subgroup-rank order.
 
     state is a preallocated SharedExpertGatherState. All peers call on one
     serialized stream; finish reading the returned view before the next call.
@@ -135,7 +146,7 @@ class SharedExpertReduceState:
     """Own IPC scratch shared by sequential layers, not by concurrent streams.
 
     Args:
-        group: Four-rank process group on a CUDA-IPC-accessible topology.
+        group: 2/4/8/16-rank process group on a CUDA-IPC-accessible topology.
         max_rows: Prepared physical rows per rank, at most 128.
         hidden: Output width, a positive multiple of eight BF16 elements.
         device: Current rank's CUDA device, already selected by the caller.
@@ -146,9 +157,10 @@ class SharedExpertReduceState:
             trtllm_create_ipc_workspace_for_reduce_scatter_fusion,
         )
 
-        if group.size() != 4 or not 0 < max_rows <= 128 or hidden <= 0:
+        self.tp_size = group.size()
+        if self.tp_size not in (2, 4, 8, 16) or not 0 < max_rows <= 128 or hidden <= 0:
             raise ValueError(
-                "Lamport shared-expert reduction requires TP4 and 1..128 rows"
+                "Lamport shared-expert reduction requires TP2/4/8/16, positive width and 1..128 rows"
             )
         if hidden % 8:
             raise ValueError(
@@ -156,7 +168,7 @@ class SharedExpertReduceState:
             )
         # Bound allocation and prevent the native wrapper silently selecting
         # two-shot on inputs larger than its signed-int32 Lamport address space.
-        if 4 * 4 * max_rows * hidden * 2 >= 2**31 - 2**21:
+        if self.tp_size * self.tp_size * max_rows * hidden * 2 >= 2**31 - 2**21:
             raise ValueError(
                 "Shared-expert reduction exceeds one-shot Lamport capacity"
             )
@@ -164,13 +176,13 @@ class SharedExpertReduceState:
         self.max_rows = max_rows
         self.hidden = hidden
         self.buffer = torch.empty(
-            (4 * max_rows, hidden), dtype=torch.bfloat16, device=device
+            (self.tp_size * max_rows, hidden), dtype=torch.bfloat16, device=device
         )
         self.handles, self.workspace = (
             trtllm_create_ipc_workspace_for_reduce_scatter_fusion(
                 tp_rank=group.rank(),
-                tp_size=4,
-                max_token_num=4 * max_rows,
+                tp_size=self.tp_size,
+                max_token_num=self.tp_size * max_rows,
                 hidden_dim=hidden,
                 use_fp32_lamport=False,
                 group=group,
@@ -187,7 +199,7 @@ class SharedExpertReduceState:
             raise ValueError(
                 "Lamport shared-expert reduction is closed or exceeds capacity"
             )
-        return self.buffer[: 4 * rows]
+        return self.buffer[: self.tp_size * rows]
 
     def close(self) -> None:
         """Collectively release IPC storage after all referencing graphs die."""
@@ -214,7 +226,7 @@ class SharedExpertReduceState:
     signatures=format_signatures(("partial",), "dense", {torch.bfloat16}),
 )
 def trtllm_shared_expert_reduce_scatter(state, partial, rows):
-    """Reduce BF16 [4*rows,H] partials into owned [rows,H] output.
+    """Reduce BF16 [TP*rows,H] partials into owned [rows,H] output.
 
     Prepare state collectively before capture. The native one-shot protocol
     publishes payloads into its own IPC ring and synchronizes their reuse;
@@ -223,7 +235,7 @@ def trtllm_shared_expert_reduce_scatter(state, partial, rows):
 
     Args:
         state: Collectively prepared SharedExpertReduceState.
-        partial: Contiguous BF16 [4*rows,H] local GEMM partials.
+        partial: Contiguous BF16 [TP*rows,H] local GEMM partials.
         rows: Equal physical row count per rank, including padding.
 
     Returns:
@@ -244,9 +256,9 @@ def trtllm_shared_expert_reduce_scatter(state, partial, rows):
     out = torch.empty((rows, state.hidden), dtype=partial.dtype, device=partial.device)
     trtllm_reducescatter_fusion(
         reducescatter_in=partial,
-        world_size=4,
+        world_size=state.tp_size,
         world_rank=state.group.rank(),
-        token_num=4 * rows,
+        token_num=state.tp_size * rows,
         hidden_dim=state.hidden,
         workspace_ptrs=state.workspace,
         trigger_completion_at_end=False,

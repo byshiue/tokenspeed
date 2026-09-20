@@ -51,8 +51,13 @@ to bypass capacity failures.
 ## Communication and validation
 
 The forward chain is AllGather, gate/up, activation, down, ReduceScatter.
-For TP4 with hidden width 7168, TRT-LLM one-shot collectives cover up to 128
-padded rows/rank. Other TP sizes, hidden widths and larger batches use NCCL.
+For TP2/4/8/16 with positive, 128-aligned hidden widths, TRT-LLM one-shot
+collectives cover up to 128 padded rows/rank on CUDA-IPC-accessible groups.
+Group size and buffer shapes come from runtime parameters; AllGather subdivides
+rows into aligned views within the native hidden-width limit. Other TP sizes,
+unaligned widths and larger batches use NCCL. One-shot address-space limits still
+apply. TP4/H7168 has prior GPU validation; newly enabled geometries require GPU
+validation on the target topology before deployment.
 `SharedExpertCommunication` owns the persistent scratch and runs these
 collectives; it is initialized before graph capture. Empty
 owners still participate when their subgroup is active. AllGather completes
@@ -74,6 +79,8 @@ It covers cross-rank setting agreement using real collectives, exact weight
 shards, uneven/empty owners, retained outputs, and changing inputs during graph
 replay. Eager warmup also checks actual collective participation and backend
 selection at the 128/129-row boundary without substituting collective results.
+Synthetic communication cases also cover narrow, subdivided, and unaligned
+hidden widths in eager execution and CUDA-graph replay.
 These shared-expert checks live in the GPU validator, not a separate CPU suite.
 
 For E2E comparison, use fixed per-rank request affinity, identical prompts and

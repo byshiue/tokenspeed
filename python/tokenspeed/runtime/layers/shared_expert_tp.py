@@ -112,9 +112,9 @@ class SharedExpertCommunication:
             parallel.tp_size * capacity, hidden, dtype=torch.bfloat16, device=device
         )
         self.gather = self.reduction = None
-        # One-shot wrappers hardcode TP4; AllGather views H7168 as 4 x H1792
-        # to fit its hidden-width limit. Other TP sizes/widths use NCCL.
-        if parallel.tp_size == 4 and hidden == 7168:
+        # Native kernels support TP2/4/8/16; the gather wrapper requires
+        # 128-aligned widths. Other geometries use NCCL.
+        if parallel.tp_size in (2, 4, 8, 16) and hidden > 0 and hidden % 128 == 0:
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
             self.gather = SharedExpertGatherState(
                 group, min(capacity, 128), hidden, device, True
