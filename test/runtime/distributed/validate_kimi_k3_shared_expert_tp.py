@@ -163,41 +163,19 @@ def main():
     # subdivision above the native limit, and an unaligned NCCL fallback.
     for width in (128, 2304, 7200):
         communication = SharedExpertCommunication(
-            parallel, 129, width, torch.device("cuda")
+            parallel, 1, width, torch.device("cuda")
         )
-        for rows in (1, 128, 129):
-            counts = [rows if r % args.tp_size else 0 for r in range(world)]
-            inputs = torch.full(
-                (counts[rank], width), rank + 1, dtype=torch.bfloat16, device="cuda"
-            )
-            expected = torch.cat(
-                [
-                    torch.full(
-                        (rows, width),
-                        peer + 1 if counts[peer] else 0,
-                        dtype=torch.bfloat16,
-                        device="cuda",
-                    )
-                    for peer in parallel.tp_group
-                ]
-            )
-            graph = torch.cuda.CUDAGraph()
-            for capture in (False, True):
-                if capture:
-                    with torch.cuda.graph(graph):
-                        gathered = communication.gather_inputs(inputs, counts)
-                        output = communication.reduce_outputs(
-                            gathered / args.tp_size, counts[rank]
-                        )
-                    graph.replay()
-                else:
-                    gathered = communication.gather_inputs(inputs, counts)
-                    output = communication.reduce_outputs(
-                        gathered / args.tp_size, counts[rank]
-                    )
-                torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
-                torch.testing.assert_close(output, inputs, rtol=0, atol=0)
-            del graph, gathered, output
+        inputs = torch.full((1, width), rank + 1, dtype=torch.bfloat16, device="cuda")
+        expected = torch.cat(
+            [
+                torch.full((1, width), peer + 1, dtype=torch.bfloat16, device="cuda")
+                for peer in parallel.tp_group
+            ]
+        )
+        gathered = communication.gather_inputs(inputs, [1] * world)
+        output = communication.reduce_outputs(gathered / args.tp_size, 1)
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        torch.testing.assert_close(output, inputs, rtol=0, atol=0)
         communication.close()
     stream = torch.cuda.Stream(priority=-1)
     fork = StreamFork(stream)

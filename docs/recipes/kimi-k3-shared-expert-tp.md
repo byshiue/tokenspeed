@@ -80,7 +80,8 @@ shards, uneven/empty owners, retained outputs, and changing inputs during graph
 replay. Eager warmup also checks actual collective participation and backend
 selection at the 128/129-row boundary without substituting collective results.
 Synthetic communication cases also cover narrow, subdivided, and unaligned
-hidden widths in eager execution and CUDA-graph replay.
+hidden widths with one token per rank in eager execution; the real-weight cases
+above cover empty owners, row-count boundaries, and CUDA-graph replay.
 These shared-expert checks live in the GPU validator, not a separate CPU suite.
 
 For E2E comparison, use fixed per-rank request affinity, identical prompts and
