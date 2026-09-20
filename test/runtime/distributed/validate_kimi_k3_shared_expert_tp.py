@@ -25,13 +25,13 @@ import json
 import os
 from contextlib import ExitStack
 from pathlib import Path
-from test.runtime.distributed.shared_expert_helpers import dep_mapping
 from unittest import mock
 
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
@@ -57,7 +57,28 @@ def main():
     assert 1 < args.tp_size < world and world % args.tp_size == 0
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     torch.set_default_dtype(torch.bfloat16)
-    mapping = dep_mapping(rank, world)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=1,
+        attn_cp_size=1,
+        attn_dp_size=world,
+        attn_dcp_size=1,
+        dense_tp_size=1,
+        dense_dp_size=world,
+        moe_tp_size=1,
+        moe_ep_size=world,
+        moe_dp_size=1,
+        vision_tp_size=1,
+        vision_dp_size=1,
+        linear_attn_tp_size=1,
+        pp_size=1,
+        pp_layer_partition=None,
+        nprocs_per_node=None,
+        nnodes=None,
+        base_gpu_id=0,
+        gpu_id_step=1,
+    )
     pg_manager.init_distributed(
         mapping,
         distributed_init_method="env://",
