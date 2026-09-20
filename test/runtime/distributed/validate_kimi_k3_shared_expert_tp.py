@@ -23,8 +23,10 @@
 import argparse
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
 from test.runtime.distributed.shared_expert_helpers import dep_mapping
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -33,10 +35,12 @@ from safetensors import safe_open
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.layers import shared_expert_tp
 from tokenspeed.runtime.layers.shared_expert_tp import (
     SharedExpertWorkspace,
     initialize_shared_expert_group,
     shared_expert_mapping,
+    validate_shared_expert_settings,
 )
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLP
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -61,6 +65,21 @@ def main():
         timeout=600,
         device_id=torch.device("cuda", torch.cuda.current_device()),
     )
+    # Exercise real world-wide agreement before any shared TP group exists.
+    # Disabled and malformed ranks must reject together with enabled peers.
+    for divergent_value in ("1", "invalid"):
+        rejected = False
+        try:
+            validate_shared_expert_settings(
+                mapping, divergent_value if rank == 0 else str(args.tp_size)
+            )
+        except ValueError as exc:
+            rejected = "differ across ranks" in str(exc)
+        accepted_rejection = torch.tensor(int(rejected), device="cuda")
+        dist.all_reduce(accepted_rejection, op=dist.ReduceOp.MIN)
+        assert accepted_rejection.item() == 1, "Every rank must reject disagreement"
+    assert validate_shared_expert_settings(mapping, "1") is None
+    validate_shared_expert_settings(mapping, str(args.tp_size))
     index = json.loads((args.model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -164,7 +183,38 @@ def main():
                     fork.join()
                 return output
 
-            for _ in range(3):
+            # Observe real collectives during eager warmup, without replacing
+            # their results. Numerics alone cannot detect an incorrect fallback
+            # or unnecessary communication by an entirely empty subgroup.
+            collective_names = (
+                "trtllm_shared_expert_allgather",
+                "trtllm_shared_expert_reduce_scatter",
+                "all_gather_single",
+                "reduce_scatter",
+            )
+            with ExitStack() as stack:
+                calls = [
+                    stack.enter_context(
+                        mock.patch.object(
+                            shared_expert_tp,
+                            name,
+                            wraps=getattr(shared_expert_tp, name),
+                        )
+                    )
+                    for name in collective_names
+                ]
+                run()
+                active_rows = max(counts[r] for r in parallel.tp_group)
+                native = args.tp_size == 4 and 0 < active_rows <= 128
+                fallback = active_rows > 0 and not native
+                observed = [call.call_count for call in calls]
+                expected_calls = [int(native)] * 2 + [int(fallback)] * 2
+                routing_ok = torch.tensor(
+                    int(observed == expected_calls), device="cuda"
+                )
+                dist.all_reduce(routing_ok, op=dist.ReduceOp.MIN)
+                assert routing_ok.item() == 1, (rows, pattern, observed, expected_calls)
+            for _ in range(2):
                 run()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):

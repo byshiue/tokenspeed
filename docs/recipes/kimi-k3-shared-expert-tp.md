@@ -59,19 +59,21 @@ before routed dispatch; shared GEMMs finish before routed BMM. Shared
 ReduceScatter runs after dispatch and completes before combine, so shared
 collectives never overlap routed dispatch/combine.
 
-Run the CPU contract and orchestration tests:
+Run the model orchestration and stream-ordering tests:
 
 ```bash
-python -m pytest -q test/runtime/distributed/test_kimi_k3_shared_expert_tp.py \
-  test/runtime/test_kimi_k3_moe_attn_dp.py test/runtime/test_cuda_stream.py \
+python -m pytest -q test/runtime/test_kimi_k3_moe_attn_dp.py test/runtime/test_cuda_stream.py \
   test/runtime/test_kimi_k3_config.py
 ```
 
 Use `test/runtime/distributed/validate_kimi_k3_shared_expert_tp.py` under
 `torchrun` with 16 workers and explicit `--model MODEL_DIR --layer 1 --tp-size 4`
 for real-weight validation; repeat with `--tp-size 2` and `--tp-size 8`.
-It covers exact weight shards, uneven/empty owners,
-the 128/129-row backend boundary, and changing inputs during graph replay.
+It covers cross-rank setting agreement using real collectives, exact weight
+shards, uneven/empty owners, retained outputs, and changing inputs during graph
+replay. Eager warmup also checks actual collective participation and backend
+selection at the 128/129-row boundary without substituting collective results.
+These shared-expert checks live in the GPU validator, not a separate CPU suite.
 
 For E2E comparison, use fixed per-rank request affinity, identical prompts and
 generation lengths, warmup, and repeated unprofiled rounds. Report prefill-plus-
