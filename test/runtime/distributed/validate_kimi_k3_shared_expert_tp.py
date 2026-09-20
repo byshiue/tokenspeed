@@ -139,10 +139,11 @@ def main():
         mlp.down_proj.weight.weight_loader(mlp.down_proj.weight, weights[2])
         mlps.append(mlp)
     baseline, candidate = mlps
+    hidden = weights[0].shape[1]
     parallel = candidate.shared_parallel
     initialize_shared_expert_group(parallel)
     candidate.shared_communication = SharedExpertCommunication(
-        parallel, 129, 7168, torch.device("cuda")
+        parallel, 129, hidden, torch.device("cuda")
     )
     shard = weights[0].shape[0] // args.tp_size
     start = parallel.tp_rank * shard
@@ -158,6 +159,46 @@ def main():
         rtol=0,
         atol=0,
     )
+    # Exercise runtime widths independently of the checkpoint: a narrow view,
+    # subdivision above the native limit, and an unaligned NCCL fallback.
+    for width in (128, 2304, 7200):
+        communication = SharedExpertCommunication(
+            parallel, 129, width, torch.device("cuda")
+        )
+        for rows in (1, 128, 129):
+            counts = [rows if r % args.tp_size else 0 for r in range(world)]
+            inputs = torch.full(
+                (counts[rank], width), rank + 1, dtype=torch.bfloat16, device="cuda"
+            )
+            expected = torch.cat(
+                [
+                    torch.full(
+                        (rows, width),
+                        peer + 1 if counts[peer] else 0,
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                    for peer in parallel.tp_group
+                ]
+            )
+            graph = torch.cuda.CUDAGraph()
+            for capture in (False, True):
+                if capture:
+                    with torch.cuda.graph(graph):
+                        gathered = communication.gather_inputs(inputs, counts)
+                        output = communication.reduce_outputs(
+                            gathered / args.tp_size, counts[rank]
+                        )
+                    graph.replay()
+                else:
+                    gathered = communication.gather_inputs(inputs, counts)
+                    output = communication.reduce_outputs(
+                        gathered / args.tp_size, counts[rank]
+                    )
+                torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+                torch.testing.assert_close(output, inputs, rtol=0, atol=0)
+            del graph, gathered, output
+        communication.close()
     stream = torch.cuda.Stream(priority=-1)
     fork = StreamFork(stream)
     worst = 0.0
@@ -177,7 +218,7 @@ def main():
             x = (
                 torch.randn(
                     counts[rank],
-                    7168,
+                    hidden,
                     device="cuda",
                     generator=torch.Generator(device="cuda").manual_seed(800 + rank),
                 )
@@ -228,7 +269,11 @@ def main():
                 ]
                 run()
                 active_rows = max(counts[r] for r in parallel.tp_group)
-                native = args.tp_size == 4 and 0 < active_rows <= 128
+                native = (
+                    args.tp_size in (2, 4, 8, 16)
+                    and hidden % 128 == 0
+                    and 0 < active_rows <= 128
+                )
                 fallback = active_rows > 0 and not native
                 observed = [call.call_count for call in calls]
                 expected_calls = [int(native)] * 2 + [int(fallback)] * 2
