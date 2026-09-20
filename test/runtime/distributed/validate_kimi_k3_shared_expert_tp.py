@@ -229,8 +229,8 @@ def main():
             # their results. Numerics alone cannot detect an incorrect fallback
             # or unnecessary communication by an entirely empty subgroup.
             collective_names = (
-                "trtllm_shared_expert_allgather",
-                "trtllm_shared_expert_reduce_scatter",
+                "trtllm_allgather",
+                "trtllm_reduce_scatter",
                 "all_gather_single",
                 "reduce_scatter",
             )

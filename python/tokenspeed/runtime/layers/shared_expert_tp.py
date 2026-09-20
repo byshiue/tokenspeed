@@ -22,11 +22,11 @@
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.trtllm_shared import (
-    SharedExpertGatherState,
-    SharedExpertReduceState,
-    trtllm_shared_expert_allgather,
-    trtllm_shared_expert_reduce_scatter,
+from tokenspeed_kernel.ops.communication.trtllm import (
+    TrtllmAllGatherState,
+    TrtllmReduceScatterState,
+    trtllm_allgather,
+    trtllm_reduce_scatter,
 )
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single, reduce_scatter
@@ -116,15 +116,15 @@ class SharedExpertCommunication:
         # 128-aligned widths. Other geometries use NCCL.
         if parallel.tp_size in (2, 4, 8, 16) and hidden > 0 and hidden % 128 == 0:
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            self.gather = SharedExpertGatherState(
+            self.gather = TrtllmAllGatherState(
                 group, min(capacity, 128), hidden, device, True
             )
-            self.reduction = SharedExpertReduceState(
+            self.reduction = TrtllmReduceScatterState(
                 group, min(capacity, 128), hidden, device
             )
             probe = self.reduction.input_buffer(1)
             probe.zero_()
-            trtllm_shared_expert_reduce_scatter(self.reduction, probe, 1)
+            trtllm_reduce_scatter(self.reduction, probe, 1)
 
     def gather_inputs(self, inputs, counts):
         """Return borrowed padded subgroup inputs before forking MLP compute.
@@ -157,7 +157,7 @@ class SharedExpertCommunication:
             send.zero_()
             send[:local_rows].copy_(inputs)
         if self.gather is not None and rows <= 128:
-            gathered = trtllm_shared_expert_allgather(self.gather, send)
+            gathered = trtllm_allgather(self.gather, send)
         else:
             gathered = self.received[: p.tp_size * rows]
             all_gather_single(gathered, send, p.tp_group, backend=None)
@@ -179,7 +179,7 @@ class SharedExpertCommunication:
         if rows == 0:
             return partial.new_empty((0, self.hidden))
         if self.reduction is not None and rows <= 128:
-            owned = trtllm_shared_expert_reduce_scatter(self.reduction, partial, rows)
+            owned = trtllm_reduce_scatter(self.reduction, partial, rows)
         else:
             owned = reduce_scatter(partial, self.parallel.tp_group, backend=None)
         return owned[:local_rows]

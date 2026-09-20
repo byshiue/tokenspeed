@@ -65,6 +65,15 @@ before routed dispatch; shared GEMMs finish before routed BMM. Shared
 ReduceScatter runs after dispatch and completes before combine, so shared
 collectives never overlap routed dispatch/combine.
 
+The plain collective wrappers live in `tokenspeed_kernel.ops.communication.trtllm`
+as `trtllm_allgather` and `trtllm_reduce_scatter`, with explicit
+`TrtllmAllGatherState` and `TrtllmReduceScatterState` instances. These instances
+own independent IPC workspaces, separate from the existing fusion workspace.
+AllGather returns a borrowed buffer; ReduceScatter returns owned output.
+Their `stateful_allgather` and `stateful_reduce_scatter` registry modes do not
+participate in stateless auto dispatch. Runtime padding and backend selection
+remain in `SharedExpertCommunication`.
+
 Run the model orchestration and stream-ordering tests:
 
 ```bash
