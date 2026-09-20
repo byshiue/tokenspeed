@@ -147,7 +147,7 @@ from tokenspeed.runtime.layers.quantization.modelopt_mixed import (
 )
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.shared_expert_tp import (
-    SharedExpertWorkspace,
+    SharedExpertCommunication,
     initialize_shared_expert_group,
     shared_expert_mapping,
     validate_shared_expert_settings,
@@ -257,7 +257,7 @@ class KimiLinearMLP(nn.Module):
     ) -> None:
         super().__init__()
         self.shared_parallel = shared_parallel
-        self.shared_workspace = None
+        self.shared_communication = None
         if self.shared_parallel is not None:
             if intermediate_size % self.shared_parallel.tp_size:
                 raise ValueError(
@@ -2026,10 +2026,10 @@ class KimiLinearMoE(nn.Module):
         if max_tokens == 0:
             return prefix_sum
 
-        shared_workspace = None
+        shared_communication = None
         if self.shared_experts.shared_parallel is not None:
-            shared_workspace = self.shared_experts.shared_workspace
-            if shared_workspace is None:
+            shared_communication = self.shared_experts.shared_communication
+            if shared_communication is None:
                 raise RuntimeError(
                     "Shared-expert communication must be prepared before forward"
                 )
@@ -2038,11 +2038,13 @@ class KimiLinearMoE(nn.Module):
             enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
             shared_output = None
-            if shared_workspace is not None:
+            if shared_communication is not None:
                 with fork.branch():
                     # Hide gathering under local routing, but let dispatch
                     # wait for AG alone while shared GEMMs keep running.
-                    shared_input = shared_workspace.gather_inputs(hidden_states, counts)
+                    shared_input = shared_communication.gather_inputs(
+                        hidden_states, counts
+                    )
                     fork.record_checkpoint()
                     shared_output = self.shared_experts(shared_input, down_out=None)
 
@@ -2089,7 +2091,7 @@ class KimiLinearMoE(nn.Module):
                         ),
                     )
 
-            if shared_workspace is not None:
+            if shared_communication is not None:
                 # Never overlap shared AG with routed communication, including
                 # the all-gather fallback and ranks with no local tokens.
                 fork.join_checkpoint()
@@ -2124,13 +2126,13 @@ class KimiLinearMoE(nn.Module):
                 )
                 topk_ids, topk_weights = payloads[-2:]
 
-            if shared_workspace is not None:
+            if shared_communication is not None:
                 # Main has dispatched. Finish shared GEMMs before routed BMM,
                 # then let only shared reduction overlap the finite routed
                 # work. Empty owners obey the same event/collective ordering.
                 fork.join()
                 with fork.branch_after_main():
-                    shared_output = shared_workspace.reduce_outputs(
+                    shared_output = shared_communication.reduce_outputs(
                         shared_output, num_tokens
                     )
                 if self.execution_plan.use_mega_moe:
@@ -2152,7 +2154,7 @@ class KimiLinearMoE(nn.Module):
                 do_finalize=True,
             )
 
-            if shared_workspace is not None:
+            if shared_communication is not None:
                 # Do not allow two peer-polling collectives to occupy the GPU
                 # concurrently: combine starts only after shared RS completes.
                 fork.join()
@@ -2171,7 +2173,7 @@ class KimiLinearMoE(nn.Module):
             if num_tokens > 0 and self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
 
-            if shared_workspace is None:
+            if shared_communication is None:
                 with fork.branch():
                     if num_tokens > 0:
                         shared_output = self.shared_experts(
@@ -3242,21 +3244,21 @@ class KimiLinearForCausalLM(BaseCausalLM):
             and layer.block_sparse_moe.shared_experts.shared_parallel is not None
         ]
         if shared_mlps:
-            workspace = shared_mlps[0].shared_workspace
+            communication = shared_mlps[0].shared_communication
             weight = shared_mlps[0].gate_up_proj.weight
             if weight.dtype != torch.bfloat16:
                 raise ValueError("Shared-expert TP currently requires BF16 weights")
-            if workspace is None:
-                workspace = SharedExpertWorkspace(
+            if communication is None:
+                communication = SharedExpertCommunication(
                     shared_mlps[0].shared_parallel,
                     max_num_tokens,
                     self.config.hidden_size,
                     weight.device,
                 )
-            elif max_num_tokens > workspace.capacity:
+            elif max_num_tokens > communication.capacity:
                 raise RuntimeError("Cannot grow a prepared shared-expert workspace")
             for mlp in shared_mlps:
-                mlp.shared_workspace = workspace
+                mlp.shared_communication = communication
         routed_hidden_size = (
             self.config.routed_expert_hidden_size
             if self.config.routed_expert_hidden_size is not None

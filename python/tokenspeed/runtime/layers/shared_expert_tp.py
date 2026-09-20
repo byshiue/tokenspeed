@@ -98,8 +98,8 @@ def initialize_shared_expert_group(parallel):
     reduce_scatter(received, parallel.tp_group, backend=None)
 
 
-class SharedExpertWorkspace:
-    """One model-owned scratch set reused by sequential shared-expert layers.
+class SharedExpertCommunication:
+    """Shared-expert collectives and scratch reused by sequential model layers.
 
     Allocate before memory profiling/capture; never alias main-stream attention
     buffers. Physical subgroup counts select the same path on every peer.

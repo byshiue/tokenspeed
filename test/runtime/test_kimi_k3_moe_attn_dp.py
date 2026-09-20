@@ -414,7 +414,7 @@ def test_attn_dp_exchanges_latents_and_returns_reduced_local_rows(
     )
     monkeypatch.setattr(kimi_k3, "all_gather", gather)
     layer.shared_experts.shared_parallel = object() if shared_tp else None
-    layer.shared_experts.shared_workspace = SimpleNamespace(
+    layer.shared_experts.shared_communication = SimpleNamespace(
         gather_inputs=shared_gather, reduce_outputs=shared_reduce
     )
     monkeypatch.setattr(kimi_k3, "reduce_scatter", scatter)
@@ -610,7 +610,7 @@ def test_attn_dp_megamoe_keeps_inputs_local_and_owns_combine(
         top_k=2,
     )
     layer.shared_experts.shared_parallel = object() if shared_tp else None
-    layer.shared_experts.shared_workspace = SimpleNamespace(
+    layer.shared_experts.shared_communication = SimpleNamespace(
         gather_inputs=mock.Mock(
             side_effect=lambda *args: (events.append("gather"), hidden)[1]
         ),

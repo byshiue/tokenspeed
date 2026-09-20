@@ -37,7 +37,7 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.layers import shared_expert_tp
 from tokenspeed.runtime.layers.shared_expert_tp import (
-    SharedExpertWorkspace,
+    SharedExpertCommunication,
     initialize_shared_expert_group,
     shared_expert_mapping,
     validate_shared_expert_settings,
@@ -141,7 +141,7 @@ def main():
     baseline, candidate = mlps
     parallel = candidate.shared_parallel
     initialize_shared_expert_group(parallel)
-    candidate.shared_workspace = SharedExpertWorkspace(
+    candidate.shared_communication = SharedExpertCommunication(
         parallel, 129, 7168, torch.device("cuda")
     )
     shard = weights[0].shape[0] // args.tp_size
@@ -187,7 +187,9 @@ def main():
             def run():
                 with fork.scope(enable=True, overlap=True):
                     with fork.branch():
-                        gathered = candidate.shared_workspace.gather_inputs(x, counts)
+                        gathered = candidate.shared_communication.gather_inputs(
+                            x, counts
+                        )
                         fork.record_checkpoint()
                         partial = candidate(gathered, down_out=None)
                     # Local routing overlaps AG; dispatch waits only for AG.
@@ -197,7 +199,7 @@ def main():
                     torch.cuda._sleep(20000)
                     fork.join()
                     with fork.branch_after_main():
-                        output = candidate.shared_workspace.reduce_outputs(
+                        output = candidate.shared_communication.reduce_outputs(
                             partial, counts[rank]
                         )
                     torch.cuda._sleep(20000)
@@ -260,7 +262,7 @@ def main():
                 torch.testing.assert_close(retained, saved, rtol=0, atol=0)
             del graph, actual
             cases.append((rows, pattern))
-    candidate.shared_workspace.close()
+    candidate.shared_communication.close()
     dist.barrier()
     if rank == 0:
         print(
