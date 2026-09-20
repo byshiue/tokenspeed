@@ -53,7 +53,8 @@ to bypass capacity failures.
 The forward chain is AllGather, gate/up, activation, down, ReduceScatter.
 For TP4 with hidden width 7168, TRT-LLM one-shot collectives cover up to 128
 padded rows/rank. Other TP sizes, hidden widths and larger batches use NCCL.
-Persistent scratch is initialized before graph capture. Empty
+`SharedExpertCommunication` owns the persistent scratch and runs these
+collectives; it is initialized before graph capture. Empty
 owners still participate when their subgroup is active. AllGather completes
 before routed dispatch; shared GEMMs finish before routed BMM. Shared
 ReduceScatter runs after dispatch and completes before combine, so shared
