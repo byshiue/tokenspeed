@@ -112,7 +112,8 @@ class SharedExpertWorkspace:
             parallel.tp_size * capacity, hidden, dtype=torch.bfloat16, device=device
         )
         self.gather = self.reduction = None
-        # Keep the validated one-shot contract; other subgroup sizes use NCCL.
+        # One-shot wrappers hardcode TP4; AllGather views H7168 as 4 x H1792
+        # to fit its hidden-width limit. Other TP sizes/widths use NCCL.
         if parallel.tp_size == 4 and hidden == 7168:
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
             self.gather = SharedExpertGatherState(
