@@ -54,7 +54,7 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 Enable this explicitly on **every peer**, before capturing any graph:
 
 ```python
-state.prepare_chunk_exchange(threshold_bytes=8 * 2**20)
+state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
 ```
 
 The existing `cuda_lamport_a2a(state, inputs, inverse)` entry point then chooses
@@ -83,10 +83,34 @@ payload scratch and `3*4*blocks*8` flag bytes per GPU to the original workspace,
 so combined scratch plus output is approximately `10*S`. No allocation or
 host synchronization is performed by the forward call or graph replay.
 
-The 8 MiB threshold is a measured GB300 tuning point, not a universal optimum.
+The recommended threshold keeps exactly 8 MiB on the tuned packet kernel and
+uses chunk exchange above it. An explicitly supplied threshold still takes
+precedence; supplying 8 MiB selects chunk exchange at exactly 8 MiB.
+These are measured GB300 tuning points, not universal optima.
 Vector-packet experiments did not justify replacing the small-message kernel.
 Correctness tests exercise both directions, repeated transitions between
 packet/chunk sizes, delayed peers, arbitrary payload bits and graph replay.
+
+### Medium-message packet tuning
+
+For 4 through 8 MiB inclusive, packet exchange uses 1024 threads/CTA, writes
+self-owned data directly to output, rotates peer publication order, and polls
+three remote owners together. Other packet sizes retain the original launch.
+Both variants use the same packet layout and full 32-bit generation IDs;
+switching sizes needs neither additional scratch nor a new barrier. This
+increases GPU occupancy; concurrent compute performance is not established.
+
+Same-node four-GB300 BF16 graph measurements, width 2048, 128 CTAs, three
+interleaved A/B rounds (microseconds):
+
+| Size | Previous packet/chunk selection | Tuned packet | TRT-LLM AllGather |
+|---|---:|---:|---:|
+| 4 MiB | 14.80 | 13.00 | 10.05 |
+| 8 MiB | 24.24 | 22.58 | 16.56 |
+
+The baseline uses packet at 4 MiB and chunk at 8 MiB. Gains are 12.1% and 6.9%
+in latency, not parity with AllGather. AllGather sizes denote total output;
+A2A sizes denote total input/output. Wire traffic and staging work differ.
 
 ## Validation and benchmark
 

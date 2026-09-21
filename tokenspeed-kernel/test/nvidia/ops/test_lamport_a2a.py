@@ -205,11 +205,20 @@ def distributed_group():
     int(os.environ.get("WORLD_SIZE", "1")) != 4,
     reason="requires torchrun --nproc-per-node=4",
 )
-@pytest.mark.parametrize("channels", [8, 40, 12288, 16384])
+@pytest.mark.parametrize("channels", [8, 40, 2048, 12288, 16384])
 def test_lamport_a2a(channels, distributed_group):
     assert distributed_group.size() == 4
     run_cases(
-        argparse.Namespace(rows=[1, 3, 32, 64, 128], channels=channels, blocks=[128]),
+        argparse.Namespace(
+            # Straddle both ends of the medium-message launch range.
+            rows=(
+                [1, 1023, 1024, 2048, 2049, 1]
+                if channels == 2048
+                else [1, 3, 32, 64, 128]
+            ),
+            channels=channels,
+            blocks=[128],
+        ),
         benchmark=False,
     )
 
