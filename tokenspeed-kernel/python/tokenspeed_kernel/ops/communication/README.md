@@ -121,18 +121,20 @@ Packet format, generation checks, workspace size, and dispatch thresholds are
 unchanged; four rank variants increase compiled code size. GPU tests cover all
 ranks, both directions, and transitions across the packet/chunk boundary.
 
-## Validation and benchmark
+## Validation and measurement methodology
 
 From the repository root, with optional CUDA/FlashInfer dependencies installed:
 
 ```bash
-torchrun --standalone --nproc-per-node=4 -m pytest -q \
-  tokenspeed-kernel/test/nvidia/ops/test_lamport_a2a.py
-
-torchrun --standalone --nproc-per-node=4 \
-  tokenspeed-kernel/test/nvidia/ops/test_lamport_a2a.py \
-  --rows 1 4 16 32 64 128 --channels 12288 --blocks 32 64 128
+python -m pytest -q \
+  test/runtime/distributed/test_comm_ops.py::TestCommOps::test_all_to_all_single
 ```
+
+The existing runtime test spawns its own workers (do not launch pytest with
+torchrun). It retains the two-/four-GPU runtime cases and adds one four-GPU
+custom-kernel case, without changing runtime backend selection. Only the
+custom case skips missing NVIDIA GPUs, full peer access, or optional FlashInfer;
+the original runtime cases retain their existing requirements.
 
 Correctness compares integer views against NCCL to check every bit. Coverage
 includes both directions, minimal/tail widths, changing shapes and payloads,
