@@ -1,0 +1,140 @@
+# Experimental Lamport packet A2A
+
+`cuda_lamport_a2a` is an opt-in TP4 BF16, intra-node NVLink experiment. It does
+not change model dispatch or replace an existing backend. It exchanges channel
+shards directly between `[M, K]` and `[4*M, K/4]`, including the inverse mapping,
+without a separate pack or output-restoration kernel.
+
+## Protocol
+
+The design follows the direct-push and rotating-scratch ideas of the existing
+TRT-LLM one-shot AllGather/ReduceScatter, but does not copy their sentinel
+protocol. Each aligned 64-bit packet holds 32 payload bits and a 32-bit
+generation. The receiver polls local packets until their generation matches,
+then writes the unmodified payload to its output. Signed zero, infinities,
+subnormals and NaN payloads are preserved. No separate cross-GPU barrier kernel
+is needed; waiting is still present inside the packet-polling loop.
+
+Three scratch generations prevent a fast sender from overwriting a slow
+receiver. Finishing an exchange requires data from every peer, so a sender
+cannot advance three exchanges ahead of a reader. A local CTA-entry counter
+ensures every CTA reads the current generation before it advances. The grid
+must not exceed the SM count. Multiple independent packet reads are pipelined
+for larger messages; one read per thread avoids that overhead for small ones.
+
+CUDA C++ is used for this initial protocol experiment to express the exact
+aligned volatile 64-bit transactions explicitly. FlashInfer provides the
+optional JIT build/FFI utilities, not the A2A algorithm. The implementation is
+independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
+
+## Contract and limits
+
+- Prepare `CudaLamportA2AState(group, max_rows, channels, device, blocks)` on all
+  four peers before capture. This creates symmetric scratch and compiles the
+  kernel. All peers must agree on the physical shape and direction of each call.
+- Inputs are contiguous BF16 matrices; `K` is a positive multiple of eight.
+  Uneven/empty logical owners must be padded to the same positive physical `M`.
+- Serialize this communicator and its consumers on one CUDA stream. The result
+  borrows persistent **local output**, valid until the next call. Inputs must
+  not alias output or communication scratch. Retain the state while graphs
+  reference it; synchronize every rank before releasing it.
+- Eager and CUDA Graph execution use the same kernel and GPU-owned generation.
+  Recreate the communicator before `2^32` calls: generation overflow traps
+  rather than risking acceptance of stale packets. There is no recovery from
+  a missing peer; collective participation is mandatory.
+- Packet storage is twice the payload size; three generations cost `6*S`
+  scratch plus `S` output bytes per GPU, excluding metadata. Payload expansion
+  also increases link traffic. This is a **low-latency**, not a large-message
+  bandwidth optimization. Only four NVLink-connected GB300 GPUs have been
+  measured; no cross-node, other-dtype or full-model claim is made.
+- There is no implicit NCCL fallback. Existing production backends are unchanged.
+
+## Optional large-message chunk exchange
+
+Enable this explicitly on **every peer**, before capturing any graph:
+
+```python
+state.prepare_chunk_exchange(threshold_bytes=8 * 2**20)
+```
+
+The existing `cuda_lamport_a2a(state, inputs, inverse)` entry point then chooses
+packet exchange below the threshold and chunk exchange at/above it. Both use
+the same layout contract and return the same local output buffer. Peers must
+agree on physical shapes, direction and threshold. Chunk exchange additionally
+requires channels divisible by 32. The original packet-only behavior remains
+available by not preparing chunk exchange.
+
+The chunk kernel moves raw payload with 128-bit loads/stores rather than
+doubling each 32-bit payload word with a tag. Each CTA owns a striped portion
+of every peer's payload. Every writing thread executes a system fence, then a
+CTA barrier. Four lanes publish per-peer readiness with system-release stores
+and wait on system-acquire loads; a second CTA barrier precedes vectorized
+local reads/output restoration. Three generations protect scratch reuse.
+This does **not** omit required synchronization or normalize special values.
+
+The selected large-message launch uses 1024 threads/CTA to increase independent
+memory operations. This occupies more GPU resources than the 256-thread packet
+kernel; interaction with concurrent GEMMs has not been benchmarked.
+
+Packet and chunk exchange have **separate scratch and generation counters**.
+Sharing raw chunk payload with packet scratch could make arbitrary data appear
+to be a valid packet tag after a size transition. Preparation adds `3*S`
+payload scratch and `3*4*blocks*8` flag bytes per GPU to the original workspace,
+so combined scratch plus output is approximately `10*S`. No allocation or
+host synchronization is performed by the forward call or graph replay.
+
+The 8 MiB threshold is a measured GB300 tuning point, not a universal optimum.
+Vector-packet experiments did not justify replacing the small-message kernel.
+Correctness tests exercise both directions, repeated transitions between
+packet/chunk sizes, delayed peers, arbitrary payload bits and graph replay.
+
+## Validation and benchmark
+
+From the repository root, with optional CUDA/FlashInfer dependencies installed:
+
+```bash
+torchrun --standalone --nproc-per-node=4 -m pytest -q \
+  tokenspeed-kernel/test/nvidia/ops/test_lamport_a2a.py
+
+torchrun --standalone --nproc-per-node=4 \
+  tokenspeed-kernel/test/nvidia/ops/test_lamport_a2a.py \
+  --rows 1 4 16 32 64 128 --channels 12288 --blocks 32 64 128
+```
+
+Correctness compares integer views against NCCL to check every bit. Coverage
+includes both directions, minimal/tail widths, changing shapes and payloads,
+an empty logical owner, delayed peers, consumers inside captured graphs, ring
+reuse, and crossing the signed-int32 generation boundary.
+
+Benchmark timings exclude startup/JIT. After 20 warmups, each sample times
+10 replays of a graph containing 100 exchanges using CUDA events, takes the
+maximum rank time, and reports the median of five samples. Output restoration
+is included. The benchmark is communication-only: it does not establish a
+projection or model speedup. AG/RS are latency references, not interchangeable
+A2A algorithms; compare their message-size definitions explicitly.
+
+### Measured low-latency behavior
+
+Four GB300 GPUs, BF16, CUDA Graphs, A2A input `[C,12288]`, 128 CTAs:
+
+| C/rank | Logical S/GPU | Ulysses A2A | Packet A2A | TRT-LLM AG | TRT-LLM RS |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 24 KiB | 7.63 µs | 4.01 µs | 3.91 µs | 4.33 µs |
+| 4 | 96 KiB | 8.03 µs | 4.14 µs | 4.12 µs | 4.49 µs |
+| 16 | 384 KiB | 9.74 µs | 4.66 µs | 4.32 µs | 4.64 µs |
+| 32 | 768 KiB | 9.88 µs | 5.64 µs | 5.09 µs | 4.98 µs |
+| 64 | 1.5 MiB | 11.68 µs | 7.52 µs | 6.57 µs | 6.03 µs |
+| 128 | 3 MiB | 14.75 µs | 11.80 µs | 8.94 µs | 8.31 µs |
+
+All backends ran sequentially on the same allocation with the timing protocol
+above. Ulysses uses its borrowed-output adapter, not an extra copy-out. AG/RS
+are unfused one-shot kernels, PDL disabled, hidden width 1536; RS accumulates
+in FP32. `S` means full per-rank input/output for A2A, full output for AG, and
+full input for RS. AG sends `S/4` local input, RS returns `S/4` local output.
+Packet A2A additionally sends its readiness tags; physical wire bytes are not
+equal between these algorithms.
+
+For C1–C16 this reaches the AG/RS latency range and reduces Ulysses latency
+by 47–52%. The C64/C128 reduction is 36%/20%, but those cases **do not match**
+AG/RS latency. Do not extrapolate these communication-only gains to full-model
+latency or large-message bandwidth.
