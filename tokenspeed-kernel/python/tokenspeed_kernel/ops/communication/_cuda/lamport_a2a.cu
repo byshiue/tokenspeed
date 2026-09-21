@@ -110,10 +110,13 @@ __global__ __launch_bounds__(256, 1) void lamport_a2a(
 // Medium messages use more resident warps, avoid staging self-owned words,
 // and poll the three remote owners together. The packet layout and generation
 // contract are identical to lamport_a2a, so shape changes reuse the same rings.
-template <bool Inverse, int Threads, bool Parallel>
+// Compile-time rank removes dynamic peer-array indexing and self-owner tests
+// from the unrolled loops. Every TP4 rank instantiates the same protocol.
+template <bool Inverse, int Threads, bool Parallel, int Rank>
 __global__ __launch_bounds__(Threads, 1) void paired_a2a(
     const uint32_t *input, uint32_t *output, uint64_t **peers,
-    uint32_t *control, int capacity, int rows, int channels, int rank) {
+    uint32_t *control, int capacity, int rows, int channels) {
+  constexpr int rank = Rank;
   __shared__ uint32_t epoch;
   if (threadIdx.x == 0)
     epoch = control[0];
@@ -208,13 +211,29 @@ void exchange(TensorView input, TensorView output, TensorView peers,
   lamport_a2a<INVERSE, PIPELINE><<<blocks, 256, 0, stream>>>(                  \
       in, out, ptrs, ctrl, capacity, rows, channels, rank)
   if (rows * channels * 2 >= (4 << 20) && rows * channels * 2 <= (8 << 20)) {
-    if (inverse) {
-      paired_a2a<true, 1024, true><<<blocks, 1024, 0, stream>>>(
-          in, out, ptrs, ctrl, capacity, rows, channels, rank);
-    } else {
-      paired_a2a<false, 1024, true><<<blocks, 1024, 0, stream>>>(
-          in, out, ptrs, ctrl, capacity, rows, channels, rank);
+#define PAIRED(RANK)                                                           \
+  if (inverse) {                                                               \
+    paired_a2a<true, 1024, true, RANK><<<blocks, 1024, 0, stream>>>(           \
+        in, out, ptrs, ctrl, capacity, rows, channels);                        \
+  } else {                                                                     \
+    paired_a2a<false, 1024, true, RANK><<<blocks, 1024, 0, stream>>>(          \
+        in, out, ptrs, ctrl, capacity, rows, channels);                        \
+  }
+    switch (rank) {
+    case 0:
+      PAIRED(0);
+      break;
+    case 1:
+      PAIRED(1);
+      break;
+    case 2:
+      PAIRED(2);
+      break;
+    case 3:
+      PAIRED(3);
+      break;
     }
+#undef PAIRED
   } else if (rows * channels / 2 <= blocks * 256) {
     if (inverse) {
       LAUNCH(true, 1);

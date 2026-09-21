@@ -227,7 +227,10 @@ def test_lamport_a2a(channels, distributed_group):
     int(os.environ.get("WORLD_SIZE", "1")) != 4,
     reason="requires torchrun --nproc-per-node=4",
 )
-@pytest.mark.parametrize("channels,threshold", [(32, 4096), (12288, 8 * 2**20)])
+@pytest.mark.parametrize(
+    "channels,threshold",
+    [(32, 4096), (12288, 8 * 2**20), (2048, 8 * 2**20 + 1)],
+)
 def test_chunk_and_packet_transitions(
     channels, threshold, distributed_group, monkeypatch
 ):
@@ -242,7 +245,15 @@ def test_chunk_and_packet_transitions(
     monkeypatch.setitem(globals(), "CudaLamportA2AState", prepare)
     run_cases(
         argparse.Namespace(
-            rows=[1, 3, 128, 512, 1, 512, 3], channels=channels, blocks=[128]
+            # Exercise small packets, every rank-specialized medium kernel,
+            # and chunk exchange while reusing one communicator.
+            rows=(
+                [1, 1023, 1024, 2048, 2049, 2048, 1]
+                if channels == 2048
+                else [1, 3, 128, 512, 1, 512, 3]
+            ),
+            channels=channels,
+            blocks=[128],
         ),
         benchmark=False,
     )

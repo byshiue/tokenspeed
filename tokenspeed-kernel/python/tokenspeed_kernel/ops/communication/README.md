@@ -112,6 +112,15 @@ The baseline uses packet at 4 MiB and chunk at 8 MiB. Gains are 12.1% and 6.9%
 in latency, not parity with AllGather. AllGather sizes denote total output;
 A2A sizes denote total input/output. Wire traffic and staging work differ.
 
+The medium kernel additionally specializes each TP4 rank at compile time to
+remove dynamic peer indexing and self-owner branches in its unrolled loops.
+Three interleaved A/B rounds on another four-GB300 allocation measured
+13.01 → 12.78 microseconds at 4 MiB and 22.13 → 21.98 at 8 MiB. This is a small
+1–2% incremental gain, not AllGather parity (10.07 / 16.53 on that allocation).
+Packet format, generation checks, workspace size, and dispatch thresholds are
+unchanged; four rank variants increase compiled code size. GPU tests cover all
+ranks, both directions, and transitions across the packet/chunk boundary.
+
 ## Validation and benchmark
 
 From the repository root, with optional CUDA/FlashInfer dependencies installed:
