@@ -1,4 +1,4 @@
-# Experimental Lamport packet A2A
+# Experimental CUDA Lamport A2A
 
 `cuda_lamport_a2a` is an opt-in TP4 BF16, intra-node NVLink experiment. It does
 not change model dispatch or replace an existing backend. It exchanges channel
@@ -29,6 +29,10 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 
 ## Contract and limits
 
+- The Python entry point lives in `cuda_lamport.py`. Both packet and chunk
+  exchange require **exactly four GPUs per process group on one host**,
+  not necessarily four GPUs in the entire job. Peer indexing and scratch
+  layouts are specialized for four peers; other group sizes are rejected.
 - Prepare `CudaLamportA2AState(group, max_rows, channels, device, blocks)` on all
   four peers before capture. This creates symmetric scratch and compiles the
   kernel. All peers must agree on the physical shape and direction of each call.

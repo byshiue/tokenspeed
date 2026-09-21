@@ -22,6 +22,10 @@
 
 CUDA C++ is used for this protocol prototype to make the system-scoped
 64-bit packet transactions explicit. No model backend is changed.
+
+Both packet and chunk exchange currently require exactly four GPUs per
+process group on one host. Peer indexing and scratch layouts specialize for
+four peers; other group sizes are rejected, with no implicit NCCL fallback.
 """
 
 import socket
@@ -36,6 +40,9 @@ from tokenspeed_kernel.signature import format_signatures
 
 class CudaLamportA2AState:
     """Persistent TP4 scratch, initialized collectively before graph capture.
+
+    The supplied process group must contain exactly four GPUs, irrespective
+    of the total number of GPUs in the job.
 
     All ranks must call in the same order, with equal physical shapes, on one
     serialized stream. Outputs are borrowed until the next call. Empty logical

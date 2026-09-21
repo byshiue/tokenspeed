@@ -520,7 +520,7 @@ def _test_all_to_all_single(rank, world_size, device, group, ref_group, backend)
 def _check_lamport_all_to_all(rank, world_size, device, ref_group):
     # This is a direct kernel check, not a runtime backend registration. The
     # kernel exchanges channel shards; NCCL expects destination-major input.
-    from tokenspeed_kernel.ops.communication.cuda import (
+    from tokenspeed_kernel.ops.communication.cuda_lamport import (
         CudaLamportA2AState,
         cuda_lamport_a2a,
     )
