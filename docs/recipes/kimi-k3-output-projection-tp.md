@@ -105,7 +105,7 @@ warm up both variants, alternate measurement order, and report repeated graph
 timings without a profiler. A standalone projection result is not a full-model
 latency or dataset-accuracy result.
 
-### Experimental fused AllGather and FP8 quantization
+### Default fused AllGather and FP8 quantization
 
 The kernel-level `TrtllmAllGatherQuantState` and
 `trtllm_allgather_fp8_quantize` APIs combine BF16 Lamport AllGather with
@@ -114,9 +114,18 @@ into the FP8 values and MN-major FP32 scales consumed by the prepared GEMM.
 Communication remains BF16. This removes the gathered-BF16 output write/read
 and the separate quantization launch; it does not reduce network traffic.
 
-This prototype is **not selected by the model runtime**. The normal QKV path
-still gathers BF16, then quantizes it. There is no PDL or overlapping scale
-consumer: the next GEMM waits for the fused kernel to complete normally.
+When QKV projection TP is enabled, the runtime selects this fusion by default
+for TP2/TP4, TRT-LLM AllGather, and 1..128 physical tokens per rank. The linear
+layer must have a prepared FlashInfer 128×128 block-FP8 plan with FP32 scales.
+No additional environment variable is needed. This does not enable QKV TP
+itself, change O projection, or quantize the BF16 shared experts.
+
+Larger batches use the existing NCCL gather. TP8/TP16, explicit NCCL AllGather,
+BF16 linears, and incompatible quantization/GEMM plans keep separate gather
+and linear execution. Admission uses the subgroup's maximum physical token
+count, so uneven and empty owners take the same collective path as their peers.
+There is no PDL or overlapping scale consumer: the next GEMM waits for the
+fused kernel to complete normally.
 The existing RMSNorm-fused AllGather is a different operation and is not used.
 
 Create the state collectively before CUDA-graph capture. Pass an explicit
@@ -124,8 +133,10 @@ positive `num_blocks` no larger than the device's SM count. Inputs must be
 contiguous BF16 with a width divisible by 128 and equal physical row counts
 of 1..128 across the subgroup. Empty owners participate with zero padding.
 Calls sharing a state must be serialized, and returned buffers are borrowed
-until the next fused call. The state retains the ordinary BF16 output buffer
-for reference testing, so this prototype does not yet reduce allocated scratch.
+until the next fused call. The runtime uses one CTA per SM and allocates this
+state during communication setup, before memory budgeting and graph capture.
+The state retains the ordinary BF16 output buffer for fallback plans and
+reference testing; the optimization does not reduce allocated scratch.
 
 Quantization matches the active prepared-scale path, including the native
 TRT-LLM small-value clamp for aligned rows and the existing Triton padding
@@ -143,8 +154,20 @@ python -m pytest -q \
 It covers eager calls, repeated graph replay with changing inputs, batch-size
 changes, signed zeros, tiny/large finite values, padded/empty owners, subgroup
 isolation, and interchange with ordinary AllGather on the same workspace.
+The real-weight QKV validator above also checks the runtime default against
+the unfused route exactly, including C32/C64/C128, the 128/129-row boundary,
+BF16 and NCCL fallbacks, retained outputs, and changing-input graph replay.
 
 ### Full-model validation
+
+Use one shared Python environment for compatible worktrees. Mount the main
+checkout at the same absolute path on every node, activate its `.venv`, and
+select the worktree's source with `PYTHONPATH`. Repeat the mounts on every
+container invocation, including invocations that reuse a named container;
+otherwise the same path can refer to container-local storage. Do not create
+per-experiment environments or restore obsolete dependency overlays. Record
+the container, resolved packages, source commit and native-extension build
+identity together. A source rebase can require rebuilding native extensions.
 
 For DEP16 with FlashInfer MoE transport, place all 16 GPUs within one compatible
 NVLink fabric, not merely each projection TP4 subgroup. Reserve the nodes with
@@ -194,3 +217,37 @@ a serving smoke test is not a dataset-accuracy result.
 Before increasing to C128/rank, confirm cache admission and actual active counts.
 If the full model does not fit, report the memory limit rather than silently
 substituting a reduced-layer model.
+
+#### Combined QKV, O-projection and shared-expert C128 profile
+
+To profile the combined optimization, also set
+`TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4`. Keep both projection TP sizes at
+`4`, select `TOKENSPEED_O_PROJ_A2A_BACKEND=cuda_lamport` and
+`TOKENSPEED_O_PROJ_RS_BACKEND=trtllm_lamport`, and retain DEP16 attention/cache
+and routed-expert ownership. This is a different configuration from the
+projection-only comparison above; label it accordingly.
+
+C128 **per rank** means 2048 concurrent requests across 16 ranks. Set
+`--max-num-seqs 2048`, `--max-cudagraph-capture-size 128`, and include `128`
+in `--cudagraph-capture-sizes`. Use fixed request-to-rank affinity. These limits
+alone do not prove full occupancy: verify 128 active decode requests on every
+rank during capture, without prefill or graph-padding rows replacing requests.
+
+For an explicitly approved 48-layer capacity experiment, retain real checkpoint
+weights and override both `num_hidden_layers` and the attention-layer lists:
+full-attention layers are 4, 8, ..., 48 (one-based), and the remaining layers
+are KDA. Do not leave attention indices for omitted layers in the override.
+Label all reports as **48-layer real-weight**, not full-model results. Without
+that explicit approval, use the full checkpoint.
+
+Warm up prefill and decode before capturing. For an agentic workload, prime a
+1024-token prefix, then submit a 1280-token input reusing that prefix and ask
+for 512 output tokens. Wait until all 2048 requests have emitted a token and
+none have completed before starting a short 20-step decode capture. Retain
+the input IDs and cache-hit counts. Use one NSYS launcher per node with
+`--trace=cuda-sw,nvtx --cuda-graph-trace=node --sample=none --cpuctxsw=none`
+and CUDA-profiler-API capture boundaries. Enable runtime NVTX annotations.
+Confirm the captured steps are decode-only on all 16 GPUs, and inspect the
+QKV/O-projection and auxiliary-stream shared-expert collectives. Save clearly
+named per-node `.nsys-rep` files and package them together. Profiled timings
+are diagnostic; measure performance separately without the profiler.

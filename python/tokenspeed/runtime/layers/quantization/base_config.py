@@ -215,7 +215,7 @@ class LinearMethodBase(QuantizeMethodBase):
         return self.apply(layer, activation(x), bias)
 
     def prepared_linear_plan(self, layer: nn.Module) -> object | None:
-        """Return an opaque backend warmup plan, if this layer prepared one."""
+        """Return an opaque backend execution/warmup plan, if one was prepared."""
         return None
 
 
