@@ -372,6 +372,7 @@ def fp8_linear(
     input_scales: torch.Tensor | None = None,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
+    out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Execute a block-FP8 linear operation through a prepared plan.
 
@@ -384,6 +385,7 @@ def fp8_linear(
         input_scales: Optional pre-quantized activation block scales.
         bias: Optional output bias.
         out_dtype: Requested output dtype.
+        out: Optional destination for the result, or None to allocate it.
     Returns:
         The linear output matrix ``[M, N]``.
     """
@@ -413,6 +415,7 @@ def fp8_linear(
         block_size=list(typed_plan.block_size),
         override=override,
         prepacked_scales=prepacked_scales,
+        out=out,
     )
 
 
