@@ -1034,7 +1034,16 @@ setup(
         "tokenspeed_kernel.ops.communication": ["_cuda/*.cu", "README.md"],
         # Pre-swept flashinfer MoE tactic tables (see ops/tuning.py).
         "tokenspeed_kernel.ops.moe.flashinfer": ["tactics/*.json"],
-        "tokenspeed_kernel.thirdparty.cuda": ["objs/**/*.so"],
+        "tokenspeed_kernel.thirdparty.cuda": [
+            "objs/**/*.so",
+            # Vendored Lamport protocol and FFI headers for the optional JIT extension.
+            "csrc/tvm_ffi_utils.h",
+            "csrc/include/**/*.h",
+            "csrc/include/**/*.cuh",
+        ],
+        "tokenspeed_kernel.thirdparty.flashinfer": [
+            "allgather_quant.cu",
+        ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.
         "tokenspeed_kernel.thirdparty.msa": [
