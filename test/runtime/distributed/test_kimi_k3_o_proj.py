@@ -54,7 +54,7 @@ RS_ENV_NAME = envs.TOKENSPEED_O_PROJ_RS_BACKEND.name
 def test_projection_mapping_and_validation(monkeypatch):
     for field, expected in (
         (envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE, "1"),
-        (envs.TOKENSPEED_O_PROJ_A2A_BACKEND, "flashinfer"),
+        (envs.TOKENSPEED_O_PROJ_A2A_BACKEND, "cuda_lamport"),
         (envs.TOKENSPEED_O_PROJ_RS_BACKEND, "triton_peer"),
     ):
         monkeypatch.delenv(field.name, raising=False)
@@ -92,7 +92,7 @@ def test_projection_mapping_and_validation(monkeypatch):
     for name, valid, invalid in (
         (
             A2A_ENV_NAME,
-            ("nccl", "auto", "flashinfer"),
+            ("nccl", "auto", "flashinfer", "cuda_lamport"),
             ("", "invalid", "NVLINK", "flashinfer_quantized"),
         ),
         (
@@ -147,7 +147,7 @@ def test_a2a_policy_and_lifecycle(monkeypatch):
     monkeypatch.setenv(A2A_ENV_NAME, "nccl")
     workspace = ProjectionWorkspace(512, 256, torch.bfloat16, torch.device("cpu"))
     parallel = projection_mapping(0, 4, 4)
-    workspace.initialize_a2a(parallel, 256, backend="nccl")
+    workspace.initialize_a2a(parallel, [256], backend="nccl")
     assert workspace.a2a is None
     assert not workspace.use_flashinfer(parallel, [16] * 4, 256)
     closed = []
@@ -204,6 +204,32 @@ def test_bf16_dispatch_across_peer_envelope(monkeypatch):
         inputs = torch.empty(rows, 512, dtype=torch.bfloat16)
         assert exchange.forward(inputs, linear, [rows] * 4).shape == (rows, 128)
     assert calls == [("bf16", rows) for rows in range(1, 65)]
+    # Lamport A2A protects its own ring, not the peer-reduction GEMM buffer.
+    # Uneven owners still use it, but must keep the explicit reuse fence.
+    calls.clear()
+    workspace.a2a = None
+    workspace.lamport_a2a_states[512] = SimpleNamespace(max_rows=64)
+    workspace.peer_states[128].handle = SimpleNamespace(
+        barrier=lambda channel: calls.append(("reuse_fence", channel))
+    )
+
+    def lamport_exchange(state, inputs, inverse):
+        assert not inverse and inputs.shape == (16, 512)
+        assert torch.count_nonzero(inputs[7:]) == 0
+        calls.append(("lamport", inputs.shape[0]))
+        return inputs
+
+    monkeypatch.setattr(projection_ops, "cuda_lamport_a2a", lamport_exchange)
+    monkeypatch.setattr(
+        projection_ops,
+        "triton_projection_reduce_scatter",
+        lambda peer, partial, rows: (
+            calls.append(("fenced_reduce", rows)) or partial[:rows]
+        ),
+    )
+    inputs = torch.ones(7, 512, dtype=torch.bfloat16)
+    assert exchange.forward(inputs, linear, [7, 16, 0, 1]).shape == (7, 128)
+    assert calls == [("lamport", 16), ("reuse_fence", 1), ("fenced_reduce", 16)]
     ordinary_mapping = Mapping(rank=0, world_size=4)
     linear, wrapper = projection_ops.make_output_projection(
         parallel=parallel,
@@ -332,6 +358,30 @@ def test_optional_a2a_import_and_topology_fallback(monkeypatch):
     fake = SimpleNamespace(UlyssesCommunicator=lambda **kwargs: fallback)
     comm, reason = create_projection_a2a(**kwargs, backend="auto")
     assert comm is None and reason == "no NVLink" and closed == [True]
+
+    # Unsupported Lamport topology selects NCCL without trying to JIT or
+    # allocate IPC buffers. An admitted topology must not swallow failures.
+    assert (
+        projection_ops.prepare_lamport_projection_a2a(
+            SimpleNamespace(size=lambda: 2),
+            128,
+            256,
+            torch.bfloat16,
+            torch.device("cpu"),
+        )
+        is None
+    )
+
+    def separate_hosts(values, value, group):
+        values[:] = ["host-a", "host-a", "host-b", "host-b"]
+
+    monkeypatch.setattr(dist, "all_gather_object", separate_hosts)
+    assert (
+        projection_ops.prepare_lamport_projection_a2a(
+            group, 128, 256, torch.bfloat16, torch.device("cpu")
+        )
+        is None
+    )
 
 
 def test_disabled_projection_and_shard_loader(monkeypatch):
