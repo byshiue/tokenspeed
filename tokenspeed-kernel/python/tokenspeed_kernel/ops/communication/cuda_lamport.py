@@ -20,8 +20,8 @@
 
 """Experimental bit-preserving, intra-node Lamport packet A2A.
 
-CUDA C++ is used for this protocol prototype to make the system-scoped
-64-bit packet transactions explicit. No model backend is changed.
+CUDA C++ expresses the system-scoped 64-bit packet transactions explicitly.
+Projection callers own topology admission, padding and NCCL fallback.
 
 Both packet and chunk exchange currently require exactly four GPUs per
 process group on one host. Peer indexing and scratch layouts specialize for

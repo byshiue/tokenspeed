@@ -3214,7 +3214,7 @@ class KimiLinearModel(nn.Module):
         validate_projection_settings(
             mapping,
             envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE.get(),
-            "flashinfer",
+            envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
             "nccl",
         )
         input_parallel = _projection_mapping(
@@ -3574,7 +3574,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 )
                 workspace.initialize_a2a(
                     exchanges[0].parallel,
-                    max_input_size,
+                    [exchange.input_size for exchange in exchanges],
                     backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
                 )
                 workspace.initialize_reduce_scatter(
@@ -3631,7 +3631,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                         torch.bfloat16,
                         linear.weight.device,
                         "trtllm",
-                        "flashinfer",
+                        envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
                     )
                 if name == "input_projection_exchange":
                     attention.input_projection_exchange = column_exchanges[key]
