@@ -22,15 +22,22 @@
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel import (
+    fp8_linear_accepts_prepacked_input,
+    fp8_linear_prepacked,
+)
 from tokenspeed_kernel.ops.communication.cuda_lamport import cuda_lamport_a2a
 from tokenspeed_kernel.ops.communication.flashinfer import (
     create_projection_a2a,
     flashinfer_projection_gather_channels,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
+    TrtllmAllGatherQuantState,
     TrtllmAllGatherState,
     trtllm_allgather,
+    trtllm_allgather_fp8_quantize,
 )
+from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_fp8_blockscale
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single, all_to_all_single
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
@@ -65,6 +72,8 @@ class DistributedColumnProjection:
 
     Construct collectively before capture/cache budgeting. Calls and consumers
     must be serialized on one stream; close only after referencing graphs die.
+    Compatible TP2/TP4 FP8 linears fuse gather and activation quantization by
+    default. Other plans and larger row counts retain gather followed by Linear.
     """
 
     def __init__(
@@ -109,11 +118,23 @@ class DistributedColumnProjection:
             max_tokens * padded_output_size, dtype=dtype, device=device
         )
         group = pg_manager.get_process_group("nccl", parallel.tp_group)
-        self.gather_state = (
-            TrtllmAllGatherState(group, min(max_tokens, 128), input_size, device, True)
-            if allgather_backend == "trtllm"
-            else None
-        )
+        self.gather_state = None
+        if allgather_backend == "trtllm":
+            # Fused gather/quantization has TP2/TP4 numerical coverage. Its
+            # inherited BF16 gather shares the IPC ring for other linear plans;
+            # larger groups retain the ordinary gather until validated.
+            if parallel.tp_size in (2, 4) and has_flashinfer_fp8_blockscale():
+                self.gather_state = TrtllmAllGatherQuantState(
+                    group,
+                    min(max_tokens, 128),
+                    input_size,
+                    device,
+                    torch.cuda.get_device_properties(device).multi_processor_count,
+                )
+            else:
+                self.gather_state = TrtllmAllGatherState(
+                    group, min(max_tokens, 128), input_size, device, True
+                )
         self.a2a = None
         self.lamport_a2a = None
         if a2a_backend == "cuda_lamport":
@@ -129,14 +150,18 @@ class DistributedColumnProjection:
                 backend=a2a_backend,
             )
 
+    def _padded_inputs(self, inputs: torch.Tensor, rows: int) -> torch.Tensor:
+        """Use identical owner padding for BF16 and fused-quantized gathers."""
+        if inputs.shape[0] == rows and inputs.is_contiguous():
+            return inputs
+        send = self.send[:rows]
+        send.zero_()
+        send[: inputs.shape[0]].copy_(inputs)
+        return send
+
     def gather_inputs(self, inputs: torch.Tensor, rows: int) -> torch.Tensor:
         """Gather equal padded rank-major token blocks; return borrowed storage."""
-        if inputs.shape[0] == rows and inputs.is_contiguous():
-            send = inputs
-        else:
-            send = self.send[:rows]
-            send.zero_()
-            send[: inputs.shape[0]].copy_(inputs)
+        send = self._padded_inputs(inputs, rows)
         if self.gather_state is not None and rows <= self.gather_state.max_rows:
             return trtllm_allgather(self.gather_state, send)
         gathered = self.gathered[: self.parallel.tp_size * rows]
@@ -200,8 +225,24 @@ class DistributedColumnProjection:
             return inputs.new_empty((0, self.output_size))
         if rows > self.max_tokens:
             raise ValueError("Column projection exceeds prepared row capacity")
-        gathered = self.gather_inputs(inputs, rows)
-        local, _ = linear(gathered)
+        plan = linear.quant_method.prepared_linear_plan(linear)
+        num_tokens = self.parallel.tp_size * rows
+        if (
+            isinstance(self.gather_state, TrtllmAllGatherQuantState)
+            and rows <= self.gather_state.max_rows
+            and fp8_linear_accepts_prepacked_input(plan, num_tokens)
+        ):
+            # Preserve the layer's prepared GEMM/scale contract. Unsupported
+            # plans (including BF16, MXFP8 and other GEMM backends) stay below.
+            values, scales = trtllm_allgather_fp8_quantize(
+                self.gather_state, self._padded_inputs(inputs, rows)
+            )
+            local = fp8_linear_prepacked(
+                plan, values, linear.weight, scales, num_tokens, inputs.dtype
+            )
+        else:
+            gathered = self.gather_inputs(inputs, rows)
+            local, _ = linear(gathered)
         output = self.restore_outputs(local.contiguous(), rows)
         return output[: inputs.shape[0], : self.output_size]
 

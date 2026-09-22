@@ -16,14 +16,20 @@ On Slurm, reserve a persistent allocation first, using your account, partition,
 and fabric-placement constraints. For a four-GPU-per-node deployment:
 
 ```bash
-salloc --account ACCOUNT --partition PARTITION --nodes 4 --exclusive \
+salloc --no-shell --account ACCOUNT --partition PARTITION --nodes 4 --exclusive \
   --ntasks-per-node 1 --gpus-per-node 4 --time 02:00:00
 ```
 
-Run the serving command through your site's `submit` wrapper or `srun` inside
-that allocation, with the same container, checkpoint mounts, and environment
+Run the serving command through your site's `submit` wrapper or `srun --jobid JOB_ID`
+in that allocation, with the same container, checkpoint mounts, and environment
 on all nodes. Use one serving launcher per node and four workers per launcher.
 Replace `HEAD_NODE` with the allocated head node, not localhost.
+Use a shared `.venv` mounted at the same absolute path on all nodes instead of
+creating a new environment for each experiment. Repeat explicit mounts when
+reusing named containers. See the
+[combined projection/shared-expert profiling recipe](kimi-k3-output-projection-tp.md#combined-qkv-o-projection-and-shared-expert-c128-profile)
+for C128/rank with all three components sharded; the baseline below isolates
+shared-expert sharding.
 
 ```bash
 export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4

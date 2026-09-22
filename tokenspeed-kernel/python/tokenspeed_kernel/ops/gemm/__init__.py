@@ -95,6 +95,8 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "fp8_linear_accepts_prepacked_input",
+    "fp8_linear_prepacked",
     "quantize_fp8_group32_for_linear",
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "linear_attnres_partials",
@@ -417,6 +419,69 @@ def fp8_linear(
         prepacked_scales=prepacked_scales,
         out=out,
     )
+
+
+def fp8_linear_accepts_prepacked_input(plan: object | None, num_tokens: int) -> bool:
+    """Whether a plan accepts FP8 values with MN-major FP32 activation scales.
+
+    Args:
+        plan: Opaque prepared linear plan, or None for an unprepared layer.
+        num_tokens: Logical input row count, before four-row padding.
+
+    Returns:
+        True only for the same prepared-scale route used by online quantization.
+        Producers must check this before replacing their ordinary BF16 output.
+    """
+    if plan is None:
+        return False
+    typed_plan = _require_fp8_linear_plan(plan)
+    return (
+        typed_plan.prepacked_scales
+        and num_tokens > 0
+        and use_flashinfer_fp8_blockscale_prepacked(num_tokens)
+    )
+
+
+def fp8_linear_prepacked(
+    plan: object,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    input_scales: torch.Tensor,
+    num_tokens: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Consume an external quantizer's output without quantizing or packing again.
+
+    Args:
+        plan: Compatible plan from ``prepare_fp8_linear``; owns weight scales.
+        x: FP8 values shaped ``[round_up(num_tokens,4),K]``.
+        weight: The plan's FP8 weight matrix ``[N,K]``.
+        input_scales: Contiguous FP32 MN-major scales ``[K/128,x.shape[0]]``.
+        num_tokens: Logical input row count, excluding quantizer padding.
+        out_dtype: Requested output dtype.
+
+    Returns:
+        Owned ``[num_tokens,N]`` output, with padded rows removed. Unsupported
+        plans fail rather than interpreting MN-major scales as canonical scales.
+    """
+    if not fp8_linear_accepts_prepacked_input(plan, num_tokens):
+        raise ValueError("FP8 linear plan does not accept prepacked input")
+    if x.dtype != torch.float8_e4m3fn or x.shape[0] != (num_tokens + 3) // 4 * 4:
+        raise ValueError("Prepacked FP8 input must have four-row padding")
+    typed_plan = _require_fp8_linear_plan(plan)
+    return mm(
+        x,
+        weight,
+        A_scales=input_scales,
+        B_scales=typed_plan.prepared_weight_scales,
+        bias=None,
+        out_dtype=out_dtype,
+        quant="mxfp8",
+        block_size=list(typed_plan.block_size),
+        override=typed_plan.override,
+        prepacked_scales=True,
+        out=None,
+    )[:num_tokens]
 
 
 def _fp8_linear_activation(

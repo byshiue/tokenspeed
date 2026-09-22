@@ -1436,7 +1436,7 @@ if current_platform().is_nvidia:
             cudart.cudaFree(c_void_p(self.control_ptr))
 
     class TrtllmAllGatherQuantState(TrtllmAllGatherState):
-        """Experimental fused BF16 gather and 1x128 FP8 quantization scratch.
+        """Fused BF16 gather and 1x128 FP8 quantization scratch.
 
         Construct collectively before capture. ``max_rows`` is the per-rank
         capacity (1..128), ``hidden`` is a multiple of 128, and ``num_blocks``
