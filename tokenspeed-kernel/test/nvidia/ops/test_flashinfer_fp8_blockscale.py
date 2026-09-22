@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel import fp8_linear, mm, prepare_fp8_linear
+from tokenspeed_kernel import (
+    fp8_linear,
+    fp8_linear_accepts_prepacked_input,
+    fp8_linear_prepacked,
+    mm,
+    prepare_fp8_linear,
+)
 from tokenspeed_kernel.ops.gemm.flashinfer import (
     gemm_fp8_nt_groupwise,
     has_flashinfer_fp8_blockscale,
@@ -167,7 +173,7 @@ def test_prepacked_selection_threshold(num_tokens: int, expected: bool) -> None:
     assert use_flashinfer_fp8_blockscale_prepacked(num_tokens) is expected
 
 
-@pytest.mark.parametrize("m", [1, 4, 8, 64])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 64, 128, 256, 512])
 def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
     torch.manual_seed(3)
     n, k = 256, 512
@@ -193,6 +199,12 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         prepacked_scales=True,
     )
     torch.testing.assert_close(planned, prepacked, atol=0, rtol=0)
+    # External producers (such as fused AllGather) must use the same prepared
+    # weight scales and strip quantizer padding without requantizing the input.
+    assert fp8_linear_accepts_prepacked_input(plan, m)
+    values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
+    external = fp8_linear_prepacked(plan, values, weight, scales, m, torch.bfloat16)
+    torch.testing.assert_close(external, planned, atol=0, rtol=0)
     # Caller-owned communication buffers and ordinary/strided destinations
     # must preserve the prepared quantizer, including its padded-M fallback.
     for stride in (1, 2):
@@ -220,6 +232,10 @@ def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> No
     )
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    assert not fp8_linear_accepts_prepacked_input(plan, m)
+    values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
+    with pytest.raises(ValueError, match="does not accept prepacked input"):
+        fp8_linear_prepacked(plan, values, weight, scales, m, torch.bfloat16)
     planned = fp8_linear(
         plan, x, weight, weight_scales, out_dtype=torch.bfloat16, out=None
     )

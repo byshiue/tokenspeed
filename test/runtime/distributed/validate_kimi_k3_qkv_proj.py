@@ -30,10 +30,12 @@ import os
 from pathlib import Path
 from test.runtime.distributed.kimi_k3_o_proj_helpers import dep_mapping
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
+from tokenspeed_kernel.ops.communication.trtllm import trtllm_allgather_fp8_quantize
 
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -179,6 +181,9 @@ def main():
         ).repeat_interleave(128, 1)
         patterns = (
             [args.rows] * world,
+            [32] * world,
+            [64] * world,
+            [128] * world,
             [129] * world,
             [512] * world,
             [513 if r % 4 == 0 else 0 for r in range(world)],
@@ -194,7 +199,23 @@ def main():
                 generator=torch.Generator(device="cuda").manual_seed(1000 + rank),
             )
             expected = baseline(x)[0] if x.shape[0] else x.new_empty((0, total))
-            actual = communication.forward(x, linear, counts)
+            with patch(
+                "tokenspeed.runtime.layers.attention.column_proj.trtllm_allgather_fp8_quantize",
+                wraps=trtllm_allgather_fp8_quantize,
+            ) as fused_gather:
+                actual = communication.forward(x, linear, counts)
+                rows = max(counts[r] for r in parallel.tp_group)
+                assert fused_gather.call_count == int(0 < rows <= 128)
+            if rows:
+                # Compare with the old production route, not just another call
+                # to the new default. This also alternates both consumers of
+                # the same Lamport ring, including the 128/129-row boundary.
+                gathered = communication.gather_inputs(x, rows)
+                partial, _ = linear(gathered)
+                unfused = communication.restore_outputs(partial.contiguous(), rows)
+                torch.testing.assert_close(
+                    actual, unfused[: x.shape[0]], rtol=0, atol=0
+                )
             if label == "KDA_QKV_gates":
                 # Exercise the model's real split/dispatch, including empty
                 # owners. The backend must still see every local attention head.
@@ -287,7 +308,54 @@ def main():
                 torch.testing.assert_close(actual, eager, rtol=0, atol=0)
         torch.cuda.synchronize()
         del graph, retained
+        # BF16 plans retain the ordinary gather, even with fused scratch present.
+        with torch.device("cuda"):
+            bf16_linear = ColumnParallelLinear(
+                weight.shape[1],
+                total,
+                bias=False,
+                gather_output=False,
+                quant_config=None,
+                prefix="self_attn.qkv_proj",
+                tp_rank=parallel.tp_rank,
+                tp_size=parallel.tp_size,
+                tp_group=parallel.tp_group,
+            )
+        bf16_linear.weight.data.copy_(reference_weight[start : start + shard])
+        counts = [0 if r % 4 == 0 else 3 for r in range(world)]
+        x = torch.randn(counts[rank], weight.shape[1], device="cuda")
+        with patch(
+            "tokenspeed.runtime.layers.attention.column_proj.trtllm_allgather_fp8_quantize",
+            side_effect=AssertionError("BF16 must not use FP8 gather"),
+        ):
+            actual = communication.forward(x, bf16_linear, counts)
+        partial, _ = bf16_linear(communication.gather_inputs(x, 3))
+        expected = communication.restore_outputs(partial.contiguous(), 3)
+        torch.testing.assert_close(actual, expected[: x.shape[0]], rtol=0, atol=0)
+        del bf16_linear
         communication.close()
+        # An explicit NCCL gather does not enter the fused route.
+        nccl_communication = DistributedColumnProjection(
+            parallel,
+            weight.shape[1],
+            total,
+            total,
+            3,
+            torch.bfloat16,
+            torch.device("cuda"),
+            "nccl",
+            "nccl",
+        )
+        with patch(
+            "tokenspeed.runtime.layers.attention.column_proj.trtllm_allgather_fp8_quantize",
+            side_effect=AssertionError("NCCL must not use fused gather"),
+        ):
+            actual = nccl_communication.forward(x, linear, counts)
+        partial, _ = linear(nccl_communication.gather_inputs(x, 3))
+        expected = nccl_communication.restore_outputs(partial.contiguous(), 3)
+        torch.testing.assert_close(actual, expected[: x.shape[0]], rtol=0, atol=0)
+        nccl_communication.close()
+        del nccl_communication
         del communication, linear, baseline, reference_weight
     dist.barrier()
     if rank == 0:
