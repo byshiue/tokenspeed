@@ -28,10 +28,15 @@ must outlive all captured graphs that reference them.
 """
 
 import logging
+import socket
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.cuda_lamport import (
+    CudaLamportA2AState,
+    cuda_lamport_a2a,
+)
 from tokenspeed_kernel.ops.communication.flashinfer import (
     create_projection_a2a,
     flashinfer_projection_a2a,
@@ -69,6 +74,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 FLASHINFER_MAX_TOKENS = 512
+CUDA_LAMPORT_MAX_TOKENS = 512
 PEER_MAX_TOKENS = 8192
 LAMPORT_MAX_TOKENS = 128
 
@@ -112,7 +118,7 @@ def validate_projection_settings(
             raise ValueError(
                 f"Projection TP/A2A/RS settings differ across ranks: {values}"
             )
-    if a2a_value not in ("nccl", "auto", "flashinfer"):
+    if a2a_value not in ("nccl", "auto", "flashinfer", "cuda_lamport"):
         raise ValueError(f"Invalid output projection A2A backend: {a2a_value}")
     if rs_value not in ("nccl", "triton_peer", "trtllm_lamport"):
         raise ValueError(
@@ -138,6 +144,33 @@ def initialize_projection_group(parallel: DenseLayerMapping) -> None:
         reduce_scatter(received, parallel.tp_group, backend=None)
 
 
+def prepare_lamport_projection_a2a(group, max_tokens, channels, dtype, device):
+    """Prepare the upstream TP4 BF16 exchange, or select NCCL for other topologies.
+
+    Shape-specific state owns packet/chunk rings and local output. Bound rows
+    to keep startup memory predictable; larger calls use the existing NCCL path.
+    Initialization failures on a supported topology remain fatal on every rank.
+    """
+    if group.size() != 4 or dtype != torch.bfloat16 or channels % 8:
+        return None
+    hosts = [None] * group.size()
+    dist.all_gather_object(hosts, socket.gethostname(), group=group)
+    if len(set(hosts)) != 1:
+        return None
+    state = CudaLamportA2AState(
+        group,
+        min(max_tokens, CUDA_LAMPORT_MAX_TOKENS),
+        channels,
+        device,
+        min(128, torch.cuda.get_device_properties(device).multi_processor_count),
+    )
+    if channels % 32 == 0:
+        # Exactly 8 MiB retains packet exchange; larger messages avoid its
+        # doubled link traffic using the upstream vectorized chunk protocol.
+        state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
+    return state
+
+
 class ProjectionWorkspace:
     """Reusable exchange scratch, shared by sequential attention layers."""
 
@@ -154,6 +187,7 @@ class ProjectionWorkspace:
         self.recv = torch.empty_like(self.send)
         self.a2a = None
         self.a2a_reason = None
+        self.lamport_a2a_states = {}
         self._a2a_initialized = False
         self.peer_states = {}
         self.lamport_states = {}
@@ -253,7 +287,7 @@ class ProjectionWorkspace:
         return reduce_scatter(partial, parallel.tp_group, backend=None)
 
     def initialize_a2a(
-        self, parallel: DenseLayerMapping, max_input_size: int, backend: str
+        self, parallel: DenseLayerMapping, input_sizes: list[int], backend: str
     ) -> None:
         """Collectively prepare optional IPC/JIT resources before graph capture.
 
@@ -262,12 +296,26 @@ class ProjectionWorkspace:
         """
         if self._a2a_initialized:
             return
-        if backend not in ("nccl", "auto", "flashinfer"):
+        if backend not in ("nccl", "auto", "flashinfer", "cuda_lamport"):
             raise ValueError("Invalid projection A2A backend")
-        if backend != "nccl":
+        if backend == "cuda_lamport":
+            group = pg_manager.get_process_group("nccl", parallel.tp_group)
+            for width in sorted(set(input_sizes)):
+                state = prepare_lamport_projection_a2a(
+                    group, self.max_tokens, width, self.send.dtype, self.send.device
+                )
+                if state is not None:
+                    self.lamport_a2a_states[width] = state
+            logger.info(
+                f"Projection A2A: cuda_lamport for widths {sorted(self.lamport_a2a_states)}, "
+                f"up to {min(self.max_tokens, CUDA_LAMPORT_MAX_TOKENS)} rows/rank; "
+                "NCCL for other shapes/topologies"
+            )
+        elif backend != "nccl":
             self.a2a, self.a2a_reason = create_projection_a2a(
                 group=pg_manager.get_process_group("nccl", parallel.tp_group),
-                max_elems=min(self.max_tokens, FLASHINFER_MAX_TOKENS) * max_input_size,
+                max_elems=min(self.max_tokens, FLASHINFER_MAX_TOKENS)
+                * max(input_sizes),
                 dtype=self.send.dtype,
                 device=self.send.device,
                 backend=backend,
@@ -277,6 +325,11 @@ class ProjectionWorkspace:
                 f"({self.a2a_reason or 'NVLink'})"
             )
         self._a2a_initialized = True
+
+    def lamport_a2a_state(self, input_size: int, rows: int):
+        """Select by subgroup physical capacity, including uneven/empty owners."""
+        state = self.lamport_a2a_states.get(input_size)
+        return state if state is not None and 0 < rows <= state.max_rows else None
 
     def use_flashinfer(
         self, parallel: DenseLayerMapping, counts: list[int], input_size: int
@@ -292,6 +345,10 @@ class ProjectionWorkspace:
 
     def close(self) -> None:
         """Collectively release IPC resources after all referencing graphs die."""
+        if self.lamport_a2a_states:
+            torch.cuda.synchronize(self.send.device)
+            dist.barrier(group=next(iter(self.lamport_a2a_states.values())).group)
+        self.lamport_a2a_states.clear()
         for state in self.lamport_states.values():
             state.close()
         self.lamport_states.clear()
@@ -361,9 +418,18 @@ class DistributedOutputProjection:
         # One row already has rank-major byte order. Other shapes fuse the
         # transpose and padding, preserving the original BF16/FP16 values.
         fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
+        lamport_a2a = workspace.lamport_a2a_state(self.input_size, max_tokens)
         peer = workspace.peer_state(linear.output_size, max_tokens)
         lamport = workspace.lamport_state(linear.output_size, max_tokens)
-        if (peer is not None or lamport is not None) and fused_a2a:
+        if lamport_a2a is not None:
+            if inputs.shape[0] == max_tokens and inputs.is_contiguous():
+                padded = inputs
+            else:
+                padded = workspace.send[:elements].view(max_tokens, self.input_size)
+                padded.zero_()
+                padded[: inputs.shape[0]].copy_(inputs)
+            recv = cuda_lamport_a2a(lamport_a2a, padded, inverse=False)
+        elif (peer is not None or lamport is not None) and fused_a2a:
             recv = flashinfer_projection_a2a_borrowed(
                 workspace.borrowed_a2a, inputs.contiguous()
             )
@@ -382,7 +448,7 @@ class DistributedOutputProjection:
         elif peer is not None:
             if not fused_a2a:
                 # A preceding FI reduction may have deferred its reuse fence.
-                # NCCL A2A is not that fence: protect direct GEMM writes here,
+                # NCCL/Lamport A2A is not that fence: protect GEMM writes here,
                 # including transitions through empty or NCCL-only batches.
                 peer.handle.barrier(channel=1)
             partial, _ = linear.forward_into(recv, None, peer.input_buffer(max_tokens))

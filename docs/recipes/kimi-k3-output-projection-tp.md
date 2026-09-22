@@ -8,7 +8,7 @@ Keep shared-expert TP disabled when measuring this feature independently.
 export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=1
 export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=4
 export TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE=4
-export TOKENSPEED_O_PROJ_A2A_BACKEND=flashinfer
+export TOKENSPEED_O_PROJ_A2A_BACKEND=cuda_lamport
 export TOKENSPEED_O_PROJ_RS_BACKEND=triton_peer
 ```
 
@@ -36,7 +36,9 @@ Each subgroup must be CUDA-IPC/NVLink accessible. Startup agrees settings across
 ranks before creating groups; unsupported checkpoint formats fail explicitly.
 
 QKV gathers use TRT-LLM one-shot through 128 physical rows/rank, then NCCL.
-Its inverse FlashInfer A2A handles up to 512 physical rows/rank, then NCCL.
+Both QKV and O projection now default to CUDA Lamport A2A through 512 physical
+rows/rank, then NCCL. Despite its historical `O_PROJ` name,
+`TOKENSPEED_O_PROJ_A2A_BACKEND` selects A2A for both projections.
 Uneven and empty owners participate with padding to their subgroup's maximum
 physical count; only wholly empty subgroups skip communication. CUDA graph
 padding counts, not live request counts, determine collective sizes.
@@ -45,12 +47,32 @@ budgeting/capture, separate from O-proj and auxiliary-stream MoE buffers.
 
 Backend alternatives:
 
-- A2A: `nccl` or `flashinfer`. FlashInfer requires compatible NVLink peers,
+- A2A: `cuda_lamport` (default), `nccl`, `flashinfer`, or `auto` (optional
+  FlashInfer with topology/dependency fallback). CUDA Lamport requires TP4,
+  BF16 activations and four NVLink-connected GPUs on one host. Unsupported
+  group sizes, cross-host groups and batches above 512 rows/rank use NCCL.
+  Initialization failures within the supported contract remain fatal.
+  FlashInfer requires compatible NVLink peers,
   equal positive physical row counts, and at most 512 rows/rank; other batches
   use the padded NCCL path.
 - Reduction: `nccl`, `triton_peer` (up to 8192 rows/rank), or
   `trtllm_lamport` (up to 128 rows/rank). Above the selected fast-path bound,
   use NCCL. The Lamport path uses the generic explicit-state TRT-LLM wrapper.
+
+CUDA Lamport combines exchange and channel-layout conversion in one kernel,
+in both directions. Messages through 8 MiB use tagged packets; larger messages
+use the upstream vectorized chunk exchange. The byte threshold refers to the
+whole per-rank BF16 payload, including padding, not one peer's share. This is
+independent of the 512-row workspace limit.
+
+Each distinct projection width has persistent packet/chunk scratch allocated
+before cache budgeting and graph capture. Same-shape layers share it on one
+serialized stream. The combined rings and local output cost approximately
+10 times the maximum payload, in addition to NCCL staging. QKV copies the
+borrowed kernel output so a subsequent layer cannot overwrite its result.
+O projection consumes the borrowed result directly in GEMM. Lamport protects
+its own communication rings; it does **not** replace the reuse barrier for
+`triton_peer` reduction's separate GEMM buffer.
 
 For standalone real-weight correctness, reserve a persistent 16-GPU allocation
 with `salloc`, then launch four workers per node through `srun` or a site submit
@@ -72,6 +94,10 @@ attention output weights in FP8 with 128x128 block scales. The validator loads
 representative KDA and MLA projections, compares against the replicated
 projection and a dequantized FP32 reference, and exercises uneven/empty owners,
 output lifetime, and repeated graph replay.
+QKV validation also retains outputs across a graph that switches between
+packet, chunk and NCCL sizes, with delayed peers and changing inputs. Add
+`--large-tokens` to O-projection validation to exercise the 128/129, 512/513
+and 8192/8193 collective boundaries with the same lifetime checks.
 
 For performance, time the entire operation, including packing, quantization,
 A2A, GEMM and reduction. Compare identical local token counts and real weights,

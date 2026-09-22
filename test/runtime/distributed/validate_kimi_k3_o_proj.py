@@ -35,6 +35,7 @@ from test.runtime.distributed.kimi_k3_o_proj_helpers import (
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.cuda_lamport import cuda_lamport_a2a
 from tokenspeed_kernel.ops.communication.flashinfer import flashinfer_projection_a2a
 
 from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
@@ -156,7 +157,7 @@ def main():
         )
         exchange.workspace.initialize_a2a(
             exchange.parallel,
-            k,
+            [k],
             backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
         )
         exchange.workspace.initialize_reduce_scatter(
@@ -196,6 +197,12 @@ def main():
             expected = baseline(x)[0] if counts[rank] else x.new_empty((0, n))
             actual = exchange.forward(x, linear, counts)
             fused_a2a = exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
+            max_rows = max(counts[r] for r in exchange.parallel.tp_group)
+            lamport_a2a = exchange.workspace.lamport_a2a_state(k, max_rows)
+            check_reduction = fused_a2a or (
+                lamport_a2a is not None
+                and all(counts[r] == max_rows for r in exchange.parallel.tp_group)
+            )
             using_peer = (
                 exchange.workspace.peer_state(
                     n, max(counts[r] for r in exchange.parallel.tp_group)
@@ -210,12 +217,17 @@ def main():
             )
             custom_reduction = using_peer or using_lamport
             reduction_errors = torch.zeros(2, device="cuda", dtype=torch.float32)
-            if custom_reduction and fused_a2a:
+            if custom_reduction and check_reduction:
                 # Same quantized GEMM partials: isolate reduction rounding from
                 # weight/activation quantization and TP1 accumulation changes.
-                partial, _ = linear(
-                    flashinfer_projection_a2a(exchange.workspace.a2a, x.contiguous())
+                redistributed = (
+                    cuda_lamport_a2a(lamport_a2a, x.contiguous(), inverse=False)
+                    if lamport_a2a is not None
+                    else flashinfer_projection_a2a(
+                        exchange.workspace.a2a, x.contiguous()
+                    )
                 )
+                partial, _ = linear(redistributed)
                 reduction_reference = partial.float()
                 dist.all_reduce(
                     reduction_reference,
@@ -298,7 +310,7 @@ def main():
                 "counts": counts,
                 "reduction_l2_vs_fp32": (
                     reduction_errors.tolist()
-                    if custom_reduction and fused_a2a
+                    if custom_reduction and check_reduction
                     else None
                 ),
                 "rs_backend": (
@@ -307,9 +319,9 @@ def main():
                     else "triton_peer" if using_peer else "nccl"
                 ),
                 "a2a_backend": (
-                    "flashinfer"
-                    if exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
-                    else "nccl"
+                    "cuda_lamport"
+                    if lamport_a2a is not None
+                    else "flashinfer" if fused_a2a else "nccl"
                 ),
                 "relative_l2": relative_l2.item(),
                 "absolute_max": absolute_max.item(),

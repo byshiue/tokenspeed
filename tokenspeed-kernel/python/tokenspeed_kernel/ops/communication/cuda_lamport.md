@@ -1,7 +1,8 @@
 # Experimental CUDA Lamport A2A
 
-`cuda_lamport_a2a` is an opt-in TP4 BF16, intra-node NVLink experiment. It does
-not change model dispatch or replace an existing backend. It exchanges channel
+`cuda_lamport_a2a` is a TP4 BF16, intra-node NVLink exchange. Kimi-K3's opt-in
+projection TP runtime selects it by default; other model paths are unchanged.
+It exchanges channel
 shards directly between `[M, K]` and `[4*M, K/4]`, including the inverse mapping,
 without a separate pack or output-restoration kernel.
 
@@ -50,8 +51,10 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
   scratch plus `S` output bytes per GPU, excluding metadata. Payload expansion
   also increases link traffic. This is a **low-latency**, not a large-message
   bandwidth optimization. Only four NVLink-connected GB300 GPUs have been
-  measured; no cross-node, other-dtype or full-model claim is made.
-- There is no implicit NCCL fallback. Existing production backends are unchanged.
+  measured; no cross-node or other-dtype claim is made.
+- The kernel itself has no implicit NCCL fallback. The projection runtime owns
+  admission, padding and NCCL fallback; see
+  [the deployment recipe](../../../../../docs/recipes/kimi-k3-output-projection-tp.md).
 
 ## Optional large-message chunk exchange
 
