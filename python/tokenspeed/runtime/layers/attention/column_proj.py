@@ -21,6 +21,8 @@
 """Projection-only column TP: gather tokens, project, restore token ownership."""
 
 import torch
+import torch.distributed as dist
+from tokenspeed_kernel.ops.communication.cuda_lamport import cuda_lamport_a2a
 from tokenspeed_kernel.ops.communication.flashinfer import (
     create_projection_a2a,
     flashinfer_projection_gather_channels,
@@ -35,6 +37,7 @@ from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.layers.attention.o_proj import prepare_lamport_projection_a2a
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear
 
 
@@ -58,7 +61,7 @@ class DistributedColumnProjection:
         dtype: BF16 activation/output storage type.
         device: Current rank's selected CUDA device.
         allgather_backend: Explicit 'nccl' or 'trtllm'.
-        a2a_backend: Explicit 'nccl' or 'flashinfer'.
+        a2a_backend: Explicit 'nccl', 'flashinfer', 'auto' or 'cuda_lamport'.
 
     Construct collectively before capture/cache budgeting. Calls and consumers
     must be serialized on one stream; close only after referencing graphs die.
@@ -78,7 +81,7 @@ class DistributedColumnProjection:
     ):
         if allgather_backend not in ("nccl", "trtllm"):
             raise ValueError("Invalid column projection all-gather backend")
-        if a2a_backend not in ("nccl", "flashinfer"):
+        if a2a_backend not in ("nccl", "flashinfer", "auto", "cuda_lamport"):
             raise ValueError("Invalid column projection A2A backend")
         if (
             parallel.tp_size not in (2, 4, 8, 16)
@@ -112,13 +115,18 @@ class DistributedColumnProjection:
             else None
         )
         self.a2a = None
-        if a2a_backend == "flashinfer":
+        self.lamport_a2a = None
+        if a2a_backend == "cuda_lamport":
+            self.lamport_a2a = prepare_lamport_projection_a2a(
+                group, max_tokens, padded_output_size, dtype, device
+            )
+        elif a2a_backend in ("flashinfer", "auto"):
             self.a2a, _ = create_projection_a2a(
                 group=group,
                 max_elems=min(max_tokens, 512) * padded_output_size,
                 dtype=dtype,
                 device=device,
-                backend="flashinfer",
+                backend=a2a_backend,
             )
 
     def gather_inputs(self, inputs: torch.Tensor, rows: int) -> torch.Tensor:
@@ -139,6 +147,10 @@ class DistributedColumnProjection:
         """Exchange output channel shards and return owned padded [rows,N]."""
         size = self.parallel.tp_size
         shard = self.padded_output_size // size
+        if self.lamport_a2a is not None and rows <= self.lamport_a2a.max_rows:
+            # The kernel lends persistent local output. Preserve the projection's
+            # owned-result contract across sequential layers and graph calls.
+            return cuda_lamport_a2a(self.lamport_a2a, local, inverse=True).clone()
         if self.a2a is not None and rows <= min(self.max_tokens, 512):
             return flashinfer_projection_gather_channels(self.a2a, local)
         received = self.received[: rows * self.padded_output_size].view(
@@ -198,6 +210,9 @@ class DistributedColumnProjection:
         if self.closed:
             return
         torch.cuda.synchronize(self.send.device)
+        if self.lamport_a2a is not None:
+            dist.barrier(group=self.lamport_a2a.group)
+            self.lamport_a2a = None
         if self.gather_state is not None:
             self.gather_state.close()
         if self.a2a is not None:

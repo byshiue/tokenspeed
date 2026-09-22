@@ -53,6 +53,7 @@ from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearKDA,
     _assemble_fp8_fused_qkv_a,
 )
+from tokenspeed.runtime.utils.env import envs
 
 
 def load_segments(root, layer, leaves):
@@ -171,7 +172,7 @@ def main():
             torch.bfloat16,
             torch.device("cuda"),
             "trtllm",
-            "flashinfer",
+            envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
         )
         reference_weight = weight.float().cuda() * scale.cuda().repeat_interleave(
             128, 0
@@ -258,6 +259,34 @@ def main():
                     ),
                     flush=True,
                 )
+        # One graph crosses packet/chunk/NCCL envelopes while retaining every
+        # result. Delayed peers and changing input data stress ring reuse, not
+        # just the accuracy of one synchronized invocation.
+        transition_inputs = [
+            torch.randn(counts[rank], weight.shape[1], device="cuda")
+            for counts in patterns
+        ]
+        delay = torch.ones(262144, device="cuda")
+        for x, counts in zip(transition_inputs, patterns):
+            communication.forward(x, linear, counts)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            retained = []
+            for x, counts in zip(transition_inputs, patterns):
+                if rank % 4 == 0:
+                    for _ in range(4):
+                        delay.mul_(1.0001)
+                retained.append(communication.forward(x, linear, counts))
+        for _ in range(5):
+            for x in transition_inputs:
+                x.normal_()
+            graph.replay()
+            for x, counts, actual in zip(transition_inputs, patterns, retained):
+                eager = communication.forward(x, linear, counts)
+                torch.testing.assert_close(actual, eager, rtol=0, atol=0)
+        torch.cuda.synchronize()
+        del graph, retained
         communication.close()
         del communication, linear, baseline, reference_weight
     dist.barrier()

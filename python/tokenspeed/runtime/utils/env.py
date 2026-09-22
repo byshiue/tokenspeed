@@ -264,7 +264,7 @@ class Envs:
     TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE = EnvStr("1")
     TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvStr("1")
     TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE = EnvStr("1")
-    TOKENSPEED_O_PROJ_A2A_BACKEND = EnvStr("flashinfer")
+    TOKENSPEED_O_PROJ_A2A_BACKEND = EnvStr("cuda_lamport")
     TOKENSPEED_O_PROJ_RS_BACKEND = EnvStr("triton_peer")
 
     # Scheduler
