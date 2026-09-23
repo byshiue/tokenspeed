@@ -27,7 +27,7 @@ from pathlib import Path
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.layers.attention.o_proj import (
+from tokenspeed.runtime.layers.dp_row_parallel_linear import (
     make_output_projection,
     projection_mapping,
 )

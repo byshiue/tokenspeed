@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Redistribute locally owned full-channel tokens for row-parallel projection.
+"""Row-parallel linear execution over data-parallel token owners.
 
 Every subgroup rank participates, even with zero local tokens. Outputs return
 to their original owners before residual/normalization processing. This wrapper
@@ -33,15 +33,9 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.cuda_lamport import (
-    CudaLamportA2AState,
-    cuda_lamport_a2a,
-)
-from tokenspeed_kernel.ops.communication.flashinfer import (
-    create_projection_a2a,
-    flashinfer_projection_a2a,
-    flashinfer_projection_a2a_borrowed,
-    prepare_borrowed_projection_a2a,
+from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+    TokenSpeedA2ALamportState,
+    tokenspeed_a2a_lamport,
 )
 from tokenspeed_kernel.ops.communication.triton import (
     triton_pack_channel_shards_for_a2a,
@@ -49,7 +43,6 @@ from tokenspeed_kernel.ops.communication.triton import (
 from tokenspeed_kernel.ops.communication.triton_projection import (
     ProjectionPeerState,
     triton_projection_reduce_scatter,
-    triton_projection_reduce_scatter_after_a2a,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
     TrtllmReduceScatterState,
@@ -73,8 +66,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
 
 logger = logging.getLogger(__name__)
-FLASHINFER_MAX_TOKENS = 512
-CUDA_LAMPORT_MAX_TOKENS = 512
+A2A_LAMPORT_MAX_TOKENS = 512
 PEER_MAX_TOKENS = 8192
 LAMPORT_MAX_TOKENS = 128
 
@@ -118,7 +110,7 @@ def validate_projection_settings(
             raise ValueError(
                 f"Projection TP/A2A/RS settings differ across ranks: {values}"
             )
-    if a2a_value not in ("nccl", "auto", "flashinfer", "cuda_lamport"):
+    if a2a_value not in ("nccl", "tokenspeed_a2a_lamport"):
         raise ValueError(f"Invalid output projection A2A backend: {a2a_value}")
     if rs_value not in ("nccl", "triton_peer", "trtllm_lamport"):
         raise ValueError(
@@ -145,7 +137,7 @@ def initialize_projection_group(parallel: DenseLayerMapping) -> None:
 
 
 def prepare_lamport_projection_a2a(group, max_tokens, channels, dtype, device):
-    """Prepare the upstream TP4 BF16 exchange, or select NCCL for other topologies.
+    """Prepare TokenSpeed TP4 BF16 A2A, or select NCCL for other topologies.
 
     Shape-specific state owns packet/chunk rings and local output. Bound rows
     to keep startup memory predictable; larger calls use the existing NCCL path.
@@ -157,16 +149,16 @@ def prepare_lamport_projection_a2a(group, max_tokens, channels, dtype, device):
     dist.all_gather_object(hosts, socket.gethostname(), group=group)
     if len(set(hosts)) != 1:
         return None
-    state = CudaLamportA2AState(
+    state = TokenSpeedA2ALamportState(
         group,
-        min(max_tokens, CUDA_LAMPORT_MAX_TOKENS),
+        min(max_tokens, A2A_LAMPORT_MAX_TOKENS),
         channels,
         device,
         min(128, torch.cuda.get_device_properties(device).multi_processor_count),
     )
     if channels % 32 == 0:
         # Exactly 8 MiB retains packet exchange; larger messages avoid its
-        # doubled link traffic using the upstream vectorized chunk protocol.
+        # doubled link traffic using the vectorized chunk protocol.
         state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
     return state
 
@@ -185,13 +177,10 @@ class ProjectionWorkspace:
         self.max_tokens = max_tokens
         self.send = torch.empty(max_tokens * max_input_size, dtype=dtype, device=device)
         self.recv = torch.empty_like(self.send)
-        self.a2a = None
-        self.a2a_reason = None
         self.lamport_a2a_states = {}
         self._a2a_initialized = False
         self.peer_states = {}
         self.lamport_states = {}
-        self.borrowed_a2a = None
         self._rs_initialized = False
 
     def initialize_reduce_scatter(
@@ -211,8 +200,6 @@ class ProjectionWorkspace:
             if parallel.tp_size != 4 or self.send.dtype != torch.bfloat16:
                 raise ValueError("Lamport projection reduction requires TP4 BF16")
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            if self.a2a is not None:
-                self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
             for width in sorted(set(output_sizes)):
                 state = TrtllmReduceScatterState(
                     group,
@@ -240,8 +227,6 @@ class ProjectionWorkspace:
                     "Projection peer reduction requires BF16 and positive widths"
                 )
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
-            if self.a2a is not None:
-                self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
             for width in sorted(set(output_sizes)):
                 state = ProjectionPeerState(
                     group,
@@ -296,9 +281,9 @@ class ProjectionWorkspace:
         """
         if self._a2a_initialized:
             return
-        if backend not in ("nccl", "auto", "flashinfer", "cuda_lamport"):
+        if backend not in ("nccl", "tokenspeed_a2a_lamport"):
             raise ValueError("Invalid projection A2A backend")
-        if backend == "cuda_lamport":
+        if backend == "tokenspeed_a2a_lamport":
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
             for width in sorted(set(input_sizes)):
                 state = prepare_lamport_projection_a2a(
@@ -307,22 +292,9 @@ class ProjectionWorkspace:
                 if state is not None:
                     self.lamport_a2a_states[width] = state
             logger.info(
-                f"Projection A2A: cuda_lamport for widths {sorted(self.lamport_a2a_states)}, "
-                f"up to {min(self.max_tokens, CUDA_LAMPORT_MAX_TOKENS)} rows/rank; "
+                f"Projection A2A: tokenspeed_a2a_lamport for widths {sorted(self.lamport_a2a_states)}, "
+                f"up to {min(self.max_tokens, A2A_LAMPORT_MAX_TOKENS)} rows/rank; "
                 "NCCL for other shapes/topologies"
-            )
-        elif backend != "nccl":
-            self.a2a, self.a2a_reason = create_projection_a2a(
-                group=pg_manager.get_process_group("nccl", parallel.tp_group),
-                max_elems=min(self.max_tokens, FLASHINFER_MAX_TOKENS)
-                * max(input_sizes),
-                dtype=self.send.dtype,
-                device=self.send.device,
-                backend=backend,
-            )
-            logger.info(
-                f"Projection A2A: {'flashinfer' if self.a2a is not None else 'nccl'} "
-                f"({self.a2a_reason or 'NVLink'})"
             )
         self._a2a_initialized = True
 
@@ -330,18 +302,6 @@ class ProjectionWorkspace:
         """Select by subgroup physical capacity, including uneven/empty owners."""
         state = self.lamport_a2a_states.get(input_size)
         return state if state is not None and 0 < rows <= state.max_rows else None
-
-    def use_flashinfer(
-        self, parallel: DenseLayerMapping, counts: list[int], input_size: int
-    ) -> bool:
-        """Choose identically on every subgroup rank, using only host metadata."""
-        rows = counts[parallel.rank]
-        return (
-            self.a2a is not None
-            and 0 < rows <= FLASHINFER_MAX_TOKENS
-            and input_size % (8 * parallel.tp_size) == 0
-            and all(counts[r] == rows for r in parallel.tp_group)
-        )
 
     def close(self) -> None:
         """Collectively release IPC resources after all referencing graphs die."""
@@ -356,13 +316,9 @@ class ProjectionWorkspace:
             torch.cuda.synchronize(self.send.device)
             dist.barrier(group=next(iter(self.peer_states.values())).group)
         self.peer_states.clear()
-        self.borrowed_a2a = None
-        if self.a2a is not None:
-            self.a2a.close()
-            self.a2a = None
 
 
-class DistributedOutputProjection:
+class DPRowParallelLinear:
     """Run a sharded projection and return outputs to the original DP owner.
 
     The row-parallel Linear remains registered as self_attn.o_proj, preserving
@@ -417,7 +373,6 @@ class DistributedOutputProjection:
         # Rank-major output segments are exactly reduce-scatter's owner ordering.
         # One row already has rank-major byte order. Other shapes fuse the
         # transpose and padding, preserving the original BF16/FP16 values.
-        fused_a2a = workspace.use_flashinfer(parallel, counts, self.input_size)
         lamport_a2a = workspace.lamport_a2a_state(self.input_size, max_tokens)
         peer = workspace.peer_state(linear.output_size, max_tokens)
         lamport = workspace.lamport_state(linear.output_size, max_tokens)
@@ -428,13 +383,7 @@ class DistributedOutputProjection:
                 padded = workspace.send[:elements].view(max_tokens, self.input_size)
                 padded.zero_()
                 padded[: inputs.shape[0]].copy_(inputs)
-            recv = cuda_lamport_a2a(lamport_a2a, padded, inverse=False)
-        elif (peer is not None or lamport is not None) and fused_a2a:
-            recv = flashinfer_projection_a2a_borrowed(
-                workspace.borrowed_a2a, inputs.contiguous()
-            )
-        elif fused_a2a:
-            recv = flashinfer_projection_a2a(workspace.a2a, inputs.contiguous())
+            recv = tokenspeed_a2a_lamport(lamport_a2a, padded, inverse=False)
         else:
             packed = triton_pack_channel_shards_for_a2a(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)
@@ -446,19 +395,10 @@ class DistributedOutputProjection:
             )
             output = trtllm_reduce_scatter(lamport, partial, max_tokens)
         elif peer is not None:
-            if not fused_a2a:
-                # A preceding FI reduction may have deferred its reuse fence.
-                # NCCL/Lamport A2A is not that fence: protect GEMM writes here,
-                # including transitions through empty or NCCL-only batches.
-                peer.handle.barrier(channel=1)
             partial, _ = linear.forward_into(recv, None, peer.input_buffer(max_tokens))
-            if fused_a2a:
-                # Next FI A2A or the NCCL path's pre-write fence protects reuse.
-                output = triton_projection_reduce_scatter_after_a2a(
-                    peer, partial, max_tokens
-                )
-            else:
-                output = triton_projection_reduce_scatter(peer, partial, max_tokens)
+            # Reduction's completion fence protects the next GEMM write.
+            # Neither NCCL nor Lamport A2A owns this separate symmetric buffer.
+            output = triton_projection_reduce_scatter(peer, partial, max_tokens)
         else:
             partial, _ = linear(recv)
             output = workspace.reduce_scatter(
@@ -476,7 +416,7 @@ def make_output_projection(
     prefix: str,
     default_parallel: AttentionLayerMapping | LinearAttnLayerMapping,
     reduce_results: bool,
-) -> tuple[RowParallelLinear, DistributedOutputProjection | None]:
+) -> tuple[RowParallelLinear, DPRowParallelLinear | None]:
     """Construct projection shards and optional DP/TP exchange, without full weights."""
     enabled = parallel is not None and parallel.tp_size > 1
     selected = parallel if enabled else default_parallel
@@ -507,15 +447,13 @@ def make_output_projection(
         alignment = block[-1] if block else getattr(resolved, "group_size", 1)
         if linear.input_size_per_partition % alignment:
             raise ValueError("Output projection TP shard splits a quantization block")
-    return linear, (
-        DistributedOutputProjection(parallel, input_size) if enabled else None
-    )
+    return linear, (DPRowParallelLinear(parallel, input_size) if enabled else None)
 
 
 def project_attention_output(
     inputs: torch.Tensor,
     linear: RowParallelLinear,
-    exchange: DistributedOutputProjection | None,
+    exchange: DPRowParallelLinear | None,
     ctx: "ForwardContext",
 ) -> torch.Tensor:
     """Apply the ordinary projection or its projection-only TP exchange."""

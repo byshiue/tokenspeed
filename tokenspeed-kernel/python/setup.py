@@ -1041,9 +1041,8 @@ setup(
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
         ],
-        # Optional JIT adapters for borrowed A2A and fused AllGather quantization.
+        # Optional JIT adapter for fused AllGather quantization.
         "tokenspeed_kernel.thirdparty.flashinfer": [
-            "ulysses_borrowed.cu",
             "allgather_quant.cu",
         ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is

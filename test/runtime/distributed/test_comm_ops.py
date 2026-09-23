@@ -492,7 +492,7 @@ def _test_all_gather_single(rank, world_size, device, group, ref_group):
 
 
 def _test_all_to_all_single(rank, world_size, device, group, ref_group, backend):
-    if backend == "cuda_lamport":
+    if backend == "tokenspeed_a2a_lamport":
         _check_lamport_all_to_all(rank, world_size, device, ref_group)
         return
     assert backend == "runtime"
@@ -520,9 +520,9 @@ def _test_all_to_all_single(rank, world_size, device, group, ref_group, backend)
 def _check_lamport_all_to_all(rank, world_size, device, ref_group):
     # This is a direct kernel check, not a runtime backend registration. The
     # kernel exchanges channel shards; NCCL expects destination-major input.
-    from tokenspeed_kernel.ops.communication.cuda_lamport import (
-        CudaLamportA2AState,
-        cuda_lamport_a2a,
+    from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+        TokenSpeedA2ALamportState,
+        tokenspeed_a2a_lamport,
     )
 
     assert world_size == 4
@@ -562,7 +562,7 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
         (2048, [1, 1023, 1024, 2048, 2049, 2048, 1], 8 * 2**20 + 1),
     ]
     for channels, row_counts, threshold in cases:
-        state = CudaLamportA2AState(
+        state = TokenSpeedA2ALamportState(
             ref_group, max(row_counts), channels, device, blocks
         )
         if threshold:
@@ -581,7 +581,7 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
                     [-32768, 0, 32704, -64], dtype=torch.int16, device=device
                 )
                 x = bits.view(torch.bfloat16)
-                call = partial(cuda_lamport_a2a, state, x, inverse)
+                call = partial(tokenspeed_a2a_lamport, state, x, inverse)
                 check_bits(call(), reference(x, inverse))
                 sources = [
                     torch.randint(
@@ -618,7 +618,7 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
             x = torch.randn((rows, channels), dtype=torch.bfloat16, device=device)
             expected = reference(x, False)
             for _ in range(5):
-                check_bits(cuda_lamport_a2a(state, x, False), expected)
+                check_bits(tokenspeed_a2a_lamport(state, x, False), expected)
         torch.cuda.synchronize(device)
         dist.barrier(group=ref_group)
         del call, state
@@ -840,11 +840,11 @@ class TestCommOps:
         [
             pytest.param(2, "runtime", id="ws2-runtime"),
             pytest.param(4, "runtime", id="ws4-runtime"),
-            pytest.param(4, "cuda_lamport", id="ws4-cuda-lamport"),
+            pytest.param(4, "tokenspeed_a2a_lamport", id="ws4-tokenspeed-a2a-lamport"),
         ],
     )
     def test_all_to_all_single(self, world_size, backend):
-        if backend == "cuda_lamport":
+        if backend == "tokenspeed_a2a_lamport":
             if torch.version.hip is not None or torch.cuda.device_count() < world_size:
                 pytest.skip("Custom A2A requires four NVIDIA GPUs")
             if importlib.util.find_spec("flashinfer") is None:
