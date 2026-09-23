@@ -29,7 +29,6 @@ from tokenspeed_kernel.thirdparty.flashinfer.moe_alltoall import FlashInferMoeAl
 
 logger = logging.getLogger(__name__)
 
-
 _custom_allreduce = None
 
 if current_platform().is_nvidia:

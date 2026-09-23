@@ -109,15 +109,11 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
-from tokenspeed.runtime.layers.dp_column_parallel_linear import (
-    DPColumnParallelLinear,
+from tokenspeed.runtime.layers.dp_linear_communication import (
+    DPColumnParallelCommunication,
+    DPRowParallelCommunication,
     column_projection_width,
-)
-from tokenspeed.runtime.layers.dp_row_parallel_linear import (
-    ProjectionWorkspace,
     initialize_projection_group,
-    make_output_projection,
-    project_attention_output,
     projection_mapping,
     validate_projection_settings,
 )
@@ -126,6 +122,8 @@ from tokenspeed.runtime.layers.layernorm import (
 )
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
+    DPColumnParallelLinear,
+    DPRowParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -231,16 +229,22 @@ def _projection_mapping(mapping: Mapping, setting) -> DenseLayerMapping:
     return projection_mapping(mapping.rank, mapping.world_size, size)
 
 
-def _project_column(inputs, linear, exchange, ctx):
-    """Restore full channels on local token owners before attention consumes them."""
-    if exchange is None:
-        raise RuntimeError("QKV projection communication was not prepared")
+def _projection_counts(ctx):
+    """Physical world-rank counts, including CUDA-graph padding."""
     counts = ctx.collective_global_num_tokens
     if counts is None:
         counts = ctx.global_num_tokens
     if counts is None:
-        raise ValueError("QKV projection TP requires collective token counts")
-    return exchange.forward(inputs, linear, counts)
+        raise ValueError("Projection TP requires collective token counts")
+    return counts
+
+
+def _project_attention_output(inputs, linear, ctx):
+    if isinstance(linear, DPRowParallelLinear):
+        output, _ = linear(inputs, counts=_projection_counts(ctx))
+    else:
+        output, _ = linear(inputs)
+    return output
 
 
 # ===----------------------------------------------------------------------=== #
@@ -417,16 +421,27 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         # Keep the registered Linear at o_proj so checkpoint shard loaders and
         # post-load quantization still see the original parameter names.
         assert not bias
-        linear, self.output_projection_exchange = make_output_projection(
-            parallel=_output_projection_mapping(self.mapping),
-            input_size=input_size,
-            output_size=output_size,
+        parallel = _output_projection_mapping(self.mapping)
+        if parallel.tp_size > 1:
+            return DPRowParallelLinear(
+                input_size=input_size,
+                output_size=output_size,
+                parallel=parallel,
+                params_dtype=None,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+        return super()._make_output_projection(
+            input_size,
+            output_size,
+            bias=bias,
+            reduce_results=reduce_results,
             quant_config=quant_config,
             prefix=prefix,
-            default_parallel=self.mapping.attn,
-            reduce_results=reduce_results,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            tp_group=tp_group,
         )
-        return linear
 
     def __init__(
         self,
@@ -473,8 +488,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         self.input_projection_parallel = _projection_mapping(
             mapping, envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE
         )
-        self.input_projection_exchange = None
-        self.query_projection_exchange = None
         if self.input_projection_parallel.tp_size > 1 and (
             not self.use_output_gate or not _fused_qkv_a_uses_fp8(quant_config, prefix)
         ):
@@ -518,27 +531,23 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             )
             if self.input_projection_parallel.tp_size > 1:
                 parallel = self.input_projection_parallel
-                self.fused_qkv_a_proj_with_mqa = ColumnParallelLinear(
+                self.fused_qkv_a_proj_with_mqa = DPColumnParallelLinear(
                     hidden_size,
-                    fused_out,
-                    bias=False,
-                    gather_output=False,
+                    self._qkv_a_width + self._gate_width,
+                    padded_output_size=fused_out,
+                    parallel=parallel,
+                    params_dtype=None,
                     quant_config=quant_config,
                     prefix=fused_prefix,
-                    tp_rank=parallel.tp_rank,
-                    tp_size=parallel.tp_size,
-                    tp_group=parallel.tp_group,
                 )
-                self.q_b_proj = ColumnParallelLinear(
+                self.q_b_proj = DPColumnParallelLinear(
                     q_lora_rank,
                     num_heads * self.qk_head_dim,
-                    bias=False,
-                    gather_output=False,
+                    padded_output_size=num_heads * self.qk_head_dim,
+                    parallel=parallel,
+                    params_dtype=None,
                     quant_config=quant_config,
                     prefix=add_prefix("q_b_proj", prefix),
-                    tp_rank=parallel.tp_rank,
-                    tp_size=parallel.tp_size,
-                    tp_group=parallel.tp_group,
                 )
 
     def _split_fused_qkv_a(
@@ -599,11 +608,8 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 raise ValueError("Column-sharded QKV expects BF16 activations")
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
-            qkv_gate = _project_column(
-                hidden_states,
-                self.fused_qkv_a_proj_with_mqa,
-                self.input_projection_exchange,
-                ctx,
+            qkv_gate, _ = self.fused_qkv_a_proj_with_mqa(
+                hidden_states, counts=_projection_counts(ctx)
             )
             qkv_gate = qkv_gate[:, : self._qkv_a_width + self._gate_width]
             q_a, latent_cache, gate = self._split_fused_qkv_a(qkv_gate)
@@ -691,13 +697,10 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 self.fused_qk_layernorm(
                     input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm
                 )
-            q = (
-                _project_column(
-                    q_norm, self.q_b_proj, self.query_projection_exchange, ctx
-                )
-                if self.input_projection_parallel.tp_size > 1
-                else self.q_b_proj(q_norm)[0]
-            )
+            if self.input_projection_parallel.tp_size > 1:
+                q, _ = self.q_b_proj(q_norm, counts=_projection_counts(ctx))
+            else:
+                q, _ = self.q_b_proj(q_norm)
             return q, latent_cache, gate, None
         q, absorbed_query = mla_normalize_project_query(
             q_a,
@@ -748,12 +751,11 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 self._project_q_latent_gated(
                     hidden_states, ctx, comm_manager, block_scale, attnres_partial_args
                 )
-            if self.output_projection_exchange is None:
+            if not isinstance(self.o_proj, DPRowParallelLinear):
                 return hidden_states
-            return project_attention_output(
+            return _project_attention_output(
                 hidden_states.new_empty((0, self.num_heads * self.v_head_dim)),
                 self.o_proj,
-                self.output_projection_exchange,
                 ctx,
             )
         if self.use_output_gate:
@@ -789,10 +791,9 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # Fused in-place fp32 sigmoid+mul; the gate shard matches the
             # head-sharded attn_output.
             attn_output = sigmoid_mul(attn_output, gate)
-        return project_attention_output(
+        return _project_attention_output(
             attn_output,
             self.o_proj,
-            self.output_projection_exchange,
             ctx,
         )
 
@@ -1206,7 +1207,7 @@ class KimiKDAMergedProj(nn.Module):
         )
 
 
-class KimiKDAColumnProj(ColumnParallelLinear):
+class KimiKDAColumnProj(DPColumnParallelLinear):
     """Contiguous column shard of the fused [q,k,v,g,f_a,b] checkpoint.
 
     Attention still owns all heads. Unlike head-wise attention TP, this loader
@@ -1219,9 +1220,10 @@ class KimiKDAColumnProj(ColumnParallelLinear):
         total = column_projection_width(self.used_rows, parallel.tp_size, 128)
         super().__init__(
             input_size=hidden,
-            output_size=total,
-            bias=False,
-            gather_output=False,
+            output_size=self.used_rows,
+            padded_output_size=total,
+            parallel=parallel,
+            params_dtype=None,
             quant_config=Fp8Config(
                 is_checkpoint_fp8_serialized=True,
                 activation_scheme="dynamic",
@@ -1230,9 +1232,6 @@ class KimiKDAColumnProj(ColumnParallelLinear):
                 scale_fmt=None,
             ),
             prefix=prefix,
-            tp_rank=parallel.tp_rank,
-            tp_size=parallel.tp_size,
-            tp_group=parallel.tp_group,
         )
         self.fp8_block_quant = True
         self._segments = {
@@ -1370,7 +1369,6 @@ class KimiLinearKDA(nn.Module):
         self.input_projection_parallel = _projection_mapping(
             mapping, envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE
         )
-        self.input_projection_exchange = None
         if self.input_projection_parallel.tp_size > 1:
             if not merged_fp8:
                 raise ValueError("QKV projection TP requires block-scaled FP8 weights")
@@ -1427,15 +1425,34 @@ class KimiLinearKDA(nn.Module):
         self.conv_weights: torch.Tensor | None = None
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.o_proj, self.output_projection_exchange = make_output_projection(
-            parallel=_output_projection_mapping(mapping),
-            input_size=proj,
-            output_size=hidden,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-            default_parallel=mapping.linear_attn,
-            reduce_results=False,  # layer-level AR owns ordinary attention TP
-        )
+        output_parallel = _output_projection_mapping(mapping)
+        if output_parallel.tp_size > 1:
+            self.o_proj = DPRowParallelLinear(
+                input_size=proj,
+                output_size=hidden,
+                parallel=output_parallel,
+                params_dtype=None,
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+            )
+        else:
+            self.o_proj = RowParallelLinear(
+                proj,
+                hidden,
+                bias=False,
+                input_is_parallel=True,
+                skip_bias_add=False,
+                params_dtype=None,
+                reduce_results=False,  # layer-level AR owns ordinary attention TP
+                quant_config=quant_config,
+                prefix=add_prefix("o_proj", prefix),
+                tp_rank=tp_rank,
+                tp_size=tp_size,
+                tp_group=tp_group,
+                use_presharded_weights=False,
+                override_kernel_name=None,
+                interleave_linear_and_gate=False,
+            )
 
         if (
             merged_fp8
@@ -1472,9 +1489,7 @@ class KimiLinearKDA(nn.Module):
         if self.input_projection_parallel.tp_size > 1:
             if attnres_partial_args is not None:
                 attnres_partial_dual(*attnres_partial_args)
-            output = _project_column(
-                hidden_states, self.qkvgb_proj, self.input_projection_exchange, ctx
-            )
+            output, _ = self.qkvgb_proj(hidden_states, counts=_projection_counts(ctx))
         elif isinstance(
             getattr(self.qkvgb_proj, "quant_method", None),
             Fp8LinearMethod,
@@ -1552,12 +1567,11 @@ class KimiLinearKDA(nn.Module):
         if hidden_states.shape[0] == 0:
             if self.input_projection_parallel.tp_size > 1:
                 self._project_qkvfab(hidden_states, attnres_partial_args, ctx=ctx)
-            if self.output_projection_exchange is None:
+            if not isinstance(self.o_proj, DPRowParallelLinear):
                 return hidden_states
-            return project_attention_output(
+            return _project_attention_output(
                 hidden_states.new_empty((0, self.num_heads * self.head_dim)),
                 self.o_proj,
-                self.output_projection_exchange,
                 ctx,
             )
 
@@ -1631,10 +1645,9 @@ class KimiLinearKDA(nn.Module):
                 hd,
                 enable_pdl=pdl_enabled(),
             )
-        return project_attention_output(
+        return _project_attention_output(
             core_out,
             self.o_proj,
-            self.output_projection_exchange,
             ctx,
         )
 
@@ -3553,90 +3566,61 @@ class KimiLinearForCausalLM(BaseCausalLM):
                 raise RuntimeError("Cannot grow a prepared shared-expert workspace")
             for mlp in shared_mlps:
                 mlp.shared_communication = communication
-        exchanges = [
-            layer.self_attn.output_projection_exchange
-            for layer in self.model.layers
-            if hasattr(layer, "self_attn")
-            and layer.self_attn.output_projection_exchange is not None
+        row_projections = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, DPRowParallelLinear)
         ]
-        if exchanges:
-            # One scratch pair for sequential attention layers, allocated before
-            # memory profiling/capture rather than one large pair per layer.
+        if row_projections:
+            # One communication object for sequential O projections, never one
+            # scratch allocation per Linear. It does not alias MoE aux-stream data.
             weight = next(self.parameters())
-            max_input_size = max(exchange.input_size for exchange in exchanges)
-            workspace = exchanges[0].workspace
-            if workspace is None:
-                workspace = ProjectionWorkspace(
+            communication = row_projections[0].communication
+            if communication is None:
+                communication = DPRowParallelCommunication(
                     max_tokens=max_num_tokens,
-                    max_input_size=max_input_size,
+                    max_input_size=max(linear.input_size for linear in row_projections),
                     dtype=weight.dtype,
                     device=weight.device,
                 )
-                workspace.initialize_a2a(
-                    exchanges[0].parallel,
-                    [exchange.input_size for exchange in exchanges],
+                communication.initialize_a2a(
+                    row_projections[0].parallel,
+                    [linear.input_size for linear in row_projections],
                     backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
                 )
-                workspace.initialize_reduce_scatter(
-                    exchanges[0].parallel,
-                    [
-                        layer.self_attn.o_proj.output_size
-                        for layer in self.model.layers
-                        if hasattr(layer, "self_attn")
-                        and layer.self_attn.output_projection_exchange is not None
-                    ],
+                communication.initialize_reduce_scatter(
+                    row_projections[0].parallel,
+                    [linear.output_size for linear in row_projections],
                     backend=envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
                 )
-            elif max_num_tokens > workspace.max_tokens:
+            elif max_num_tokens > communication.max_tokens:
                 raise RuntimeError("Cannot grow a prepared projection workspace")
-            for exchange in exchanges:
-                exchange.workspace = workspace
-        # Sequential attention layers share one communication scratch per shape.
-        # These allocations precede memory budgeting and graph capture; they do
-        # not alias the output projection or the auxiliary-stream MoE scratch.
-        column_exchanges = {}
-        for layer in self.model.layers:
-            if not isinstance(layer, KimiLinearDecoderLayer):
+            for linear in row_projections:
+                linear.communication = communication
+        # QKV layers share scratch by stored shape, independently of logical
+        # output padding. All initialization precedes memory budgeting/capture.
+        column_communications = {}
+        for linear in self.model.modules():
+            if not isinstance(linear, DPColumnParallelLinear):
                 continue
-            attention = layer.self_attn
-            parallel = attention.input_projection_parallel
-            if parallel.tp_size == 1:
-                continue
-            projections = (
-                [("input_projection_exchange", attention.qkvgb_proj)]
-                if isinstance(attention, KimiLinearKDA)
-                else [
-                    ("input_projection_exchange", attention.fused_qkv_a_proj_with_mqa),
-                    ("query_projection_exchange", attention.q_b_proj),
-                ]
-            )
-            for name, linear in projections:
-                key = (linear.input_size, linear.output_size)
-                existing = (
-                    attention.input_projection_exchange
-                    if name == "input_projection_exchange"
-                    else attention.query_projection_exchange
+            key = (linear.tp_group, linear.input_size, linear.output_size)
+            existing = linear.communication
+            if existing is not None:
+                if max_num_tokens > existing.max_tokens:
+                    raise RuntimeError("Cannot grow prepared QKV communication")
+                column_communications[key] = existing
+            if key not in column_communications:
+                column_communications[key] = DPColumnParallelCommunication(
+                    linear.parallel,
+                    linear.input_size,
+                    linear.output_size,
+                    max_num_tokens,
+                    torch.bfloat16,
+                    linear.weight.device,
+                    "trtllm",
+                    envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
                 )
-                if existing is not None:
-                    if max_num_tokens > existing.max_tokens:
-                        raise RuntimeError("Cannot grow prepared QKV communication")
-                    column_exchanges[key] = existing
-                if key not in column_exchanges:
-                    column_exchanges[key] = DPColumnParallelLinear(
-                        parallel,
-                        linear.input_size,
-                        linear.output_size,
-                        linear.output_size,
-                        max_num_tokens,
-                        torch.bfloat16,
-                        linear.weight.device,
-                        "trtllm",
-                        envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
-                    )
-                if name == "input_projection_exchange":
-                    attention.input_projection_exchange = column_exchanges[key]
-                else:
-                    attention.query_projection_exchange = column_exchanges[key]
+            linear.communication = column_communications[key]
         routed_hidden_size = (
             self.config.routed_expert_hidden_size
             if self.config.routed_expert_hidden_size is not None
@@ -3649,7 +3633,10 @@ class KimiLinearForCausalLM(BaseCausalLM):
             max_num_tokens=max_num_tokens,
         )
         return (
-            bool(shared_mlps) or bool(exchanges) or bool(column_exchanges) or prepared
+            bool(shared_mlps)
+            or bool(row_projections)
+            or bool(column_communications)
+            or prepared
         )
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
