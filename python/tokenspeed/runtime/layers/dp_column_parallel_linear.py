@@ -160,9 +160,12 @@ class DPColumnParallelLinear:
         size = self.parallel.tp_size
         shard = self.padded_output_size // size
         if self.lamport_a2a is not None and rows <= self.lamport_a2a.max_rows:
-            # The kernel lends persistent local output. Preserve the projection's
-            # owned-result contract across sequential layers and graph calls.
-            return tokenspeed_a2a_lamport(self.lamport_a2a, local, inverse=True).clone()
+            # Write directly into owned storage: later layers may reuse the
+            # communicator while a caller still retains this projection result.
+            output = local.new_empty((rows, self.padded_output_size))
+            return tokenspeed_a2a_lamport(
+                self.lamport_a2a, local, inverse=True, out=output
+            )
         received = self.received[: rows * self.padded_output_size].view(
             size * rows, shard
         )

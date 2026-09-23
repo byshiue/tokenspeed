@@ -582,7 +582,12 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
                 )
                 x = bits.view(torch.bfloat16)
                 call = partial(tokenspeed_a2a_lamport, state, x, inverse)
-                check_bits(call(), reference(x, inverse))
+                expected = reference(x, inverse)
+                check_bits(call(out=None), expected)
+                owned = torch.empty_like(expected)
+                assert call(out=owned) is owned
+                check_bits(owned, expected)
+                owned_expected = expected
                 sources = [
                     torch.randint(
                         -32768, 32768, shape, dtype=torch.int16, device=device
@@ -596,16 +601,22 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
                 snapshots = [torch.empty_like(references[0]) for _ in sources]
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    for source, snapshot in zip(sources, snapshots):
+                    for index, (source, snapshot) in enumerate(zip(sources, snapshots)):
                         x.copy_(source)
                         if rank == 1:
                             torch.cuda._sleep(10000)  # Deliberate peer skew.
-                        snapshot.copy_(call())
+                        # Alternate borrowed and owned destinations in the same
+                        # graph. Later calls must not overwrite retained outputs.
+                        if index % 2:
+                            call(out=snapshot)
+                        else:
+                            snapshot.copy_(call(out=None))
                 for _ in range(3):
                     graph.replay()
                 torch.cuda.synchronize(device)
                 for snapshot, expected in zip(snapshots, references):
                     check_bits(snapshot, expected)
+                check_bits(owned, owned_expected)
                 del graph, snapshots, sources, references
 
         # Exercise unsigned generation IDs across the signed-int32 boundary.
@@ -618,7 +629,19 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
             x = torch.randn((rows, channels), dtype=torch.bfloat16, device=device)
             expected = reference(x, False)
             for _ in range(5):
-                check_bits(tokenspeed_a2a_lamport(state, x, False), expected)
+                check_bits(tokenspeed_a2a_lamport(state, x, False, out=None), expected)
+        # Reject unsafe destinations before launching a collective on any rank.
+        x = torch.randn((1, channels), dtype=torch.bfloat16, device=device)
+        shape = (world_size, channels // world_size)
+        misaligned = torch.empty(channels + 1, dtype=x.dtype, device=device)[1:]
+        for out in (
+            x.view(shape),
+            state.output[:channels].view(shape),
+            state.scratch.view(torch.bfloat16)[:channels].view(shape),
+            misaligned.view(shape),
+        ):
+            with pytest.raises(ValueError):
+                tokenspeed_a2a_lamport(state, x, False, out=out)
         torch.cuda.synchronize(device)
         dist.barrier(group=ref_group)
         del call, state
