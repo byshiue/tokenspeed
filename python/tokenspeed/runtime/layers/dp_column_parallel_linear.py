@@ -226,7 +226,7 @@ class DPColumnParallelLinear:
                 self.gather_state, self._padded_inputs(inputs, rows)
             )
             local = fp8_linear_prepacked(
-                plan, values, linear.weight, scales, num_tokens, inputs.dtype
+                plan, values, linear.weight, scales, num_tokens, inputs.dtype, out=None
             )
         else:
             gathered = self.gather_inputs(inputs, rows)

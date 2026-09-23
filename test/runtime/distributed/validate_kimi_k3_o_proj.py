@@ -32,6 +32,7 @@ from test.runtime.distributed.kimi_k3_o_proj_helpers import (
     load_projection,
     make_linears,
 )
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -210,6 +211,14 @@ def main():
             )
             expected = baseline(x)[0] if counts[rank] else x.new_empty((0, n))
             actual = exchange.forward(x, linear, counts)
+            # Compare against the same TP4 GEMM/reduction with its original
+            # separate quantizer, isolating fusion from TP1 rounding differences.
+            with patch(
+                "tokenspeed.runtime.layers.dp_row_parallel_linear.fp8_linear_accepts_prepacked_input",
+                return_value=False,
+            ):
+                unfused = exchange.forward(x, linear, counts)
+            torch.testing.assert_close(actual, unfused, rtol=0, atol=0)
             max_rows = max(counts[r] for r in exchange.parallel.tp_group)
             lamport_a2a = exchange.workspace.lamport_a2a_state(k, max_rows)
             check_reduction = lamport_a2a is not None and all(

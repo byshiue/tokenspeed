@@ -33,9 +33,11 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel import fp8_linear_accepts_prepacked_input, fp8_linear_prepacked
 from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
     TokenSpeedA2ALamportState,
     tokenspeed_a2a_lamport,
+    tokenspeed_a2a_lamport_fp8_quantize,
 )
 from tokenspeed_kernel.ops.communication.triton import (
     triton_pack_channel_shards_for_a2a,
@@ -290,6 +292,8 @@ class ProjectionWorkspace:
                     group, self.max_tokens, width, self.send.dtype, self.send.device
                 )
                 if state is not None:
+                    if width % 512 == 0:
+                        state.prepare_fp8_quantization()
                     self.lamport_a2a_states[width] = state
             logger.info(
                 f"Projection A2A: tokenspeed_a2a_lamport for widths {sorted(self.lamport_a2a_states)}, "
@@ -376,34 +380,59 @@ class DPRowParallelLinear:
         lamport_a2a = workspace.lamport_a2a_state(self.input_size, max_tokens)
         peer = workspace.peer_state(linear.output_size, max_tokens)
         lamport = workspace.lamport_state(linear.output_size, max_tokens)
+        # Preserve GEMM's prepared scale format and direct reduction destination.
+        # Other quantizers/backends retain their ordinary Linear execution.
+        plan = linear.quant_method.prepared_linear_plan(linear)
+        num_tokens = size * max_tokens
+        fused_quant = (
+            lamport_a2a is not None
+            and lamport_a2a.fp8_output is not None
+            and linear.bias is None
+            and linear.input_is_parallel
+            and not linear.reduce_results
+            and fp8_linear_accepts_prepacked_input(plan, num_tokens)
+        )
+        destination = (
+            lamport.input_buffer(max_tokens)
+            if lamport is not None
+            else peer.input_buffer(max_tokens) if peer is not None else None
+        )
         if lamport_a2a is not None:
-            if inputs.shape[0] == max_tokens and inputs.is_contiguous():
+            if (
+                inputs.shape[0] == max_tokens
+                and inputs.is_contiguous()
+                and inputs.data_ptr() % 16 == 0
+            ):
                 padded = inputs
             else:
                 padded = workspace.send[:elements].view(max_tokens, self.input_size)
                 padded.zero_()
                 padded[: inputs.shape[0]].copy_(inputs)
-            recv = tokenspeed_a2a_lamport(lamport_a2a, padded, inverse=False, out=None)
+            if fused_quant:
+                values, scales = tokenspeed_a2a_lamport_fp8_quantize(
+                    lamport_a2a, padded
+                )
+                partial = fp8_linear_prepacked(
+                    plan,
+                    values,
+                    linear.weight,
+                    scales,
+                    num_tokens,
+                    inputs.dtype,
+                    out=destination,
+                )
+            else:
+                recv = tokenspeed_a2a_lamport(
+                    lamport_a2a, padded, inverse=False, out=None
+                )
         else:
             packed = triton_pack_channel_shards_for_a2a(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)
-        if lamport is not None:
-            # This destination is local: the native Lamport kernel publishes
-            # GEMM results into its own IPC ring and protects ring reuse.
-            partial, _ = linear.forward_into(
-                recv, None, lamport.input_buffer(max_tokens)
-            )
-            output = trtllm_reduce_scatter(lamport, partial, max_tokens)
-        elif peer is not None:
-            partial, _ = linear.forward_into(recv, None, peer.input_buffer(max_tokens))
-            # Reduction's completion fence protects the next GEMM write.
-            # Neither NCCL nor Lamport A2A owns this separate symmetric buffer.
-            output = triton_projection_reduce_scatter(peer, partial, max_tokens)
-        else:
-            partial, _ = linear(recv)
-            output = workspace.reduce_scatter(
-                partial.contiguous(), parallel, max_tokens
-            )
+        if not fused_quant:
+            partial, _ = linear.forward_into(recv, None, destination)
+        # Lamport owns its IPC ring; peer reduction retains a completion fence
+        # protecting its separate symmetric GEMM destination from the next call.
+        output = workspace.reduce_scatter(partial.contiguous(), parallel, max_tokens)
         return output[: inputs.shape[0]]
 
 
