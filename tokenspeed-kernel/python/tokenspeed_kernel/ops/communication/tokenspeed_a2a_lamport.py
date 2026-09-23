@@ -83,6 +83,7 @@ class TokenSpeedA2ALamportState:
         self.chunk_scratch = self.chunk_handle = self.chunk_peers = None
         self.chunk_flags = self.chunk_flag_handle = self.chunk_flag_peers = None
         self.chunk_control = self.chunk_module = None
+        self.fp8_output = self.fp8_scales = None
         self.chunk_capacity = self.words // 2
         with torch.inference_mode(False):
             self.scratch = symm.empty(
@@ -110,6 +111,28 @@ class TokenSpeedA2ALamportState:
         )
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
+
+    def prepare_fp8_quantization(self):
+        """Allocate borrowed FP8 values and MN-major FP32 scales before capture.
+
+        Only the forward [M,K] -> [4*M,K/4] exchange is quantized. Every
+        channel shard must contain complete 128-element quantization groups.
+        Packet/chunk storage and generations remain shared with BF16 calls.
+        """
+        if self.channels % 512:
+            raise ValueError("Fused A2A quantization requires K divisible by 512")
+        if self.fp8_output is not None:
+            return
+        self.fp8_output = torch.empty(
+            (4 * self.max_rows, self.channels // 4),
+            dtype=torch.float8_e4m3fn,
+            device=self.output.device,
+        )
+        self.fp8_scales = torch.empty(
+            self.max_rows * self.channels // 128,
+            dtype=torch.float32,
+            device=self.output.device,
+        )
 
     def prepare_chunk_exchange(self, threshold_bytes):
         """Collectively enable vectorized chunk publication before capture.
@@ -286,3 +309,86 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
         inverse,
     )
     return output
+
+
+@register_kernel(
+    family="communication",
+    mode="all_to_all_fp8_quantize",
+    solution="cuda",
+    signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
+)
+def tokenspeed_a2a_lamport_fp8_quantize(state, inputs):
+    """Exchange BF16 shards and quantize ready 128-element groups in one kernel.
+
+    Args:
+        state: TokenSpeedA2ALamportState with FP8 buffers prepared before capture.
+        inputs: Contiguous BF16 [M,K], with equal positive physical M on all peers.
+
+    Returns:
+        Borrowed FP8 [4*M,K/4] and MN-major FP32 scales [K/512,4*M], valid until
+        the next quantized call. Consumers use ordinary stream ordering; no
+        external tile-readiness protocol or additional quantization is needed.
+    """
+    if (
+        state.fp8_output is None
+        or inputs.ndim != 2
+        or inputs.dtype != torch.bfloat16
+        or inputs.device != state.output.device
+        or not inputs.is_contiguous()
+        or inputs.shape[1] != state.channels
+        or not 0 < inputs.shape[0] <= state.max_rows
+        or inputs.data_ptr() % 16
+    ):
+        raise ValueError("Invalid fused A2A quantization input or unprepared state")
+    storage = inputs.untyped_storage().data_ptr()
+    if any(
+        buffer is not None and storage == buffer.untyped_storage().data_ptr()
+        for buffer in (
+            state.output,
+            state.scratch,
+            state.control,
+            state.peers,
+            state.chunk_scratch,
+            state.chunk_flags,
+            state.chunk_control,
+            state.chunk_peers,
+            state.chunk_flag_peers,
+            state.fp8_output,
+            state.fp8_scales,
+        )
+    ):
+        raise ValueError("Fused A2A input must not alias state storage")
+    rows = inputs.shape[0]
+    values = state.fp8_output[: 4 * rows]
+    scales = state.fp8_scales[: rows * state.channels // 128].view(-1, 4 * rows)
+    if (
+        state.chunk_threshold_bytes is not None
+        and inputs.numel() * inputs.element_size() >= state.chunk_threshold_bytes
+    ):
+        state.chunk_module.exchange_chunk_fp8(
+            state.chunk_flag_peers,
+            inputs,
+            values,
+            scales,
+            state.chunk_peers,
+            state.chunk_control,
+            state.chunk_capacity,
+            rows,
+            state.channels,
+            state.rank,
+            state.blocks,
+        )
+    else:
+        state.module.exchange_fp8(
+            inputs,
+            values,
+            scales,
+            state.peers,
+            state.control,
+            state.words,
+            rows,
+            state.channels,
+            state.rank,
+            state.blocks,
+        )
+    return values, scales
