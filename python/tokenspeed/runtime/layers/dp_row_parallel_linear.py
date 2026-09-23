@@ -383,7 +383,7 @@ class DPRowParallelLinear:
                 padded = workspace.send[:elements].view(max_tokens, self.input_size)
                 padded.zero_()
                 padded[: inputs.shape[0]].copy_(inputs)
-            recv = tokenspeed_a2a_lamport(lamport_a2a, padded, inverse=False)
+            recv = tokenspeed_a2a_lamport(lamport_a2a, padded, inverse=False, out=None)
         else:
             packed = triton_pack_channel_shards_for_a2a(inputs, send)
             all_to_all_single(recv, packed, parallel.tp_group, backend=None)

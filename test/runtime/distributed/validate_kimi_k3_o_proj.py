@@ -233,7 +233,7 @@ def main():
                 # Same quantized GEMM partials: isolate reduction rounding from
                 # weight/activation quantization and TP1 accumulation changes.
                 redistributed = tokenspeed_a2a_lamport(
-                    lamport_a2a, x.contiguous(), inverse=False
+                    lamport_a2a, x.contiguous(), inverse=False, out=None
                 )
                 partial, _ = linear(redistributed)
                 reduction_reference = partial.float()
