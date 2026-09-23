@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Experimental bit-preserving, intra-node Lamport packet A2A.
+"""TokenSpeed bit-preserving, intra-node Lamport A2A.
 
 CUDA C++ expresses the system-scoped 64-bit packet transactions explicitly.
 Projection callers own topology admission, padding and NCCL fallback.
@@ -38,7 +38,7 @@ from tokenspeed_kernel.registry import register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 
-class CudaLamportA2AState:
+class TokenSpeedA2ALamportState:
     """Persistent TP4 scratch, initialized collectively before graph capture.
 
     The supplied process group must contain exactly four GPUs, irrespective
@@ -180,7 +180,7 @@ class CudaLamportA2AState:
     solution="cuda",
     signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
 )
-def cuda_lamport_a2a(state, inputs, inverse):
+def tokenspeed_a2a_lamport(state, inputs, inverse):
     """Exchange BF16 channel shards while preserving every input bit.
 
     Forward: [M,K] -> [4*M,K/4]. Inverse: [4*M,K/4] -> [M,K].

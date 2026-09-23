@@ -1,6 +1,6 @@
-# Experimental CUDA Lamport A2A
+# TokenSpeed Lamport A2A
 
-`cuda_lamport_a2a` is a TP4 BF16, intra-node NVLink exchange. Kimi-K3's opt-in
+`tokenspeed_a2a_lamport` is a TP4 BF16, intra-node NVLink exchange. Kimi-K3's opt-in
 projection TP runtime selects it by default; other model paths are unchanged.
 It exchanges channel
 shards directly between `[M, K]` and `[4*M, K/4]`, including the inverse mapping,
@@ -30,11 +30,11 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 
 ## Contract and limits
 
-- The Python entry point lives in `cuda_lamport.py`. Both packet and chunk
+- The Python entry point lives in `tokenspeed_a2a_lamport.py`. Both packet and chunk
   exchange require **exactly four GPUs per process group on one host**,
   not necessarily four GPUs in the entire job. Peer indexing and scratch
   layouts are specialized for four peers; other group sizes are rejected.
-- Prepare `CudaLamportA2AState(group, max_rows, channels, device, blocks)` on all
+- Prepare `TokenSpeedA2ALamportState(group, max_rows, channels, device, blocks)` on all
   four peers before capture. This creates symmetric scratch and compiles the
   kernel. All peers must agree on the physical shape and direction of each call.
 - Inputs are contiguous BF16 matrices; `K` is a positive multiple of eight.
@@ -54,7 +54,7 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
   measured; no cross-node or other-dtype claim is made.
 - The kernel itself has no implicit NCCL fallback. The projection runtime owns
   admission, padding and NCCL fallback; see
-  [the deployment recipe](../../../../../docs/recipes/kimi-k3-output-projection-tp.md).
+  [the deployment recipe](../../../../../docs/recipes/kimi-k3-tp-sharding.md).
 
 ## Optional large-message chunk exchange
 
@@ -64,7 +64,7 @@ Enable this explicitly on **every peer**, before capturing any graph:
 state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
 ```
 
-The existing `cuda_lamport_a2a(state, inputs, inverse)` entry point then chooses
+The existing `tokenspeed_a2a_lamport(state, inputs, inverse)` entry point then chooses
 packet exchange below the threshold and chunk exchange at/above it. Both use
 the same layout contract and return the same local output buffer. Peers must
 agree on physical shapes, direction and threshold. Chunk exchange additionally
