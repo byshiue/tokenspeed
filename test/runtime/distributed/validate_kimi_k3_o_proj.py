@@ -32,6 +32,7 @@ from test.runtime.distributed.kimi_k3_o_proj_helpers import (
     load_projection,
     make_linears,
 )
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -44,17 +45,18 @@ from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.dp_row_parallel_linear import (
-    ProjectionWorkspace,
+from tokenspeed.runtime.layers.dp_linear_communication import (
+    DPRowParallelCommunication,
     initialize_projection_group,
     validate_projection_settings,
 )
+from tokenspeed.runtime.layers.linear import RowParallelLinear
 from tokenspeed.runtime.utils.env import envs
 
 ENV_NAME = envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.name
 
 
-def validate_backend_transitions(exchange, linear, baseline, k, world):
+def validate_backend_transitions(linear, baseline, k, world):
     """Replay mixed backend boundaries with delayed peers and retained outputs."""
     rank = dist.get_rank()
     patterns = [
@@ -80,7 +82,7 @@ def validate_backend_transitions(exchange, linear, baseline, k, world):
         for x in inputs
     ]
     for x, counts in zip(inputs, patterns):
-        exchange.forward(x, linear, counts)
+        linear(x, counts=counts)[0]
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -89,7 +91,7 @@ def validate_backend_transitions(exchange, linear, baseline, k, world):
             if rank % 4 == 0:
                 for _ in range(4):
                     delay.mul_(1.0001)
-            outputs.append(exchange.forward(x, linear, counts))
+            outputs.append(linear(x, counts=counts)[0])
     for _ in range(5):
         graph.replay()
         for actual, reference in zip(outputs, expected):
@@ -160,23 +162,34 @@ def main():
         else:
             weight, scale, quant = load_projection(args.model, layer)
             n, k = weight.shape
-        (baseline, _), (linear, exchange) = make_linears(mapping, weight, scale, quant)
+        baseline, linear = make_linears(mapping, weight, scale, quant)
+        # A quant method without apply_into must still populate the caller's
+        # destination. Keep the real GPU GEMM, hiding only its optional out API.
+        inputs = torch.randn(2, k // parallel.tp_size, device="cuda")
+        expected, expected_bias = RowParallelLinear.forward(linear, inputs, scale=None)
+        destination = torch.full_like(expected, float("nan"))
+        with patch.object(
+            linear, "quant_method", SimpleNamespace(apply=linear.quant_method.apply)
+        ):
+            actual, output_bias = linear.forward_into(inputs, None, destination)
+        assert actual is destination and output_bias is expected_bias
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         reference_weight = weight.float()
         if scale is not None:
             reference_weight *= scale.repeat_interleave(128, 0).repeat_interleave(
                 128, 1
             )
         reference_weight = reference_weight.cuda()
-        exchange.workspace = ProjectionWorkspace(
+        linear.communication = DPRowParallelCommunication(
             8193 if args.large_tokens else 512, k, torch.bfloat16, torch.device("cuda")
         )
-        exchange.workspace.initialize_a2a(
-            exchange.parallel,
+        linear.communication.initialize_a2a(
+            linear.parallel,
             [k],
             backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
         )
-        exchange.workspace.initialize_reduce_scatter(
-            exchange.parallel,
+        linear.communication.initialize_reduce_scatter(
+            linear.parallel,
             [n],
             backend=envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
         )
@@ -210,29 +223,29 @@ def main():
                 generator=generator,
             )
             expected = baseline(x)[0] if counts[rank] else x.new_empty((0, n))
-            actual = exchange.forward(x, linear, counts)
+            actual = linear(x, counts=counts)[0]
             # Compare against the same TP4 GEMM/reduction with its original
             # separate quantizer, isolating fusion from TP1 rounding differences.
             with patch(
-                "tokenspeed.runtime.layers.dp_row_parallel_linear.fp8_linear_accepts_prepacked_input",
+                "tokenspeed.runtime.layers.linear.fp8_linear_accepts_prepacked_input",
                 return_value=False,
             ):
-                unfused = exchange.forward(x, linear, counts)
+                unfused = linear(x, counts=counts)[0]
             torch.testing.assert_close(actual, unfused, rtol=0, atol=0)
-            max_rows = max(counts[r] for r in exchange.parallel.tp_group)
-            lamport_a2a = exchange.workspace.lamport_a2a_state(k, max_rows)
+            max_rows = max(counts[r] for r in linear.parallel.tp_group)
+            lamport_a2a = linear.communication.lamport_a2a_state(k, max_rows)
             check_reduction = lamport_a2a is not None and all(
-                counts[r] == max_rows for r in exchange.parallel.tp_group
+                counts[r] == max_rows for r in linear.parallel.tp_group
             )
             using_peer = (
-                exchange.workspace.peer_state(
-                    n, max(counts[r] for r in exchange.parallel.tp_group)
+                linear.communication.peer_state(
+                    n, max(counts[r] for r in linear.parallel.tp_group)
                 )
                 is not None
             )
             using_lamport = (
-                exchange.workspace.lamport_state(
-                    n, max(counts[r] for r in exchange.parallel.tp_group)
+                linear.communication.lamport_state(
+                    n, max(counts[r] for r in linear.parallel.tp_group)
                 )
                 is not None
             )
@@ -244,19 +257,21 @@ def main():
                 redistributed = tokenspeed_a2a_lamport(
                     lamport_a2a, x.contiguous(), inverse=False, out=None
                 )
-                partial, _ = linear(redistributed)
+                partial, _ = RowParallelLinear.forward(
+                    linear, redistributed, scale=None
+                )
                 reduction_reference = partial.float()
                 dist.all_reduce(
                     reduction_reference,
                     group=pg_manager.get_process_group(
-                        "nccl", exchange.parallel.tp_group
+                        "nccl", linear.parallel.tp_group
                     ),
                 )
                 rows = counts[rank]
-                offset = exchange.parallel.tp_rank * rows
+                offset = linear.parallel.tp_rank * rows
                 reduction_reference = reduction_reference[offset : offset + rows]
                 nccl_output = reduce_scatter(
-                    partial, exchange.parallel.tp_group, backend=None
+                    partial, linear.parallel.tp_group, backend=None
                 )
                 norm = reduction_reference.norm().clamp_min(1e-8)
                 reduction_errors[0] = (
@@ -269,7 +284,7 @@ def main():
             dist.all_reduce(reduction_errors, op=dist.ReduceOp.MAX)
             # Outputs must survive reuse of symmetric scratch by a later layer.
             preserved = actual.clone()
-            exchange.forward(x * 0.5, linear, counts)
+            linear(x * 0.5, counts=counts)[0]
             torch.testing.assert_close(actual, preserved, rtol=0, atol=0)
             if x.shape[0]:
                 reference = x.float() @ reference_weight.T
@@ -299,15 +314,15 @@ def main():
             # replay to detect stale packing and graph-owned scratch aliases.
             if max(counts):
                 for _ in range(3):
-                    exchange.forward(x, linear, counts)
+                    linear(x, counts=counts)[0]
                 torch.cuda.synchronize()
                 capture = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(capture):
-                    graphed = exchange.forward(x, linear, counts)
+                    graphed = linear(x, counts=counts)[0]
                 for multiplier in (0.5, -1.0, 1e-10, 0.0):
                     x.mul_(multiplier)
                     capture.replay()
-                    eager = exchange.forward(x, linear, counts)
+                    eager = linear(x, counts=counts)[0]
                     torch.testing.assert_close(graphed, eager, rtol=0, atol=0)
                 # Captured collective counts describe physical rows. Valid
                 # token counts may change within that envelope between replays.
@@ -315,7 +330,7 @@ def main():
                     x.zero_()
                     x[:valid].normal_(generator=generator)
                     capture.replay()
-                    eager = exchange.forward(x, linear, counts)
+                    eager = linear(x, counts=counts)[0]
                     torch.testing.assert_close(graphed, eager, rtol=0, atol=0)
                 torch.cuda.synchronize()
                 # NCCL communicators cannot be destroyed while a live graph
@@ -346,9 +361,9 @@ def main():
             if rank == 0:
                 print(json.dumps(record), flush=True)
         if args.large_tokens:
-            validate_backend_transitions(exchange, linear, baseline, k, world)
-        exchange.workspace.close()
-        del baseline, linear, exchange, reference_weight
+            validate_backend_transitions(linear, baseline, k, world)
+        linear.communication.close()
+        del baseline, linear, reference_weight
         torch.cuda.empty_cache()
     dist.barrier()
     if rank == 0:

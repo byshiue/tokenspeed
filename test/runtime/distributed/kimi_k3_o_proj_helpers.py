@@ -27,10 +27,8 @@ from pathlib import Path
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.layers.dp_row_parallel_linear import (
-    make_output_projection,
-    projection_mapping,
-)
+from tokenspeed.runtime.layers.dp_linear_communication import projection_mapping
+from tokenspeed.runtime.layers.linear import DPRowParallelLinear, RowParallelLinear
 from tokenspeed.runtime.utils.env import envs
 
 ENV_NAME = envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.name
@@ -95,20 +93,39 @@ def make_linears(mapping: Mapping, weight, scale, quant):
     result = []
     for size in (1, 4):
         os.environ[ENV_NAME] = str(size)
+        parallel = projection_mapping(mapping.rank, mapping.world_size, size)
         with torch.device("cuda"):
-            linear, exchange = make_output_projection(
-                parallel=projection_mapping(mapping.rank, mapping.world_size, size),
-                input_size=k,
-                output_size=n,
-                quant_config=quant,
-                prefix="self_attn.o_proj",
-                default_parallel=mapping.attn,
-                reduce_results=False,
-            )
+            if size > 1:
+                linear = DPRowParallelLinear(
+                    k,
+                    n,
+                    parallel=parallel,
+                    params_dtype=None,
+                    quant_config=quant,
+                    prefix="self_attn.o_proj",
+                )
+            else:
+                linear = RowParallelLinear(
+                    k,
+                    n,
+                    bias=False,
+                    input_is_parallel=True,
+                    skip_bias_add=False,
+                    params_dtype=None,
+                    reduce_results=False,
+                    quant_config=quant,
+                    prefix="self_attn.o_proj",
+                    tp_rank=parallel.tp_rank,
+                    tp_size=parallel.tp_size,
+                    tp_group=parallel.tp_group,
+                    use_presharded_weights=False,
+                    override_kernel_name=None,
+                    interleave_linear_and_gate=False,
+                )
         linear.weight.weight_loader(linear.weight, weight)
         if scale is not None:
             linear.weight_scale_inv.weight_loader(linear.weight_scale_inv, scale)
         linear.quant_method.process_weights_after_loading(linear)
-        result.append((linear, exchange))
+        result.append(linear)
     os.environ[ENV_NAME] = "4"
     return result
