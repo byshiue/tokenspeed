@@ -113,11 +113,12 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
-from tokenspeed.runtime.layers.attention.column_proj import (
-    DistributedColumnProjection,
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dp_column_parallel_linear import (
+    DPColumnParallelLinear,
     column_projection_width,
 )
-from tokenspeed.runtime.layers.attention.o_proj import (
+from tokenspeed.runtime.layers.dp_row_parallel_linear import (
     ProjectionWorkspace,
     initialize_projection_group,
     make_output_projection,
@@ -125,7 +126,6 @@ from tokenspeed.runtime.layers.attention.o_proj import (
     projection_mapping,
     validate_projection_settings,
 )
-from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
 )
@@ -3767,7 +3767,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                         raise RuntimeError("Cannot grow prepared QKV communication")
                     column_exchanges[key] = existing
                 if key not in column_exchanges:
-                    column_exchanges[key] = DistributedColumnProjection(
+                    column_exchanges[key] = DPColumnParallelLinear(
                         parallel,
                         linear.input_size,
                         linear.output_size,

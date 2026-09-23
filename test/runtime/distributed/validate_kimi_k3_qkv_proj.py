@@ -40,11 +40,11 @@ from tokenspeed_kernel.ops.communication.trtllm import trtllm_allgather_fp8_quan
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.attention.column_proj import (
-    DistributedColumnProjection,
+from tokenspeed.runtime.layers.dp_column_parallel_linear import (
+    DPColumnParallelLinear,
     column_projection_width,
 )
-from tokenspeed.runtime.layers.attention.o_proj import (
+from tokenspeed.runtime.layers.dp_row_parallel_linear import (
     initialize_projection_group,
     projection_mapping,
 )
@@ -165,7 +165,7 @@ def main():
             rtol=0,
             atol=0,
         )
-        communication = DistributedColumnProjection(
+        communication = DPColumnParallelLinear(
             parallel,
             weight.shape[1],
             total,
@@ -200,7 +200,7 @@ def main():
             )
             expected = baseline(x)[0] if x.shape[0] else x.new_empty((0, total))
             with patch(
-                "tokenspeed.runtime.layers.attention.column_proj.trtllm_allgather_fp8_quantize",
+                "tokenspeed.runtime.layers.dp_column_parallel_linear.trtllm_allgather_fp8_quantize",
                 wraps=trtllm_allgather_fp8_quantize,
             ) as fused_gather:
                 actual = communication.forward(x, linear, counts)
@@ -325,7 +325,7 @@ def main():
         counts = [0 if r % 4 == 0 else 3 for r in range(world)]
         x = torch.randn(counts[rank], weight.shape[1], device="cuda")
         with patch(
-            "tokenspeed.runtime.layers.attention.column_proj.trtllm_allgather_fp8_quantize",
+            "tokenspeed.runtime.layers.dp_column_parallel_linear.trtllm_allgather_fp8_quantize",
             side_effect=AssertionError("BF16 must not use FP8 gather"),
         ):
             actual = communication.forward(x, bf16_linear, counts)
@@ -335,7 +335,7 @@ def main():
         del bf16_linear
         communication.close()
         # An explicit NCCL gather does not enter the fused route.
-        nccl_communication = DistributedColumnProjection(
+        nccl_communication = DPColumnParallelLinear(
             parallel,
             weight.shape[1],
             total,
@@ -347,7 +347,7 @@ def main():
             "nccl",
         )
         with patch(
-            "tokenspeed.runtime.layers.attention.column_proj.trtllm_allgather_fp8_quantize",
+            "tokenspeed.runtime.layers.dp_column_parallel_linear.trtllm_allgather_fp8_quantize",
             side_effect=AssertionError("NCCL must not use fused gather"),
         ):
             actual = nccl_communication.forward(x, linear, counts)
