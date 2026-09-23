@@ -52,6 +52,26 @@ output-channel shards, with zero tail padding to keep scale blocks aligned.
 Output projections load input-channel shards and their scales directly.
 Checkpoint codes are not requantized.
 
+`DPColumnParallelLinear` and `DPRowParallelLinear` live in `layers/linear.py`
+and inherit their weight creation, shard loading and quantization from the
+ordinary column/row parallel layers. Parameter paths stay unchanged, including
+`qkvgb_proj.weight` and `o_proj.weight`; there is no nested `linear` module.
+KDA retains its segment-aware checkpoint loader in `KimiKDAColumnProj`.
+
+Both DP layers take explicit physical token counts and return `(output, bias)`.
+Column projection keeps the parent's `output_size` as the padded weight width
+and returns only `logical_output_size` channels. It disables the parent's output
+gather because A2A restores complete outputs. Row projection similarly disables
+the parent's all-reduce because ReduceScatter performs the required reduction.
+The ordinary GEMM paths use the parent methods; compatible FP8 plans retain
+the fused quantization paths described below.
+
+Communication buffers are separate from the linear modules. Model setup binds
+one `DPColumnParallelCommunication` per stored shape and one shared
+`DPRowParallelCommunication` for sequential O projections before memory
+budgeting and graph capture. Forward never creates communicators or grows
+their buffers; the auxiliary-stream MLP buffers remain independent.
+
 Inspect tensors rather than inferring every layer's precision from the model
 name. The NVFP4 checkpoint used for this recipe has block-FP8 attention
 projections and BF16 shared experts; its routed experts use NVFP4.
@@ -204,13 +224,14 @@ Run orchestration and real stream-dependency checks:
 
 ```bash
 python -m pytest -q \
-  test/runtime/distributed/test_kimi_k3_projection_tp.py \
   test/runtime/test_kimi_k3_moe_attn_dp.py \
   test/runtime/test_cuda_stream.py test/runtime/test_kimi_k3_config.py
 ```
 
-The projection unit tests cover shard arithmetic and empty-owner participation.
-Distributed numerical checks use the production helpers and real weights.
+The distributed validators check projection numerics with real weights, output
+ownership, graph replay, and backend boundaries. They also exercise the output
+buffer fallback and empty KDA/MLA model forwards with independent QKV/O switches
+and real collectives, using small deterministic matrices for the latter.
 Within the allocation, launch each validator on all nodes:
 
 ```bash
