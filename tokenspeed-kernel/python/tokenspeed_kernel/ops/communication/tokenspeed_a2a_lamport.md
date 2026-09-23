@@ -39,10 +39,15 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
   kernel. All peers must agree on the physical shape and direction of each call.
 - Inputs are contiguous BF16 matrices; `K` is a positive multiple of eight.
   Uneven/empty logical owners must be padded to the same positive physical `M`.
-- Serialize this communicator and its consumers on one CUDA stream. The result
-  borrows persistent **local output**, valid until the next call. Inputs must
-  not alias output or communication scratch. Retain the state while graphs
-  reference it; synchronize every rank before releasing it.
+- Serialize this communicator and its consumers on one CUDA stream. Pass
+  `out=None` to borrow persistent **local output**, valid until the next call.
+  Alternatively, supply a contiguous BF16 output with the exact result shape,
+  matching device and a 16-byte-aligned address. The kernel writes directly into
+  that tensor and returns it; later exchanges do not overwrite it. Supplied output
+  must not share storage with inputs or state buffers. Inputs must not alias
+  persistent output or communication scratch. Retain the state and destinations
+  while queued work or graphs reference them; synchronize every rank before
+  releasing the state.
 - Eager and CUDA Graph execution use the same kernel and GPU-owned generation.
   Recreate the communicator before `2^32` calls: generation overflow traps
   rather than risking acceptance of stale packets. There is no recovery from
@@ -64,9 +69,9 @@ Enable this explicitly on **every peer**, before capturing any graph:
 state.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
 ```
 
-The existing `tokenspeed_a2a_lamport(state, inputs, inverse)` entry point then chooses
+The `tokenspeed_a2a_lamport(state, inputs, inverse, out)` entry point then chooses
 packet exchange below the threshold and chunk exchange at/above it. Both use
-the same layout contract and return the same local output buffer. Peers must
+the same layout contract and write the selected local output buffer. Peers must
 agree on physical shapes, direction and threshold. Chunk exchange additionally
 requires channels divisible by 32. The original packet-only behavior remains
 available by not preparing chunk exchange.
@@ -129,8 +134,9 @@ the original runtime cases retain their existing requirements.
 
 Correctness compares integer views against NCCL to check every bit. Coverage
 includes both directions, minimal/tail widths, changing shapes and payloads,
-an empty logical owner, delayed peers, consumers inside captured graphs, ring
-reuse, and crossing the signed-int32 generation boundary.
+an empty logical owner, delayed peers, borrowed and caller-owned destinations
+inside captured graphs, retained-output lifetime, ring reuse, and crossing the
+signed-int32 generation boundary.
 
 Benchmark timings exclude startup/JIT. After 20 warmups, each sample times
 10 replays of a graph containing 100 exchanges using CUDA events, takes the

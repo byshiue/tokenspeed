@@ -45,10 +45,11 @@ class TokenSpeedA2ALamportState:
     of the total number of GPUs in the job.
 
     All ranks must call in the same order, with equal physical shapes, on one
-    serialized stream. Outputs are borrowed until the next call. Empty logical
-    owners must participate using zero-padded physical rows. Three generations
-    protect readers from faster peers; each 64-bit packet embeds a 32-bit epoch
-    and 32 payload bits, preserving signed zero and NaN payloads exactly.
+    serialized stream. Outputs are borrowed unless the caller supplies storage.
+    Empty logical owners must participate using zero-padded physical rows.
+    Three generations protect readers from faster peers; each 64-bit packet
+    embeds a 32-bit epoch and 32 payload bits, preserving signed zero and NaN
+    payloads exactly.
     """
 
     def __init__(self, group, max_rows, channels, device, blocks):
@@ -180,13 +181,17 @@ class TokenSpeedA2ALamportState:
     solution="cuda",
     signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
 )
-def tokenspeed_a2a_lamport(state, inputs, inverse):
+def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
     """Exchange BF16 channel shards while preserving every input bit.
 
     Forward: [M,K] -> [4*M,K/4]. Inverse: [4*M,K/4] -> [M,K].
-    state owns persistent scratch/output; inverse explicitly chooses layout.
-    Every peer must use the same shape/direction and serialize consumers before
-    its next call. Returned output aliases state.output, not remote scratch.
+    state owns persistent scratch; inverse explicitly chooses layout.
+    out=None returns borrowed state.output, valid until the next call. A supplied
+    out must have the exact result shape, be contiguous BF16 on the same device,
+    and have a 16-byte-aligned address without aliasing inputs or state storage.
+    The kernel writes directly into out and returns it, without an extra copy.
+    Every peer must use the same shape/direction on one serialized stream.
+    Keep state and output storage alive until their queued consumers finish.
     """
     if inputs.ndim != 2:
         raise ValueError("A2A input must be a matrix")
@@ -216,7 +221,40 @@ def tokenspeed_a2a_lamport(state, inputs, inverse):
     result_shape = (
         (rows, state.channels) if inverse else (4 * rows, state.channels // 4)
     )
-    output = state.output[: inputs.numel()].view(result_shape)
+    if out is None:
+        output = state.output[: inputs.numel()].view(result_shape)
+    else:
+        if (
+            tuple(out.shape) != result_shape
+            or out.dtype != torch.bfloat16
+            or out.device != inputs.device
+            or not out.is_contiguous()
+            or out.data_ptr() % 16
+        ):
+            raise ValueError(
+                "Output must match the A2A result shape, dtype, device, "
+                "contiguity, and 16-byte alignment"
+            )
+        # A separate destination preserves ownership across subsequent calls.
+        # Reject shared storage conservatively, including protocol metadata.
+        output_storage = out.untyped_storage().data_ptr()
+        if any(
+            buffer is not None and output_storage == buffer.untyped_storage().data_ptr()
+            for buffer in (
+                inputs,
+                state.output,
+                state.scratch,
+                state.control,
+                state.peers,
+                state.chunk_scratch,
+                state.chunk_flags,
+                state.chunk_control,
+                state.chunk_peers,
+                state.chunk_flag_peers,
+            )
+        ):
+            raise ValueError("Output must not alias A2A inputs or state storage")
+        output = out
     if (
         state.chunk_threshold_bytes is not None
         and inputs.numel() * inputs.element_size() >= state.chunk_threshold_bytes

@@ -129,8 +129,10 @@ Projection scratch is separate from attention buffers and auxiliary-stream
 shared-expert communication.
 
 TokenSpeed A2A's packet/chunk rings and local output cost about ten times the
-maximum payload, in addition to NCCL staging. QKV retains an owned copy of the
-borrowed exchange result; O projection consumes it directly in GEMM.
+maximum payload, in addition to NCCL staging. QKV gives A2A an owned output tensor
+to write directly, avoiding a post-exchange copy while keeping earlier results
+valid across later projection calls. O projection consumes borrowed output
+directly in GEMM.
 Lamport protects its own rings, not the separate GEMM buffer used by
 `triton_peer`. Peer reduction keeps an explicit completion fence before that
 buffer can be written again.
