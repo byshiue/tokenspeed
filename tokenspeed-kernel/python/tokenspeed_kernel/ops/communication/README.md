@@ -1,4 +1,4 @@
-# Experimental fused AllGather and FP8 quantization
+# Fused AllGather and FP8 quantization
 
 `TrtllmAllGatherQuantState` and `trtllm_allgather_fp8_quantize` combine BF16
 Lamport AllGather with 128-element FP8 activation quantization. Each ready
@@ -7,9 +7,12 @@ prepared GEMM. Communication remains BF16. Fusion removes the gathered-BF16
 output write/read and a separate quantization launch; it does not reduce
 network traffic.
 
-This prototype is not selected by the model runtime. It does not apply
-RMSNorm or use PDL. A following GEMM waits for the fused kernel to complete
-normally; there is no separate overlapping scale consumer.
+Kimi-K3 QKV projection TP selects this path by default for TP2/TP4, up to 128
+physical rows/rank, and compatible prepared block-FP8 GEMM plans. Other plans
+keep separate gather and linear execution. See the unified
+[TP-sharding recipe](../../../../../docs/recipes/kimi-k3-tp-sharding.md).
+This does not apply RMSNorm or use PDL. A following GEMM waits for the fused
+kernel to complete normally; there is no overlapping scale consumer.
 
 Create the state collectively before CUDA-graph capture. Pass an explicit
 positive `num_blocks` no larger than the device's SM count. Inputs must be
@@ -17,7 +20,7 @@ contiguous, finite BF16 with a width divisible by 128 and equal physical row
 counts of 1..128 across the subgroup. Empty owners participate with zero
 padding. Calls sharing a state must be serialized, and returned buffers are
 borrowed until the next fused call. The state retains the ordinary BF16 output
-buffer for reference testing, so this prototype does not yet reduce allocated
+buffer for fallback and reference testing, so fusion does not reduce allocated
 scratch.
 
 Quantization matches the prepared-scale path, including the native TRT-LLM

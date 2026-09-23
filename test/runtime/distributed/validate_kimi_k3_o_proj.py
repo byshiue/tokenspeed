@@ -35,14 +35,15 @@ from test.runtime.distributed.kimi_k3_o_proj_helpers import (
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.cuda_lamport import cuda_lamport_a2a
-from tokenspeed_kernel.ops.communication.flashinfer import flashinfer_projection_a2a
+from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+    tokenspeed_a2a_lamport,
+)
 
 from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.attention.o_proj import (
+from tokenspeed.runtime.layers.dp_row_parallel_linear import (
     ProjectionWorkspace,
     initialize_projection_group,
     validate_projection_settings,
@@ -119,6 +120,19 @@ def main():
         device_id=torch.device("cuda", torch.cuda.current_device()),
     )
     os.environ[ENV_NAME] = "4"
+    # Reject rank disagreement collectively before creating subgroups. This is
+    # a deadlock-safety check with real collectives, not a mocked settings table.
+    for local_value in ("1", "invalid"):
+        rejected = False
+        try:
+            validate_projection_settings(
+                mapping, local_value if rank == 0 else "4", "nccl", "nccl"
+            )
+        except ValueError as exc:
+            rejected = "differ across ranks" in str(exc)
+        rejected_on_all_ranks = torch.tensor(int(rejected), device="cuda")
+        dist.all_reduce(rejected_on_all_ranks, op=dist.ReduceOp.MIN)
+        assert rejected_on_all_ranks.item() == 1
     parallel = validate_projection_settings(
         mapping,
         envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
@@ -196,12 +210,10 @@ def main():
             )
             expected = baseline(x)[0] if counts[rank] else x.new_empty((0, n))
             actual = exchange.forward(x, linear, counts)
-            fused_a2a = exchange.workspace.use_flashinfer(exchange.parallel, counts, k)
             max_rows = max(counts[r] for r in exchange.parallel.tp_group)
             lamport_a2a = exchange.workspace.lamport_a2a_state(k, max_rows)
-            check_reduction = fused_a2a or (
-                lamport_a2a is not None
-                and all(counts[r] == max_rows for r in exchange.parallel.tp_group)
+            check_reduction = lamport_a2a is not None and all(
+                counts[r] == max_rows for r in exchange.parallel.tp_group
             )
             using_peer = (
                 exchange.workspace.peer_state(
@@ -220,12 +232,8 @@ def main():
             if custom_reduction and check_reduction:
                 # Same quantized GEMM partials: isolate reduction rounding from
                 # weight/activation quantization and TP1 accumulation changes.
-                redistributed = (
-                    cuda_lamport_a2a(lamport_a2a, x.contiguous(), inverse=False)
-                    if lamport_a2a is not None
-                    else flashinfer_projection_a2a(
-                        exchange.workspace.a2a, x.contiguous()
-                    )
+                redistributed = tokenspeed_a2a_lamport(
+                    lamport_a2a, x.contiguous(), inverse=False
                 )
                 partial, _ = linear(redistributed)
                 reduction_reference = partial.float()
@@ -319,9 +327,7 @@ def main():
                     else "triton_peer" if using_peer else "nccl"
                 ),
                 "a2a_backend": (
-                    "cuda_lamport"
-                    if lamport_a2a is not None
-                    else "flashinfer" if fused_a2a else "nccl"
+                    "tokenspeed_a2a_lamport" if lamport_a2a is not None else "nccl"
                 ),
                 "relative_l2": relative_l2.item(),
                 "absolute_max": absolute_max.item(),
