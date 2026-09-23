@@ -449,6 +449,7 @@ def fp8_linear_prepacked(
     input_scales: torch.Tensor,
     num_tokens: int,
     out_dtype: torch.dtype,
+    out: torch.Tensor | None,
 ) -> torch.Tensor:
     """Consume an external quantizer's output without quantizing or packing again.
 
@@ -459,17 +460,29 @@ def fp8_linear_prepacked(
         input_scales: Contiguous FP32 MN-major scales ``[K/128,x.shape[0]]``.
         num_tokens: Logical input row count, excluding quantizer padding.
         out_dtype: Requested output dtype.
+        out: Caller-owned [num_tokens,N] output, or None to allocate it.
 
     Returns:
-        Owned ``[num_tokens,N]`` output, with padded rows removed. Unsupported
+        Owned ``[num_tokens,N]`` output (or out), with padded rows removed. Unsupported
         plans fail rather than interpreting MN-major scales as canonical scales.
     """
     if not fp8_linear_accepts_prepacked_input(plan, num_tokens):
         raise ValueError("FP8 linear plan does not accept prepacked input")
     if x.dtype != torch.float8_e4m3fn or x.shape[0] != (num_tokens + 3) // 4 * 4:
         raise ValueError("Prepacked FP8 input must have four-row padding")
+    if out is not None:
+        _validate_gemm_out(
+            out,
+            shape=(num_tokens, weight.shape[0]),
+            dtype=out_dtype,
+            device=x.device,
+            op="fp8_linear_prepacked",
+        )
+    # Aligned TP batches write straight into reduction scratch. A padded GEMM
+    # must first trim its temporary output before copying to a logical-size out.
+    destination = out if num_tokens == x.shape[0] else None
     typed_plan = _require_fp8_linear_plan(plan)
-    return mm(
+    output = mm(
         x,
         weight,
         A_scales=input_scales,
@@ -480,8 +493,13 @@ def fp8_linear_prepacked(
         block_size=list(typed_plan.block_size),
         override=typed_plan.override,
         prepacked_scales=True,
-        out=None,
-    )[:num_tokens]
+        out=destination,
+    )
+    if out is not None:
+        if destination is None:
+            out.copy_(output[:num_tokens])
+        return out
+    return output[:num_tokens]
 
 
 def _fp8_linear_activation(

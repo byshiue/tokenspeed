@@ -203,7 +203,9 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
     # weight scales and strip quantizer padding without requantizing the input.
     assert fp8_linear_accepts_prepacked_input(plan, m)
     values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
-    external = fp8_linear_prepacked(plan, values, weight, scales, m, torch.bfloat16)
+    external = fp8_linear_prepacked(
+        plan, values, weight, scales, m, torch.bfloat16, out=None
+    )
     torch.testing.assert_close(external, planned, atol=0, rtol=0)
     # Caller-owned communication buffers and ordinary/strided destinations
     # must preserve the prepared quantizer, including its padded-M fallback.
@@ -214,6 +216,12 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         destination = storage[::stride]
         actual = fp8_linear(
             plan, x, weight, weight_scales, out_dtype=torch.bfloat16, out=destination
+        )
+        assert actual.data_ptr() == destination.data_ptr()
+        torch.testing.assert_close(actual, planned, atol=0, rtol=0)
+        destination.fill_(float("nan"))
+        actual = fp8_linear_prepacked(
+            plan, values, weight, scales, m, torch.bfloat16, out=destination
         )
         assert actual.data_ptr() == destination.data_ptr()
         torch.testing.assert_close(actual, planned, atol=0, rtol=0)
@@ -235,7 +243,7 @@ def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> No
     assert not fp8_linear_accepts_prepacked_input(plan, m)
     values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
     with pytest.raises(ValueError, match="does not accept prepacked input"):
-        fp8_linear_prepacked(plan, values, weight, scales, m, torch.bfloat16)
+        fp8_linear_prepacked(plan, values, weight, scales, m, torch.bfloat16, out=None)
     planned = fp8_linear(
         plan, x, weight, weight_scales, out_dtype=torch.bfloat16, out=None
     )

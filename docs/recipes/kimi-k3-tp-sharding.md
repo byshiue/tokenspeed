@@ -109,8 +109,8 @@ Communication stays BF16: the fusion removes the gathered-output write/read
 and a separate quantization launch, not network bytes.
 
 Larger batches, TP8/TP16, explicit NCCL AllGather, BF16 linears and incompatible
-GEMM plans retain separate gather and linear execution. This does not quantize
-shared experts or change O projection. It is not RMSNorm fusion or PDL; GEMM
+GEMM plans retain separate gather and linear execution. This fusion applies
+only to QKV, not shared experts. It is not RMSNorm fusion or PDL; GEMM
 waits for the fused kernel to complete normally.
 
 The kernel APIs are `TrtllmAllGatherQuantState` and
@@ -120,6 +120,25 @@ Runtime uses one CTA per SM. Inputs are contiguous BF16, width divisible by
 128, with equal physical counts after padding. Quantization matches the
 prepared GEMM's scale/clamp and padding rules; dependency changes require
 checking exact FP8 bytes and scales again.
+
+### Fused O-projection A2A and quantization
+
+Compatible output projections fuse Lamport A2A with the same 128-element FP8
+activation quantizer by default. The receiver quantizes each complete group
+only after its BF16 payload is ready, writing FP8 values and MN-major FP32
+scales directly for the prepared GEMM. This removes a BF16 output write/read
+and the separate quantization launch; it does not reduce network traffic.
+
+The fusion requires TP4, 1..512 physical rows/rank, input width divisible by
+512, no bias/redundant Linear reduction, and a compatible prepared FlashInfer
+block-FP8 GEMM plan. Other linears, NCCL A2A and larger batches keep separate
+exchange and Linear execution. GEMM still writes directly into the selected
+ReduceScatter input buffer. Quantization does not change its reduction backend.
+
+Prepare the FP8 outputs and scales before memory profiling or graph capture.
+They are borrowed across serialized calls and add approximately 0.516 times
+the maximum BF16 payload to A2A scratch. The ordinary BF16 output is retained
+for fallback and reference use. QKV's inverse A2A remains unquantized.
 
 ### Workspace and stream lifetime
 
@@ -225,12 +244,18 @@ python -m pytest -q \
   test/runtime/distributed/test_comm_ops.py::TestCommOps::test_all_to_all_single
 python -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/communication/test_trtllm_allgather_quant.py
+python -m pytest -q \
+  tokenspeed-kernel/test/nvidia/ops/communication/test_tokenspeed_a2a_quant.py
 ```
 
 These tests spawn their own workers; do not wrap pytest in torchrun. A2A is
 bit-compared with NCCL, including special payloads, ring reuse and graph replay.
 Fused gather/quantization checks FP8 bytes and scales for TP2/TP4, padded/empty
 owners and interchange with ordinary AllGather on the same workspace.
+Fused A2A checks exact FP8 values/scales, zero and extreme-value groups,
+delayed peers, packet/chunk transitions and interchange with unquantized A2A
+in captured graphs. Real-weight O-projection validation additionally compares
+fused and separate quantization with identical TP4 GEMM and reduction.
 
 For performance, warm up both variants and time the complete operation with
 CUDA graphs, identical weights/counts and repeated unprofiled measurements.

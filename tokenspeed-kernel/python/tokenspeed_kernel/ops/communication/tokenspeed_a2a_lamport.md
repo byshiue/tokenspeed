@@ -117,6 +117,26 @@ Packet format, generation checks, workspace size, and dispatch thresholds are
 unchanged; four rank variants increase compiled code size. GPU tests cover all
 ranks, both directions, and transitions across the packet/chunk boundary.
 
+## Fused FP8 receive-side quantization
+
+Call `state.prepare_fp8_quantization()` before capture, then
+`tokenspeed_a2a_lamport_fp8_quantize(state, inputs)` for the forward exchange.
+Input width must be divisible by 512: each TP4 channel shard contains whole
+128-element quantization groups. The kernel returns borrowed E4M3 values
+`[4*M,K/4]` and contiguous MN-major FP32 scales `[K/512,4*M]`.
+
+Packet polling or chunk acquire fences establish readiness before quantization.
+Both variants share their existing rings and generations with ordinary BF16
+A2A; there is no separate consumer-readiness protocol. The BF16 epsilon clamp,
+round-to-nearest divisions and FP8 conversion match the prepared FlashInfer
+quantizer. A following GEMM uses normal stream ordering and must finish reading
+the borrowed buffers before the next quantized call.
+
+Communication still carries BF16 data. The fusion removes local BF16 output
+materialization and a quantization launch, not link bytes. Persistent FP8 and
+scale outputs add `M*K + 4*M*K/128` bytes at the configured maximum M.
+The existing BF16 output remains available, and inverse exchange is unchanged.
+
 ## Validation and measurement methodology
 
 From the repository root, with optional CUDA/FlashInfer dependencies installed:
