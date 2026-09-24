@@ -48,6 +48,7 @@ from test.runtime.distributed.kimi_k3_o_proj_helpers import (
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.gemm.flashinfer import flashinfer_mm_fp8_blockscale
 from tokenspeed_kernel.ops.gemm.fp8_utils import (
@@ -71,13 +72,23 @@ def gather_weight_scales(
     WEIGHT_WORDS: tl.constexpr,
     SCALE_WORDS: tl.constexpr,
     BLOCK: tl.constexpr,
+    N_SHARD_SCALES: tl.constexpr,
+    PEERS: tl.constexpr,
 ):
     """Copy one immutable peer's scales per CTA into the prepared GEMM layout."""
     peer = tl.program_id(0)
     source = tl.load(sources + peer).to(tl.pointer_type(tl.int32))
     offsets = tl.arange(0, BLOCK)
     bits = tl.load(source + WEIGHT_WORDS + offsets, offsets < SCALE_WORDS, other=0)
-    tl.store(output + peer * SCALE_WORDS + offsets, bits, offsets < SCALE_WORDS)
+    if N_SHARD_SCALES:
+        destinations = (
+            offsets // N_SHARD_SCALES * (N_SHARD_SCALES * PEERS)
+            + peer * N_SHARD_SCALES
+            + offsets % N_SHARD_SCALES
+        )
+    else:
+        destinations = peer * SCALE_WORDS + offsets
+    tl.store(output + destinations, bits, offsets < SCALE_WORDS)
 
 
 @triton.jit
@@ -96,11 +107,12 @@ def copy_local_weight_and_gather_scales(
     VECTOR_LOAD: tl.constexpr,
     ASM_LOAD: tl.constexpr,
     STREAMING: tl.constexpr,
+    N_SHARD_SCALES: tl.constexpr,
 ):
     """Replace the late local CUDA 2D copy with a bounded ordinary CTA grid.
 
     Remote weight copies remain on copy engines. This kernel touches only the
-    local weight columns and all peers' tiny scale slices, bit-for-bit.
+    local weight shard and all peers' tiny scale slices, bit-for-bit.
     """
     pid = tl.program_id(0)
     source_address = tl.load(sources + RANK)
@@ -131,7 +143,12 @@ def copy_local_weight_and_gather_scales(
                 other=0,
                 cache_modifier=".cg" if STREAMING else "",
             )
-        destinations = offsets // shard_k * K_WORDS + RANK * shard_k + offsets % shard_k
+        if N_SHARD_SCALES:
+            destinations = RANK * WEIGHT_WORDS + offsets
+        else:
+            destinations = (
+                offsets // shard_k * K_WORDS + RANK * shard_k + offsets % shard_k
+            )
         if VECTOR_STORE:
             # Both row pitches and loop offsets are multiples of four words:
             # every aligned group of four destinations is contiguous.
@@ -151,7 +168,15 @@ def copy_local_weight_and_gather_scales(
         bits = tl.load(
             peer_source + WEIGHT_WORDS + offsets, offsets < SCALE_WORDS, other=0
         )
-        tl.store(scales + pid * SCALE_WORDS + offsets, bits, offsets < SCALE_WORDS)
+        if N_SHARD_SCALES:
+            destinations = (
+                offsets // N_SHARD_SCALES * (N_SHARD_SCALES * PEERS)
+                + pid * N_SHARD_SCALES
+                + offsets % N_SHARD_SCALES
+            )
+        else:
+            destinations = pid * SCALE_WORDS + offsets
+        tl.store(scales + destinations, bits, offsets < SCALE_WORDS)
 
 
 # Explicit experimental choices: remote-first, fused scales, late join,
@@ -191,6 +216,27 @@ REMOTE_STREAM_MODES = {
     f"remote_streams_{count}": (count, 1024, False) for count in (1, 2, 3)
 }
 REMOTE_STREAM_MODES["remote_streams_3_asm"] = (3, 4096, True)
+# Output-channel weight shards are contiguous in the full GEMM matrix. This
+# changes only persistent placement, not the replicated projection arithmetic.
+# Fields: local SM copy, local-first order, attention-first capture, early join.
+ROW_SHARD_MODES = {
+    "row_shards_ce": (False, False, False, False),
+    "row_shards_ce_local_first": (False, True, False, False),
+    "row_shards_sm": (True, False, False, False),
+    "row_shards_ce_attention_first": (False, False, True, False),
+    "row_shards_ce_early_join": (False, False, False, True),
+    "row_shards_ce_scales_first": (False, False, False, False),
+    "row_shards_ce_scales_first_marker": (False, False, False, False),
+    "row_shards_ce_cuda_default": (False, False, False, False),
+}
+ROW_COPY_TUNING = {
+    "row_shards_sm_32": (32, 4096, 4),
+    "row_shards_sm_32_w1": (32, 1024, 1),
+    "row_shards_sm_64_w1": (64, 1024, 1),
+    "row_shards_sm_sm_w1": (-1, 1024, 1),
+    "row_shards_sm_32_16k": (32, 16384, 4),
+}
+ROW_SHARD_MODES.update({name: (True, False, False, False) for name in ROW_COPY_TUNING})
 
 
 class ScaleCopyDiagnostic(DirectCopyEngineWeightPrefetch):
@@ -287,6 +333,7 @@ class PrefetchScheduleOptimization(ScaleCopyDiagnostic):
         self.optimization_mode = mode
         self.local_copy_ctas = LOCAL_COPY_MODES.get(mode, 0)
         self.local_copy_block = 1024
+        self.local_copy_warps = 4
         self.vector_store = False
         self.vector_load = False
         self.asm_load = mode in ASM_LOAD_MODES
@@ -295,6 +342,14 @@ class PrefetchScheduleOptimization(ScaleCopyDiagnostic):
         early_join = False
         self.peer_streams = []
         self.local_copy_kernel = None
+        # N-scale columns per peer for N shards; zero retains the K-shard layout.
+        self.n_shard_scales = 0
+        self.scales_first = mode in (
+            "row_shards_ce_scales_first",
+            "row_shards_ce_scales_first_marker",
+        )
+        self.final_marker = mode == "row_shards_ce_scales_first_marker"
+        self.copy_kind = 4 if mode == "row_shards_ce_cuda_default" else 3
         if mode in REMOTE_STREAM_MODES:
             count, self.local_copy_block, self.asm_load = REMOTE_STREAM_MODES[mode]
             self.peer_streams = [torch.cuda.Stream(priority=-1) for _ in range(count)]
@@ -311,6 +366,49 @@ class PrefetchScheduleOptimization(ScaleCopyDiagnostic):
                 early_join,
                 self.vector_load,
             ) = LOCAL_TUNING_MODES[mode]
+        row_local_first = row_attention_first = False
+        if mode in ROW_SHARD_MODES:
+            local_sm, row_local_first, row_attention_first, early_join = (
+                ROW_SHARD_MODES[mode]
+            )
+            assert self.n % (128 * self.size) == 0
+            shard_n = self.n // self.size
+            self.n_shard_scales = shard_n // 128
+            w = weight_cpu[self.rank * shard_n : (self.rank + 1) * shard_n].contiguous()
+            s = (
+                scales_cpu[
+                    self.rank
+                    * self.n_shard_scales : (self.rank + 1)
+                    * self.n_shard_scales
+                ]
+                .t()
+                .contiguous()
+            )
+            # Replace the superclass's K-shard setup allocation before capture.
+            # Only one shard stays resident; the complete matrix is scratch.
+            payload_cpu = torch.cat(
+                (w.view(torch.uint8).flatten(), s.view(torch.uint8).flatten())
+            )
+            self.payload = symm_mem.empty(
+                payload_cpu.shape, dtype=torch.uint8, device="cuda"
+            )
+            self.payload.copy_(payload_cpu)
+            self.handle = symm_mem.rendezvous(self.payload, group)
+            self.sources = [
+                self.handle.get_buffer(
+                    peer, self.payload.shape, self.payload.dtype, storage_offset=0
+                )
+                for peer in range(self.size)
+            ]
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            self.local_copy_ctas = -1 if local_sm else 0
+            self.local_copy_block = 4096
+            self.vector_store = self.vector_load = self.asm_load = local_sm
+        if mode in ROW_COPY_TUNING:
+            self.local_copy_ctas, self.local_copy_block, self.local_copy_warps = (
+                ROW_COPY_TUNING[mode]
+            )
         if self.vector_load:
             assert all(source.data_ptr() % 16 == 0 for source in self.sources)
             assert self.weight_shard_bytes % 16 == 0
@@ -324,7 +422,9 @@ class PrefetchScheduleOptimization(ScaleCopyDiagnostic):
             self.late_join,
             self.attention_first,
         ) = (
-            (True, True, True, False) if self.local_copy_ctas else SCHEDULE_MODES[mode]
+            (not row_local_first, True, True, row_attention_first)
+            if self.local_copy_ctas or mode in ROW_SHARD_MODES
+            else SCHEDULE_MODES[mode]
         )
         if early_join:
             self.late_join = False
@@ -352,12 +452,28 @@ class PrefetchScheduleOptimization(ScaleCopyDiagnostic):
             self.vector_load,
             self.asm_load,
             self.streaming,
-            num_warps=4,
+            self.n_shard_scales,
+            num_warps=self.local_copy_warps,
         )
+
+    def copy_weight(self, peer, stream):
+        if not self.n_shard_scales:
+            return super().copy_weight(peer, stream)
+        status = self.copy_bytes(
+            self.weight.data_ptr() + peer * self.weight_shard_bytes,
+            self.sources[peer].data_ptr(),
+            self.weight_shard_bytes,
+            self.copy_kind,
+            stream,
+        )
+        if status:
+            raise RuntimeError(f"cudaMemcpyAsync failed: {status}")
 
     def gather(self):
         stream = torch.cuda.current_stream().cuda_stream
         peers = [(self.rank - step) % self.size for step in range(self.size)]
+        if self.scales_first:
+            self.gather_scales()
         if self.peer_streams:
             owner_stream = torch.cuda.current_stream()
             # All branches inherit the previous GEMM's scratch-release edge.
@@ -383,18 +499,26 @@ class PrefetchScheduleOptimization(ScaleCopyDiagnostic):
             if not self.local_first:
                 self.copy_local()
         elif self.fused_scales:
-            gather_weight_scales[(self.size,)](
-                self.source_pointers,
-                self.scales.view(torch.int32),
-                self.weight_shard_bytes // 4,
-                self.scale_shard_bytes // 4,
-                triton.next_power_of_2(self.scale_shard_bytes // 4),
-                num_warps=4,
-            )
+            if not self.scales_first:
+                self.gather_scales()
+            elif self.final_marker:
+                copy_schedule_marker[(1,)](self.marker, num_warps=1)
         else:
             for peer in peers:
                 self.copy_scale(peer, stream)
             copy_schedule_marker[(1,)](self.marker, num_warps=1)
+
+    def gather_scales(self):
+        gather_weight_scales[(self.size,)](
+            self.source_pointers,
+            self.scales.view(torch.int32),
+            self.weight_shard_bytes // 4,
+            self.scale_shard_bytes // 4,
+            triton.next_power_of_2(self.scale_shard_bytes // 4),
+            self.n_shard_scales,
+            self.size,
+            num_warps=4,
+        )
 
     def overlap(self, attention):
         main = torch.cuda.current_stream()
@@ -558,6 +682,7 @@ def main():
             or mode in LOCAL_COPY_MODES
             or mode in LOCAL_TUNING_MODES
             or mode in REMOTE_STREAM_MODES
+            or mode in ROW_SHARD_MODES
         ):
             states[mode] = PrefetchScheduleOptimization(group, weight, scales, mode)
         elif mode == "contiguous":
@@ -570,7 +695,12 @@ def main():
             states[mode] = ScaleCopyDiagnostic(group, weight, scales, mode)
     reference = baseline(attention())[0].clone()
     for state in states.values():
-        state.prepare()
+        # Validate preparation on the same auxiliary stream used by overlap().
+        main_stream = torch.cuda.current_stream()
+        state.aux.wait_stream(main_stream)
+        with torch.cuda.stream(state.aux):
+            state.prepare()
+        main_stream.wait_stream(state.aux)
         torch.testing.assert_close(
             state.weight.view(torch.uint8).cpu(),
             weight.view(torch.uint8),
@@ -607,9 +737,8 @@ def main():
             torch.testing.assert_close(outputs[name], reference, rtol=0, atol=0)
     shared_scratch_checks = []
     for name, state in states.items():
-        if (
-            not isinstance(state, PrefetchScheduleOptimization)
-            or not state.local_copy_ctas
+        if not isinstance(state, PrefetchScheduleOptimization) or not (
+            state.local_copy_ctas or state.n_shard_scales
         ):
             continue
         check_shared_scratch(
@@ -622,7 +751,7 @@ def main():
             args.output.with_name(f"{args.output.stem}-{name}-shared-scratch.dot"),
         )
         shared_scratch_checks.append(name)
-        if rank == 0:
+        if rank == 0 and state.local_copy_kernel is not None:
             args.output.with_name(f"{args.output.stem}-{name}.ptx").write_text(
                 state.local_copy_kernel.asm["ptx"]
             )
@@ -645,6 +774,22 @@ def main():
             "passed" if shared_scratch_checks else "not run"
         ),
         "shared_scratch_checked_modes": shared_scratch_checks,
+        "persistent_weight_axis": {
+            name: (
+                "N"
+                if isinstance(state, PrefetchScheduleOptimization)
+                and state.n_shard_scales
+                else "K"
+            )
+            for name, state in states.items()
+        },
+        "logical_memory_bytes": {
+            name: {
+                "persistent_shard": state.shard_bytes,
+                "reusable_weight_scratch": state.scratch_bytes,
+            }
+            for name, state in states.items()
+        },
         "median_us_max_rank": {k: statistics.median(v) for k, v in timings.items()},
         "samples_us_max_rank": timings,
     }

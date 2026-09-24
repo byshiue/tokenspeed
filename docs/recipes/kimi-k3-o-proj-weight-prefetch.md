@@ -279,3 +279,82 @@ Each candidate passes exact byte/scale reconstruction, changed-input and
 poisoned-scratch graph replay, and two-real-layer shared-scratch checks. Match
 the 20-forward graph length when profiling: a shorter capture can change copy
 scheduling. Use repeated unprofiled measurements for performance claims.
+
+### C128: contiguous weight shards and early scale gathering
+
+`row_shards_ce_scales_first` keeps the full replicated GEMM but changes the
+persistent weight partition from input channels (K) to output channels (N).
+For `[N, K] = [7168, 12288]`, each TP4 rank holds `[1792, 12288]` FP8 codes
+and its corresponding scales. These shards occupy contiguous regions in the
+ordinary full GEMM matrix, so four CUDA copies replace strided destination
+copies and the local SM weight-copy kernel. This is a weight-prefetch
+experiment, not column-parallel projection computation.
+
+A small kernel gathers all four scale shards into the prepared scale layout
+**before** the weight copies. Scales are immutable and independent of the
+weight transfer, so they need not wait behind it. Every forward still refreshes
+all weight bytes and scales. The full matrix remains reusable scratch;
+no complete layer weight or scale cache bypasses communication.
+
+All four copies run on the auxiliary stream. The previous GEMM releases the
+scratch before either scales or weights are overwritten. Attention and activation
+quantization run on the main stream; the main stream waits for prefetch only
+before GEMM. The numerical computation and output layout remain unchanged.
+
+Compare the previous best path, contiguous copies with late scale gathering,
+and the candidate using:
+
+```bash
+--rows 128 --steps 20 --samples 15 --replays 20 \
+--modes local_asm_load_4096_sm row_shards_ce row_shards_ce_scales_first
+```
+
+On one four-GB300 group, with real checkpoint weights, C128/rank and CUDA
+graphs, three fresh-process repetitions gave these medians. Each repetition
+uses 15 samples of 400 forwards, alternating variant order and taking the
+slowest of the four ranks per sample; the table reports the median of the
+three run medians.
+
+| Path | Attention → projection | Gap to replicated TP1 |
+| --- | ---: | ---: |
+| Replicated TP1 | 438.17 µs | — |
+| Previous vectorized K-shard prefetch | 445.79 µs | +1.74% |
+| Contiguous N-shards, scales last | 443.48 µs | +1.21% |
+| Contiguous N-shards, scales first | 441.43 µs | +0.74% |
+
+The final candidate reduces latency by 0.98% against the previous prefetch
+path and closes about 57% of its remaining gap to TP1. It remains slower
+than replicated weights. Run medians ranged from 441.40 to 441.46 µs, with
+matched TP1 medians of 438.13–438.19 µs. A separate 100-forward graph measured
+441.41 versus 437.90 µs (+0.80%), with the previous prefetch path at 446.08 µs.
+These are component results on one TP4 group, not full-model or DEP16
+throughput measurements, and they do not establish TP16-weight performance.
+
+The final 20-forward trace confirms early scale gathering and removal of the
+SM weight-copy kernel. Average attention duration falls from 405.52 to 403.28 µs
+(TP1: 399.70 µs); quantization-to-GEMM gap falls from 2.04 to 1.65 µs
+(TP1: 0.34 µs). The unchanged GEMM also measures faster, 33.19 versus 36.04 µs
+for the previous prefetch path and 35.49 µs for TP1. These trace averages explain
+the path, but do not replace the unprofiled measurements above. Copies still
+contend with attention; the optimization has not eliminated every source of
+overhead.
+
+Also repeat with `--steps 100 --replays 4`, keeping the number of forwards
+per sample constant. Report these graph lengths separately. Each candidate
+must pass exact weight/scale reconstruction and output comparison, changed-input
+and poisoned-scratch replay, delayed peers, and alternating two real O-projection
+layers through one scratch allocation.
+
+Logical storage stays at 21.01 MiB of persistent weight/scales and 84.02 MiB
+of reusable weight/scale scratch per rank, plus the small peer-pointer table.
+The N partition requires output width divisible by `128 * TP`. It is not a
+drop-in loading change for the activation-TP runtime, which shards O weights
+along K. Serving defaults and model loading are unchanged.
+
+The local CUDA copy still starts late in the trace. Early scale gathering
+removes the scale kernel from that tail; it does not prove that all copies
+overlap attention perfectly. Smaller SM-copy grids, one-warp copies, an early
+stream join and local-first copy order did not beat the copy-engine candidate.
+CUDA 13's batched-copy overlap hint passed eager checks but was rejected during
+graph capture with `cudaErrorStreamCaptureUnsupported`. It is not retained as
+a selectable backend, and no environment upgrade was made for it.
