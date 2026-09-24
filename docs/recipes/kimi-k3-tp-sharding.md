@@ -229,6 +229,11 @@ Include packing, quantization, communication, GEMM and output restoration.
 Separate baseline quantization error from sharding's accumulation-order error.
 Neither a unit benchmark nor a serving smoke test establishes dataset accuracy.
 
+For the separate experiment that shards persistent O-projection weights but
+gathers them before a replicated GEMM, see
+[KDA weight prefetch](kimi-k3-o-proj-weight-prefetch.md). That experiment does
+not change these runtime TP paths.
+
 ## Full-model launch and comparison
 
 The following command uses real NVFP4 weights, the full model, no speculation,
