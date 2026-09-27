@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
     _clone,
     _entrypoints,
@@ -185,6 +186,9 @@ def test_upstream_dispatch_and_caches_are_unchanged():
         assert factory is not core._get_trtllm_moe_sm100_module_impl
 
 
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="FlashInfer native JIT requires NVIDIA"
+)
 def test_private_routing_build_keeps_upstream_sources():
     from flashinfer.jit.fused_moe import gen_trtllm_gen_fused_moe_sm100_module
 
@@ -204,6 +208,9 @@ def test_private_routing_build_keeps_upstream_sources():
         assert (private_include / "flashinfer/trtllm/fused_moe" / name).is_file()
 
 
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="FlashInfer native JIT requires NVIDIA"
+)
 def test_private_routing_build_rejects_duplicate_source_names(monkeypatch):
     from flashinfer.jit import fused_moe
 
