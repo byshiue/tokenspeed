@@ -90,8 +90,8 @@ files (paths relative to the upstream repository):
   include/flashinfer/trtllm/fused_moe/RoutingKernel.h
   include/flashinfer/trtllm/fused_moe/runner.h
   csrc/trtllm_fused_moe_kernel_launcher.cu
-  csrc/trtllm_fused_moe_runner.cu
-  csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cu
+  csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_runner.cu
+  csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh
   csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_llama4.cu
 
 These files are licensed under Apache-2.0. The NVIDIA-authored sources carry

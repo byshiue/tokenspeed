@@ -129,8 +129,8 @@ def patch_routing_sources(sources: dict[str, str]) -> dict[str, str]:
     """
     required = {
         "trtllm_fused_moe_kernel_launcher.cu",
-        "trtllm_fused_moe_runner.cu",
-        "trtllm_fused_moe_routing_custom.cu",
+        "trtllm_fused_moe_routing_runner.cu",
+        "trtllm_fused_moe_routing_custom.cuh",
         "trtllm_fused_moe_routing_llama4.cu",
         "runner.h",
         "RoutingKernel.h",
@@ -142,17 +142,22 @@ def patch_routing_sources(sources: dict[str, str]) -> dict[str, str]:
         )
     producers = {
         "RoutingKernel.cuh": 3,
-        "trtllm_fused_moe_routing_custom.cu": 2,
+        "trtllm_fused_moe_routing_custom.cuh": 2,
         "trtllm_fused_moe_routing_llama4.cu": 1,
     }
     # A new native producer must not silently retain uninitialized padding.
     for name, source in sources.items():
-        stores = re.findall(r"mPtrPermutedIdxToTokenIdx\[[^;\n]+\]\s*=", source)
+        stores = re.findall(r"mPtrPermutedIdxToTokenIdx\s*\[[^;]+?\]\s*=(?!=)", source)
         if len(stores) != producers.get(name, 0):
             raise RuntimeError(f"Unsupported FlashInfer routing map writers in {name}")
     patched = dict(sources)
     name = "trtllm_fused_moe_kernel_launcher.cu"
     source = sources[name]
+    # Only the fused entrypoints use this module; staged and standalone routing
+    # keep upstream behavior. Detect new launcher paths before accepting them.
+    construction = "Routing::Runner routing_runner(tile_tokens_dim);"
+    if source.count(construction) != 5:
+        raise RuntimeError("Unsupported FlashInfer routing launcher paths")
     allocation = re.compile(
         r"permuted_idx_to_token_idx\s*=\s*alloc_tensor\("
         r"\{max_num_padded_tokens(?:\s*\+\s*1)?\},\s*"
@@ -189,7 +194,7 @@ def patch_routing_sources(sources: dict[str, str]) -> dict[str, str]:
         1,
     )
 
-    name = "trtllm_fused_moe_runner.cu"
+    name = "trtllm_fused_moe_routing_runner.cu"
     assignment = "routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;"
     patched[name] = _replace(
         sources[name],
