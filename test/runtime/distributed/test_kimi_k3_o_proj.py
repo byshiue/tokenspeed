@@ -26,12 +26,19 @@ validate_kimi_k3_o_proj.py.
 
 import builtins
 import os
-from test.runtime.distributed.kimi_k3_o_proj_helpers import dep_mapping
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from test.ci_system.ci_register import register_cuda_ci
+from test.runtime.distributed.kimi_k3_o_proj_helpers import dep_mapping
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -439,3 +446,65 @@ def test_attention_construction_and_empty_rank_participation(monkeypatch):
         )
         assert result.shape == (0, 64)
         assert calls == [(torch.Size([0, 64]), counts)]
+
+
+def test_projection_and_shared_expert_workspaces_are_independent(monkeypatch):
+    from tokenspeed.runtime.models import kimi_k3
+
+    monkeypatch.setenv(A2A_ENV_NAME, "nccl")
+    monkeypatch.setenv(RS_ENV_NAME, "nccl")
+    monkeypatch.setattr(
+        kimi_k3, "prepare_k3_all_reduce_buffers", lambda **kwargs: False
+    )
+    parallel = projection_mapping(0, 8, 4)
+    weight = torch.empty(7, 32, dtype=torch.bfloat16)
+    shared = SimpleNamespace(
+        shared_parallel=parallel,
+        shared_communication=None,
+        gate_up_proj=SimpleNamespace(weight=weight),
+    )
+    exchanges = [
+        projection_ops.DistributedOutputProjection(parallel, 32) for _ in range(2)
+    ]
+    layers = []
+    for exchange in exchanges:
+        layer = kimi_k3.KimiLinearDecoderLayer.__new__(kimi_k3.KimiLinearDecoderLayer)
+        torch.nn.Module.__init__(layer)
+        layer.self_attn = SimpleNamespace(
+            output_projection_exchange=exchange, o_proj=SimpleNamespace(output_size=7)
+        )
+        layer.block_sparse_moe = SimpleNamespace(shared_experts=shared)
+        layers.append(layer)
+    model = SimpleNamespace(
+        model=SimpleNamespace(layers=layers),
+        config=SimpleNamespace(hidden_size=7, routed_expert_hidden_size=None),
+        mapping=dep_mapping(0, 8),
+        parameters=lambda: iter([weight]),
+    )
+    prepare = kimi_k3.KimiLinearForCausalLM.prepare_communication_runtime
+    assert prepare(model, 8)
+    workspace = exchanges[0].workspace
+    assert exchanges[1].workspace is workspace
+    communication = shared.shared_communication
+    buffers = [
+        workspace.send,
+        workspace.recv,
+        communication.send,
+        communication.received,
+    ]
+    assert len({buffer.data_ptr() for buffer in buffers}) == len(buffers)
+    communication.send.fill_(3)
+    communication.received.fill_(5)
+    workspace.send.zero_()
+    workspace.recv.zero_()
+    assert torch.all(communication.send == 3)
+    assert torch.all(communication.received == 5)
+    assert prepare(model, 8)
+    assert exchanges[0].workspace is workspace
+    assert shared.shared_communication is communication
+    with pytest.raises(RuntimeError, match="Cannot grow"):
+        prepare(model, 9)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -62,3 +62,25 @@ def test_owner_reduce_aligned_bases_and_unaligned_owner_slices(rows, hidden):
             rtol=0,
             atol=0,
         )
+
+
+def test_owner_reduce_reuses_compilation():
+    from utils import assert_no_triton_compile
+
+    hidden = 128
+    peers = [
+        torch.randn(4 * 65, hidden, device="cuda", dtype=torch.bfloat16)
+        for _ in range(4)
+    ]
+    pointers = torch.tensor(
+        [x.data_ptr() for x in peers], device="cuda", dtype=torch.uint64
+    )
+    output = torch.empty(65, hidden, device="cuda", dtype=torch.bfloat16)
+    owner_reduce[(1,)](pointers, output, 3, hidden, 4, 1, 1024)
+    with assert_no_triton_compile(owner_reduce):
+        for rows in (1, 2, 7, 16, 33, 65):
+            owner_reduce[((rows * hidden + 1023) // 1024,)](
+                pointers, output, rows, hidden, 4, 1, 1024
+            )
+            expected = sum(peer[rows : 2 * rows].float() for peer in peers).bfloat16()
+            torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)

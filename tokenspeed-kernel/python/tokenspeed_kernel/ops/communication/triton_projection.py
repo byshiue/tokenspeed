@@ -28,11 +28,11 @@ from tokenspeed_kernel.registry import register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def owner_reduce(
     PTRS,
     Y,
-    M: tl.constexpr,
+    M,
     H: tl.constexpr,
     P: tl.constexpr,
     R: tl.constexpr,

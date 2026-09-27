@@ -23,19 +23,25 @@
 import argparse
 import json
 import os
+from contextlib import ExitStack
 from pathlib import Path
-from test.runtime.distributed.kimi_k3_o_proj_helpers import dep_mapping
-from unittest.mock import patch
+from unittest import mock
 
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.attention.o_proj import initialize_projection_group
-from tokenspeed.runtime.layers.shared_expert_tp import SharedExpertWorkspace
+from tokenspeed.runtime.layers import shared_expert_tp
+from tokenspeed.runtime.layers.shared_expert_tp import (
+    SharedExpertCommunication,
+    initialize_shared_expert_group,
+    shared_expert_mapping,
+    validate_shared_expert_settings,
+)
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearMLP
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
@@ -45,12 +51,34 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--layer", type=int, required=True)
+    parser.add_argument("--tp-size", type=int, required=True)
     args = parser.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
-    assert world == 16
+    assert 1 < args.tp_size < world and world % args.tp_size == 0
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     torch.set_default_dtype(torch.bfloat16)
-    mapping = dep_mapping(rank, world)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=1,
+        attn_cp_size=1,
+        attn_dp_size=world,
+        attn_dcp_size=1,
+        dense_tp_size=1,
+        dense_dp_size=world,
+        moe_tp_size=1,
+        moe_ep_size=world,
+        moe_dp_size=1,
+        vision_tp_size=1,
+        vision_dp_size=1,
+        linear_attn_tp_size=1,
+        pp_size=1,
+        pp_layer_partition=None,
+        nprocs_per_node=None,
+        nnodes=None,
+        base_gpu_id=0,
+        gpu_id_step=1,
+    )
     pg_manager.init_distributed(
         mapping,
         distributed_init_method="env://",
@@ -58,6 +86,21 @@ def main():
         timeout=600,
         device_id=torch.device("cuda", torch.cuda.current_device()),
     )
+    # Exercise real world-wide agreement before any shared TP group exists.
+    # Disabled and malformed ranks must reject together with enabled peers.
+    for divergent_value in ("1", "invalid"):
+        rejected = False
+        try:
+            validate_shared_expert_settings(
+                mapping, divergent_value if rank == 0 else str(args.tp_size)
+            )
+        except ValueError as exc:
+            rejected = "differ across ranks" in str(exc)
+        accepted_rejection = torch.tensor(int(rejected), device="cuda")
+        dist.all_reduce(accepted_rejection, op=dist.ReduceOp.MIN)
+        assert accepted_rejection.item() == 1, "Every rank must reject disagreement"
+    assert validate_shared_expert_settings(mapping, "1") is None
+    validate_shared_expert_settings(mapping, str(args.tp_size))
     index = json.loads((args.model / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -72,14 +115,16 @@ def main():
     assert all(w.dtype == torch.bfloat16 for w in weights)
     config = json.loads((args.model / "config.json").read_text())["text_config"]
     mlps = []
-    for size in ("1", "4"):
-        with patch.dict(
-            os.environ, {"TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE": size}
-        ), torch.device("cuda"):
+    for size in ("1", str(args.tp_size)):
+        parallel = shared_expert_mapping(mapping, size)
+        with torch.device("cuda"):
             mlp = KimiLinearMLP(
                 weights[0].shape[1],
                 weights[0].shape[0],
-                mapping,
+                tp_rank=parallel.tp_rank if parallel is not None else 0,
+                tp_size=parallel.tp_size if parallel is not None else 1,
+                tp_group=parallel.tp_group if parallel is not None else None,
+                shared_parallel=parallel,
                 quant_config=None,
                 prefix="shared_experts",
                 reduce_results=False,
@@ -94,12 +139,13 @@ def main():
         mlp.down_proj.weight.weight_loader(mlp.down_proj.weight, weights[2])
         mlps.append(mlp)
     baseline, candidate = mlps
+    hidden = weights[0].shape[1]
     parallel = candidate.shared_parallel
-    initialize_projection_group(parallel)
-    candidate.shared_workspace = SharedExpertWorkspace(
-        parallel, 129, 7168, torch.device("cuda")
+    initialize_shared_expert_group(parallel)
+    candidate.shared_communication = SharedExpertCommunication(
+        parallel, 129, hidden, torch.device("cuda")
     )
-    shard = 6144 // 4
+    shard = weights[0].shape[0] // args.tp_size
     start = parallel.tp_rank * shard
     torch.testing.assert_close(
         candidate.gate_up_proj.weight,
@@ -113,6 +159,24 @@ def main():
         rtol=0,
         atol=0,
     )
+    # Exercise runtime widths independently of the checkpoint: a narrow view,
+    # subdivision above the native limit, and an unaligned NCCL fallback.
+    for width in (128, 2304, 7200):
+        communication = SharedExpertCommunication(
+            parallel, 1, width, torch.device("cuda")
+        )
+        inputs = torch.full((1, width), rank + 1, dtype=torch.bfloat16, device="cuda")
+        expected = torch.cat(
+            [
+                torch.full((1, width), peer + 1, dtype=torch.bfloat16, device="cuda")
+                for peer in parallel.tp_group
+            ]
+        )
+        gathered = communication.gather_inputs(inputs, [1] * world)
+        output = communication.reduce_outputs(gathered / args.tp_size, 1)
+        torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+        torch.testing.assert_close(output, inputs, rtol=0, atol=0)
+        communication.close()
     stream = torch.cuda.Stream(priority=-1)
     fork = StreamFork(stream)
     worst = 0.0
@@ -120,15 +184,19 @@ def main():
     for rows in (0, 1, 32, 64, 128, 129):
         for pattern in ("balanced", "uneven", "empty_group"):
             counts = [
-                rows if pattern == "balanced" else (rows * (r % 4) // 3)
+                (
+                    rows
+                    if pattern == "balanced"
+                    else (rows * (r % args.tp_size) // (args.tp_size - 1))
+                )
                 for r in range(world)
             ]
             if pattern == "empty_group":
-                counts = [0 if r < 4 else rows for r in range(world)]
+                counts = [0 if r < args.tp_size else rows for r in range(world)]
             x = (
                 torch.randn(
                     counts[rank],
-                    7168,
+                    hidden,
                     device="cuda",
                     generator=torch.Generator(device="cuda").manual_seed(800 + rank),
                 )
@@ -138,7 +206,9 @@ def main():
             def run():
                 with fork.scope(enable=True, overlap=True):
                     with fork.branch():
-                        gathered = candidate.shared_workspace.gather_inputs(x, counts)
+                        gathered = candidate.shared_communication.gather_inputs(
+                            x, counts
+                        )
                         fork.record_checkpoint()
                         partial = candidate(gathered, down_out=None)
                     # Local routing overlaps AG; dispatch waits only for AG.
@@ -148,14 +218,49 @@ def main():
                     torch.cuda._sleep(20000)
                     fork.join()
                     with fork.branch_after_main():
-                        output = candidate.shared_workspace.reduce_outputs(
+                        output = candidate.shared_communication.reduce_outputs(
                             partial, counts[rank]
                         )
                     torch.cuda._sleep(20000)
                     fork.join()
                 return output
 
-            for _ in range(3):
+            # Observe real collectives during eager warmup, without replacing
+            # their results. Numerics alone cannot detect an incorrect fallback
+            # or unnecessary communication by an entirely empty subgroup.
+            collective_names = (
+                "trtllm_allgather",
+                "trtllm_reduce_scatter",
+                "all_gather_single",
+                "reduce_scatter",
+            )
+            with ExitStack() as stack:
+                calls = [
+                    stack.enter_context(
+                        mock.patch.object(
+                            shared_expert_tp,
+                            name,
+                            wraps=getattr(shared_expert_tp, name),
+                        )
+                    )
+                    for name in collective_names
+                ]
+                run()
+                active_rows = max(counts[r] for r in parallel.tp_group)
+                native = (
+                    args.tp_size in (2, 4, 8, 16)
+                    and hidden % 128 == 0
+                    and 0 < active_rows <= 128
+                )
+                fallback = active_rows > 0 and not native
+                observed = [call.call_count for call in calls]
+                expected_calls = [int(native)] * 2 + [int(fallback)] * 2
+                routing_ok = torch.tensor(
+                    int(observed == expected_calls), device="cuda"
+                )
+                dist.all_reduce(routing_ok, op=dist.ReduceOp.MIN)
+                assert routing_ok.item() == 1, (rows, pattern, observed, expected_calls)
+            for _ in range(2):
                 run()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
@@ -164,7 +269,7 @@ def main():
             for factor in (1.0, 0.0, -1.0, 0.5):
                 x.copy_(original * factor)
                 expected = baseline(x, down_out=None)
-                if rank % 4 == 0:
+                if rank % args.tp_size == 0:
                     torch.cuda._sleep(100000)
                 graph.replay()
                 err = (
@@ -180,7 +285,7 @@ def main():
                 torch.testing.assert_close(retained, saved, rtol=0, atol=0)
             del graph, actual
             cases.append((rows, pattern))
-    candidate.shared_workspace.close()
+    candidate.shared_communication.close()
     dist.barrier()
     if rank == 0:
         print(

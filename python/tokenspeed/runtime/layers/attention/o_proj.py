@@ -46,9 +46,9 @@ from tokenspeed_kernel.ops.communication.triton_projection import (
     triton_projection_reduce_scatter,
     triton_projection_reduce_scatter_after_a2a,
 )
-from tokenspeed_kernel.ops.communication.trtllm_projection import (
-    ProjectionLamportState,
-    trtllm_projection_reduce_scatter,
+from tokenspeed_kernel.ops.communication.trtllm import (
+    TrtllmReduceScatterState,
+    trtllm_reduce_scatter,
 )
 
 from tokenspeed.runtime.distributed.comm_ops import all_to_all_single, reduce_scatter
@@ -165,7 +165,8 @@ class ProjectionWorkspace:
     ) -> None:
         """Allocate bounded symmetric scratch per output width before capture.
 
-        Explicit opt-in accepts a different BF16 reduction order. Initialization
+        Enabling projection TP selects the documented BF16 reduction policy.
+        Callers pass the chosen backend explicitly. Initialization
         failures are fatal; never retry a failed collective with
         another backend inside forward.
         """
@@ -180,7 +181,7 @@ class ProjectionWorkspace:
             if self.a2a is not None:
                 self.borrowed_a2a = prepare_borrowed_projection_a2a(self.a2a, group)
             for width in sorted(set(output_sizes)):
-                state = ProjectionLamportState(
+                state = TrtllmReduceScatterState(
                     group,
                     min(self.max_tokens, LAMPORT_MAX_TOKENS),
                     width,
@@ -189,10 +190,10 @@ class ProjectionWorkspace:
                 self.lamport_states[width] = state
                 probe = state.input_buffer(1)
                 probe.zero_()
-                trtllm_projection_reduce_scatter(state, probe, 1)
+                trtllm_reduce_scatter(state, probe, 1)
             logger.info(
-                "Projection ReduceScatter: trtllm_lamport, up to %s rows/rank; NCCL above",
-                min(self.max_tokens, LAMPORT_MAX_TOKENS),
+                "Projection ReduceScatter: trtllm_lamport, up to "
+                f"{min(self.max_tokens, LAMPORT_MAX_TOKENS)} rows/rank; NCCL above"
             )
         if backend == "triton_peer":
             if parallel.tp_size != 4:
@@ -220,8 +221,8 @@ class ProjectionWorkspace:
                 triton_projection_reduce_scatter(state, probe, 1)
                 self.peer_states[width] = state
             logger.info(
-                "Projection ReduceScatter: triton_peer, up to %s rows/rank",
-                min(self.max_tokens, PEER_MAX_TOKENS),
+                "Projection ReduceScatter: triton_peer, up to "
+                f"{min(self.max_tokens, PEER_MAX_TOKENS)} rows/rank"
             )
         self._rs_initialized = True
 
@@ -246,7 +247,7 @@ class ProjectionWorkspace:
         """Return owned output rows; never expose reusable communication storage."""
         lamport = self.lamport_state(partial.shape[1], max_tokens)
         if lamport is not None:
-            return trtllm_projection_reduce_scatter(lamport, partial, max_tokens)
+            return trtllm_reduce_scatter(lamport, partial, max_tokens)
         peer = self.peer_state(partial.shape[1], max_tokens)
         if peer is not None:
             return triton_projection_reduce_scatter(peer, partial, max_tokens)
@@ -273,9 +274,8 @@ class ProjectionWorkspace:
                 backend=backend,
             )
             logger.info(
-                "Projection A2A: %s (%s)",
-                "flashinfer" if self.a2a is not None else "nccl",
-                self.a2a_reason or "NVLink",
+                f"Projection A2A: {'flashinfer' if self.a2a is not None else 'nccl'} "
+                f"({self.a2a_reason or 'NVLink'})"
             )
         self._a2a_initialized = True
 
@@ -292,7 +292,10 @@ class ProjectionWorkspace:
         )
 
     def close(self) -> None:
-        """Collectively release IPC resources after all referencing graphs die."""
+        """Explicit standalone cleanup after all referencing graphs die.
+
+        Model-owned workspaces normally live until worker process exit.
+        """
         for state in self.lamport_states.values():
             state.close()
         self.lamport_states.clear()
@@ -379,7 +382,7 @@ class DistributedOutputProjection:
             partial, _ = linear.forward_into(
                 recv, None, lamport.input_buffer(max_tokens)
             )
-            output = trtllm_projection_reduce_scatter(lamport, partial, max_tokens)
+            output = trtllm_reduce_scatter(lamport, partial, max_tokens)
         elif peer is not None:
             if not fused_a2a:
                 # A preceding FI reduction may have deferred its reuse fence.

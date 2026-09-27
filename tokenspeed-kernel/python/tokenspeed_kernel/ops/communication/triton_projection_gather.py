@@ -52,6 +52,7 @@ class ProjectionGatherState:
             max_bytes=0,
             attnres_max_numel=0,
             attnres_max_rows=0,
+            enable_lamport=False,
         )
         self.handle = symm_mem.rendezvous(self.state.comm_buff, group=group)
         if not self.handle.multicast_ptr:

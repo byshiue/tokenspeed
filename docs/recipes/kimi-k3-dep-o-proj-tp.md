@@ -183,12 +183,14 @@ the reduction also retains its trailing reuse fence. NCCL A2A alone is not a
 symmetric-buffer reuse fence.
 The peer reduction preserves the 16-byte alignment of symmetric allocation
 bases through its indirect pointer loads, allowing vectorized BF16 reads.
-Owner offsets and masked tails still determine the safe access width;
+Batch row counts remain runtime kernel arguments so changing traffic reuses
+compiled packing and reduction kernels. Owner offsets and masked tails still determine the safe access width;
 unaligned slices are supported. Accumulation remains FP32 in peer-rank order,
 with the final result stored as BF16. This changes neither synchronization
 nor buffer ownership.
 Never replace or close buffers while captured graphs still reference them;
-explicit close is collective. Returned outputs own their storage and survive
+explicit close is collective. Standalone callers own this cleanup; model
+workers currently retain their prepared workspaces until process exit. Returned outputs own their storage and survive
 later workspace reuse. Initialization failures propagate for explicitly
 requested backends; never switch collectives after a rank-local forward error.
 
@@ -263,35 +265,14 @@ token counts, outputs and source/dependency versions.
 Record measured results and limitations in the job's local runbook. This guide
 does not claim that full-model validation or a speedup has already passed.
 
-## Shared-expert TP4 experiment
+## Combining projection and shared-expert TP
 
-Shared-expert sharding is independent of attention output projection. To compare
-it against unchanged DEP16, keep attention projections unsharded in both runs:
+Projection sharding can be enabled alongside the existing
+[shared-expert TP configuration](kimi-k3-shared-expert-tp.md). Each subsystem
+owns separate communication buffers: sequential attention layers share the
+projection workspace, while shared experts retain their own auxiliary-stream
+workspace and ordered AllGather/ReduceScatter stages. Prepare both before
+cache sizing and graph capture; neither workspace may alias the other.
 
-```bash
-export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=1
-# Baseline: 1; shared-expert TP4: 4.
-export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4
-```
-
-Use attention TP1/DP16, routed MoE TP1/EP16, PP1. The shared MLP stays on the
-existing auxiliary-stream path. Shared AllGather overlaps local routing;
-dispatch waits for a gather-only event, not the following shared GEMMs.
-Shared GEMMs may overlap dispatch. Routed BMM waits for shared GEMMs;
-auxiliary ReduceScatter waits for dispatch, then overlaps routed BMM. Combine
-waits for ReduceScatter. This prevents peer-polling shared and routed
-collectives from starving each other of SM resources, without overlapping
-the two GEMM paths. Gate/up and down weights are sharded directly;
-AllGather and ReduceScatter restore token ownership without an intermediate
-AllToAll. Up to 128 padded tokens per rank use TRT-LLM one-shot collectives;
-larger shapes use NCCL. See [the design](../design/shared-expert-tp.md).
-
-Run `test/runtime/distributed/validate_kimi_k3_shared_expert_tp.py` with 16
-distributed workers and explicit `--model MODEL_DIR --layer 1` before measuring
-the full model. It checks real BF16 shared-expert weights from the NVFP4
-checkpoint, uneven/empty peers, auxiliary-stream CUDA graphs and the fallback
-boundary. It does not validate full-model generation.
-
-C64 per rank means 1,024 active requests across DEP16. First verify cache
-admission at that capacity. A failed capacity check is not an E2E measurement;
-neither a shared-MLP microbenchmark nor fewer active requests substitutes for it.
+Validate both features together with changing graph inputs and empty owners
+before interpreting full-model accuracy or performance.

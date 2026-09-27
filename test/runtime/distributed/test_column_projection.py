@@ -157,3 +157,36 @@ def test_column_projection_restores_uneven_rank_and_channel_order(monkeypatch):
     bad.gather_output = True
     with pytest.raises(ValueError):
         module.forward(inputs[5], bad, counts)
+
+
+def test_column_gather_initializes_current_collective_contract(monkeypatch):
+    import inspect
+
+    from tokenspeed_kernel.ops.communication import (
+        triton_projection_gather as gather_ops,
+    )
+
+    signature = inspect.signature(gather_ops.create_state)
+    calls = []
+
+    def create_state(**kwargs):
+        signature.bind(**kwargs)
+        calls.append(kwargs)
+        return SimpleNamespace(comm_buff=torch.empty(1), device=torch.device("cpu"))
+
+    monkeypatch.setattr(gather_ops, "create_state", create_state)
+    monkeypatch.setattr(
+        gather_ops.symm_mem,
+        "rendezvous",
+        lambda buffer, group: SimpleNamespace(multicast_ptr=1),
+    )
+    monkeypatch.setattr(
+        gather_ops,
+        "_alloc_symm",
+        lambda shape, dtype, device, group: (torch.empty(shape), object()),
+    )
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 4)
+    state = gather_ops.ProjectionGatherState(group, 8, 128, torch.device("cpu"))
+    assert state.max_rows == 8
+    assert calls[0]["enable_lamport"] is False
+    assert calls[0]["max_tokens"] == 32

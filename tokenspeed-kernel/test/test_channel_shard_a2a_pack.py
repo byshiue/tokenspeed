@@ -70,3 +70,22 @@ def test_channel_shard_a2a_pack_and_replay(peers, width, rows, padded, strided):
         scratch.fill_(17)
         graph.replay()
         torch.testing.assert_close(captured, reference(), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU required")
+def test_channel_shard_pack_reuses_compilation():
+    from tokenspeed_kernel.ops.communication.triton import (
+        _pack_channel_shards_for_a2a_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    storage = torch.randn(65, 512, device="cuda", dtype=torch.bfloat16)
+    scratch = torch.empty(4, 65, 128, device="cuda", dtype=storage.dtype)
+    triton_pack_channel_shards_for_a2a(storage[:3], scratch)
+    with assert_no_triton_compile(_pack_channel_shards_for_a2a_kernel):
+        for rows, padded in ((0, 1), (1, 2), (7, 16), (16, 16), (33, 65)):
+            workspace = scratch.flatten()[: 4 * padded * 128].view(4, padded, 128)
+            result = triton_pack_channel_shards_for_a2a(storage[:rows], workspace)
+            expected = torch.zeros_like(workspace)
+            expected[:, :rows] = storage[:rows].view(rows, 4, 128).transpose(0, 1)
+            torch.testing.assert_close(result, expected.flatten(0, 1), rtol=0, atol=0)

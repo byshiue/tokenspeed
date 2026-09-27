@@ -198,7 +198,10 @@ class DistributedColumnProjection:
         return output[: inputs.shape[0], : self.output_size]
 
     def close(self) -> None:
-        """Collectively close communicators after all referencing graphs die."""
+        """Explicit standalone cleanup after all referencing graphs die.
+
+        The caller owns teardown; model workers may retain state until exit.
+        """
         if self.closed:
             return
         torch.cuda.synchronize(self.send.device)
