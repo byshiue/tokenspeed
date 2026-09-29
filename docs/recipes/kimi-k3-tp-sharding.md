@@ -284,10 +284,14 @@ Include packing, quantization, communication, GEMM and output restoration.
 Separate baseline quantization error from sharding's accumulation-order error.
 Neither a unit benchmark nor a serving smoke test establishes dataset accuracy.
 
-For the separate experiment that shards persistent O-projection weights but
-gathers them before a replicated GEMM, see
-[KDA weight prefetch](kimi-k3-o-proj-weight-prefetch.md). That experiment does
-not change these runtime TP paths.
+For the hybrid runtime path that switches between activation TP and a
+prefetched full-width GEMM, see
+[Kimi-K3 weight prefetch](kimi-k3-o-proj-weight-prefetch.md). It uses full-weight
+prefetch only at local GEMM M ≥ 128; smaller inputs use the existing activation
+A2A/GEMM/ReduceScatter path with the same K-sharded weights. Select it with
+`TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE` and leave O-projection compute TP at
+`1`. The larger-M route gathers weights during attention; the smaller-M route
+redistributes activations instead.
 
 ## Full-model launch and comparison
 

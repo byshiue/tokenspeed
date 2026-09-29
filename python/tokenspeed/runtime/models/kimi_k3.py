@@ -163,6 +163,10 @@ from tokenspeed.runtime.layers.shared_expert_tp import (
     validate_shared_expert_settings,
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.layers.weight_prefetch_linear import (
+    CudaWeightPrefetchWorkspace,
+    WeightPrefetchLinear,
+)
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
@@ -205,6 +209,17 @@ logger = logging.getLogger(__name__)
 def _output_projection_mapping(mapping: Mapping) -> DenseLayerMapping:
     """Resolve projection-only TP without changing attention/cache mappings."""
     return _projection_mapping(mapping, envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE)
+
+
+def _weight_projection_mapping(mapping: Mapping) -> DenseLayerMapping:
+    parallel = _projection_mapping(
+        mapping, envs.TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE
+    )
+    if parallel.tp_size > 1 and _output_projection_mapping(mapping).tp_size > 1:
+        raise ValueError(
+            "O-projection compute TP and weight-only TP are mutually exclusive"
+        )
+    return parallel
 
 
 def _projection_mapping(mapping: Mapping, setting) -> DenseLayerMapping:
@@ -417,10 +432,15 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         tp_rank: int,
         tp_size: int,
         tp_group: tuple[int, ...],
-    ) -> RowParallelLinear:
+    ) -> RowParallelLinear | WeightPrefetchLinear:
         # Keep the registered Linear at o_proj so checkpoint shard loaders and
         # post-load quantization still see the original parameter names.
         assert not bias
+        weight_parallel = _weight_projection_mapping(self.mapping)
+        if weight_parallel.tp_size > 1:
+            return WeightPrefetchLinear(
+                input_size, output_size, weight_parallel, quant_config, prefix
+            )
         parallel = _output_projection_mapping(self.mapping)
         if parallel.tp_size > 1:
             return DPRowParallelLinear(
@@ -779,7 +799,12 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
         )
-        attn_output = self._attn(
+        attention = self._attn
+        if isinstance(self.o_proj, WeightPrefetchLinear):
+            attention = self.o_proj.wrap_attention(
+                attention, hidden_states.shape[0], capture_ready=False
+            )
+        attn_output = attention(
             positions,
             q,
             latent_cache,
@@ -1426,7 +1451,16 @@ class KimiLinearKDA(nn.Module):
 
         self.o_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         output_parallel = _output_projection_mapping(mapping)
-        if output_parallel.tp_size > 1:
+        weight_parallel = _weight_projection_mapping(mapping)
+        if weight_parallel.tp_size > 1:
+            self.o_proj = WeightPrefetchLinear(
+                proj,
+                hidden,
+                weight_parallel,
+                quant_config,
+                add_prefix("o_proj", prefix),
+            )
+        elif output_parallel.tp_size > 1:
             self.o_proj = DPRowParallelLinear(
                 input_size=proj,
                 output_size=hidden,
@@ -1602,7 +1636,17 @@ class KimiLinearKDA(nn.Module):
         conv_weights = self.conv_weights
         fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
 
-        core_out = ctx.attn_backend.forward(
+        attention = ctx.attn_backend.forward
+        if isinstance(self.o_proj, WeightPrefetchLinear):
+            attention = self.o_proj.wrap_attention(
+                attention,
+                num_tokens,
+                capture_ready=(
+                    ctx.attn_backend.linear_attn_backend.prefill_metadata_is_capture_ready
+                    and ctx.attn_backend.step_counter is None
+                ),
+            )
+        core_out = attention(
             q=None,
             k=None,
             v=None,
@@ -3226,6 +3270,14 @@ class KimiLinearModel(nn.Module):
         initialize_projection_group(parallel)
         validate_projection_settings(
             mapping,
+            envs.TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE.get(),
+            "nccl",
+            "nccl",
+        )
+        weight_parallel = _weight_projection_mapping(mapping)
+        initialize_projection_group(weight_parallel)
+        validate_projection_settings(
+            mapping,
             envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE.get(),
             envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
             "nccl",
@@ -3544,6 +3596,25 @@ class KimiLinearForCausalLM(BaseCausalLM):
     model_cls = KimiLinearModel
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        weight_projections = [
+            module
+            for module in self.model.modules()
+            if isinstance(module, WeightPrefetchLinear)
+        ]
+        if weight_projections:
+            # Persistent shards belong to each layer; full weights are one
+            # model-owned scratch set reused by KDA and MLA in execution order.
+            workspace = weight_projections[0].workspace
+            if workspace is None:
+                workspace = CudaWeightPrefetchWorkspace(
+                    [
+                        (linear.logical_output_size, linear.input_size)
+                        for linear in weight_projections
+                    ],
+                    weight_projections[0].weight.device,
+                )
+            for linear in weight_projections:
+                linear.prepare(workspace)
         shared_mlps = [
             layer.block_sparse_moe.shared_experts
             for layer in self.model.layers
@@ -3575,10 +3646,17 @@ class KimiLinearForCausalLM(BaseCausalLM):
             # One communication object for sequential O projections, never one
             # scratch allocation per Linear. It does not alias MoE aux-stream data.
             weight = next(self.parameters())
+            row_capacity = max_num_tokens
+            if all(
+                isinstance(linear, WeightPrefetchLinear) for linear in row_projections
+            ):
+                row_capacity = min(
+                    row_capacity, WeightPrefetchLinear.PREFETCH_MIN_ROWS - 1
+                )
             communication = row_projections[0].communication
             if communication is None:
                 communication = DPRowParallelCommunication(
-                    max_tokens=max_num_tokens,
+                    max_tokens=row_capacity,
                     max_input_size=max(linear.input_size for linear in row_projections),
                     dtype=weight.dtype,
                     device=weight.device,
@@ -3593,7 +3671,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     [linear.output_size for linear in row_projections],
                     backend=envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
                 )
-            elif max_num_tokens > communication.max_tokens:
+            elif row_capacity > communication.max_tokens:
                 raise RuntimeError("Cannot grow a prepared projection workspace")
             for linear in row_projections:
                 linear.communication = communication
@@ -3633,7 +3711,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
             max_num_tokens=max_num_tokens,
         )
         return (
-            bool(shared_mlps)
+            bool(weight_projections)
+            or bool(shared_mlps)
             or bool(row_projections)
             or bool(column_communications)
             or prepared
