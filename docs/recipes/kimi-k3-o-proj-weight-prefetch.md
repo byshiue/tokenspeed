@@ -5,6 +5,12 @@ under DEP16. It does not add a serving mode or load the full model.
 Use the [TP-sharding recipe](kimi-k3-tp-sharding.md) for the shared environment,
 persistent allocation and existing runtime paths.
 
+The compute-TP4 reference uses `DPRowParallelLinear` with a preallocated
+`DPRowParallelCommunication`; weight-only variants still use the full GEMM.
+The recorded measurements below predate the projection API rebase onto
+`4d4c0357`. Rerun the paired benchmarks before treating them as performance
+results for the rebased code.
+
 | Variant | Persistent weight placement | Work done for each forward |
 | --- | --- | --- |
 | DEP16 | Full weight on every rank | Local full-width GEMM |

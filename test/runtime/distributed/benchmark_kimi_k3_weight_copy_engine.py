@@ -213,7 +213,7 @@ def main():
             group = candidate
     assert group is not None
     weight, scales, quant = load_projection(str(args.model), 0)
-    (baseline, _), unused_compute = make_linears(mapping, weight, scales, quant)
+    baseline, unused_compute = make_linears(mapping, weight, scales, quant)
     del unused_compute
     states = {"nccl_high": WeightPrefetch(group, weight, scales)}
     states["nccl_high"].aux = torch.cuda.Stream(priority=-1)

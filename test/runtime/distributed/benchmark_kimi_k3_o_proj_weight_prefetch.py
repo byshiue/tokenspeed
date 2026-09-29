@@ -51,8 +51,8 @@ from tokenspeed_kernel.ops.gemm.fp8_utils import (
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers.dp_row_parallel_linear import (
-    ProjectionWorkspace,
+from tokenspeed.runtime.layers.dp_linear_communication import (
+    DPRowParallelCommunication,
     initialize_projection_group,
     projection_mapping,
 )
@@ -346,15 +346,13 @@ def main():
     weight_cpu, scales_cpu, quant = load_projection(str(args.model), 0)
     n, k = weight_cpu.shape
     assert (n, k) == (7168, 12288)
-    (baseline, _), (linear4, exchange4) = make_linears(
-        mapping, weight_cpu, scales_cpu, quant
-    )
-    workspace = ProjectionWorkspace(
+    baseline, linear4 = make_linears(mapping, weight_cpu, scales_cpu, quant)
+    workspace = DPRowParallelCommunication(
         max(args.rows), k, torch.bfloat16, torch.device("cuda")
     )
     workspace.initialize_a2a(parallel, [k], backend="tokenspeed_a2a_lamport")
     workspace.initialize_reduce_scatter(parallel, [n], backend="trtllm_lamport")
-    exchange4.workspace = workspace
+    linear4.communication = workspace
     prefetch = {
         "tp4_weight": WeightPrefetch(group4, weight_cpu, scales_cpu),
         "tp16_weight": WeightPrefetch(dist.group.WORLD, weight_cpu, scales_cpu),
@@ -410,7 +408,7 @@ def main():
         reference = baseline(x)[0]
         assert torch.isfinite(reference).all()
         errors = {}
-        actual4 = exchange4.forward(x, linear4, counts)
+        actual4 = linear4(x, counts=counts)[0]
         error = (actual4.float() - reference.float()).norm() / reference.float().norm()
         dist.all_reduce(error, op=dist.ReduceOp.MAX)
         assert error < 0.015, error
@@ -428,11 +426,11 @@ def main():
         calls = {
             "attention": attention,
             "dep16_projection": lambda: baseline(x)[0],
-            "tp4_compute_projection": lambda: exchange4.forward(x, linear4, counts),
+            "tp4_compute_projection": lambda: linear4(x, counts=counts)[0],
             "dep16_attention_projection": lambda: baseline(attention())[0],
-            "tp4_compute_attention_projection": lambda: exchange4.forward(
-                attention(), linear4, counts
-            ),
+            "tp4_compute_attention_projection": lambda: linear4(
+                attention(), counts=counts
+            )[0],
             "quantize": lambda: flashinfer_fp8_blockscale_quantize_prepacked(x, 128)[0],
             "full_gemm": lambda: flashinfer_mm_fp8_blockscale(
                 xq,

@@ -605,7 +605,7 @@ def check_shared_scratch(state, baseline, attention, mapping, group, model, dot_
     previous layer's local weight or scales in the reusable full-weight buffer.
     """
     weight, scales, quant = load_projection(str(model), 1)
-    (other_baseline, _), unused = make_linears(mapping, weight, scales, quant)
+    other_baseline, unused = make_linears(mapping, weight, scales, quant)
     del unused
     other = PrefetchScheduleOptimization(group, weight, scales, state.optimization_mode)
     other.weight = state.weight
@@ -672,7 +672,7 @@ def main():
             group = candidate
     assert group is not None
     weight, scales, quant = load_projection(str(args.model), 0)
-    (baseline, _), unused = make_linears(mapping, weight, scales, quant)
+    baseline, unused = make_linears(mapping, weight, scales, quant)
     del unused
     attention = KdaDecode(args.model, args.rows, rank)
     states = {}
