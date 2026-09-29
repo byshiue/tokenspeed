@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Share K-sharded weights between activation TP and full-weight prefetch."""
+"""Prefetch immutable output-channel shards beside attention for a local GEMM."""
 
 from functools import partial
 
@@ -33,16 +33,17 @@ from tokenspeed.runtime.distributed.process_group_manager import (
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
-from tokenspeed.runtime.layers.linear import DPRowParallelLinear
+from tokenspeed.runtime.layers.linear import ColumnParallelLinear, DPRowParallelLinear
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
-class WeightPrefetchLinear(DPRowParallelLinear):
-    """Use activation TP below 128 local rows and prefetch weights otherwise.
+class WeightPrefetchLinear(ColumnParallelLinear):
+    """Use compute TP through M=64 and N-shard prefetch for larger local batches.
 
-    Both routes share one K shard and the ordinary checkpoint loader. Large
-    owners still compute the small owners' partial outputs when a group is
-    mixed; every peer must enter the same activation collectives.
+    Keep an N shard for direct-layout weight prefetch and a separate K shard
+    for the ordinary activation-TP projection. Both load checkpoint codes and
+    scales verbatim. Large owners also contribute their K shard when other
+    owners in the subgroup use compute TP; empty ranks must participate too.
 
     Args:
         input_size: Full GEMM input width (K).
@@ -52,16 +53,30 @@ class WeightPrefetchLinear(DPRowParallelLinear):
         prefix: Checkpoint parameter prefix, unchanged by sharding.
     """
 
-    PREFETCH_MIN_ROWS = 128
+    COMPUTE_MAX_ROWS = 64
 
     def __init__(self, input_size, output_size, parallel, quant_config, prefix):
+        if input_size % 128 or output_size % 128:
+            raise ValueError("Weight prefetch requires full 128x128 weight blocks")
+        shard_rows = (
+            (output_size // 128 + parallel.tp_size - 1) // parallel.tp_size
+        ) * 128
         super().__init__(
             input_size=input_size,
-            output_size=output_size,
-            parallel=parallel,
+            output_size=shard_rows * parallel.tp_size,
+            bias=False,
+            gather_output=False,
+            skip_bias_add=False,
             params_dtype=None,
             quant_config=quant_config,
+            output_sizes=None,
             prefix=prefix,
+            tp_rank=parallel.tp_rank,
+            tp_size=parallel.tp_size,
+            tp_group=parallel.tp_group,
+            use_presharded_weights=False,
+            override_kernel_name=None,
+            interleave_linear_and_gate=False,
         )
         if (
             not isinstance(self.quant_method, Fp8LinearMethod)
@@ -75,11 +90,44 @@ class WeightPrefetchLinear(DPRowParallelLinear):
                 "Weight-only TP requires serialized FP8/FP32 128x128 scales and dense_gemm_backend=auto"
             )
         self.logical_output_size = output_size
+        self.parallel = parallel
         self.source: CudaWeightPrefetchSource | None = None
         self.workspace: CudaWeightPrefetchWorkspace | None = None
+        self.compute_projection = DPRowParallelLinear(
+            input_size,
+            output_size,
+            parallel=parallel,
+            params_dtype=None,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+
+    def weight_loader_v2(self, param, loaded_weight):
+        """Load both shard layouts without retaining the full checkpoint matrix."""
+        if param is self.weight:
+            expected = (self.logical_output_size, self.input_size)
+            compute_param = self.compute_projection.weight
+        elif param is self.weight_scale_inv:
+            expected = (self.logical_output_size // 128, self.input_size // 128)
+            compute_param = self.compute_projection.weight_scale_inv
+        else:
+            raise ValueError(
+                "Weight prefetch accepts only FP8 weights and block scales"
+            )
+        if tuple(loaded_weight.shape) != expected:
+            raise ValueError(
+                f"Expected checkpoint shape {expected}, got {loaded_weight.shape}"
+            )
+        rows = param.shape[0]
+        start = self.tp_rank * rows
+        valid = max(0, min(rows, loaded_weight.shape[0] - start))
+        param.data.zero_()
+        if valid:
+            param.data[:valid].copy_(loaded_weight[start : start + valid])
+        self.compute_projection.weight_loader_v2(compute_param, loaded_weight)
 
     def prepare(self, workspace):
-        """Publish immutable shards and bind shared scratch before memory profiling."""
+        """Publish shards, cache layer scales and bind scratch before memory profiling."""
         if self.source is not None:
             if self.workspace is not workspace:
                 raise RuntimeError(
@@ -88,18 +136,17 @@ class WeightPrefetchLinear(DPRowParallelLinear):
             return
         group = pg_manager.get_process_group("nccl", self.parallel.tp_group)
         self.source = CudaWeightPrefetchSource(
-            group, self.weight, self.weight_scale_inv, self.input_size
+            group, self.weight, self.weight_scale_inv, self.logical_output_size
         )
+        workspace.prepare(self.source)
         # Replace, rather than retain, the loading allocation. The shard remains
         # immutable and mapped for the entire lifetime of all serving graphs.
         self.weight.data = self.source.weight
         self.weight_scale_inv.data = self.source.scales
-        # Refresh the ordinary sharded GEMM plan against the published storage.
-        self.quant_method.process_weights_after_loading(self)
         self.workspace = workspace
 
     def prefetch(self):
-        """Fork weight/scales refresh before attention on this layer's main stream."""
+        """Fork weight refresh before attention; immutable scales are already cached."""
         if self.source is None or self.workspace is None:
             raise RuntimeError("Weight prefetch must be prepared before forward")
         main = torch.cuda.current_stream(self.weight.device)
@@ -124,7 +171,7 @@ class WeightPrefetchLinear(DPRowParallelLinear):
         return self.attend(attention, *args, **kwargs)
 
     def wrap_attention(self, attention, num_tokens, capture_ready):
-        if num_tokens < self.PREFETCH_MIN_ROWS:
+        if num_tokens <= self.COMPUTE_MAX_ROWS:
             return attention
         # Match the backend's boundary: retain inline KDA prefill capture when
         # metadata is ready, but contain the fork/join inside an eager break.
@@ -140,16 +187,17 @@ class WeightPrefetchLinear(DPRowParallelLinear):
             or inputs.shape != (counts[self.parallel.rank], self.input_size)
         ):
             raise ValueError("Weight prefetch requires matching physical token counts")
-        large = inputs.shape[0] >= self.PREFETCH_MIN_ROWS
+        large = inputs.shape[0] > self.COMPUTE_MAX_ROWS
         small_counts = [
-            count if count < self.PREFETCH_MIN_ROWS else 0 for count in counts
+            count if count <= self.COMPUTE_MAX_ROWS else 0 for count in counts
         ]
-        # Filtering only the owners, not the participants, keeps mixed groups
-        # collective-safe. Each peer contributes its one persistent K shard.
-        small_output, _ = super().forward(inputs[:0] if large else inputs, small_counts)
+        # Filter token owners, never participants: all peers supply K-sharded
+        # partial results for the small owners, including large and idle peers.
+        small_output, _ = self.compute_projection(
+            inputs[:0] if large else inputs, small_counts
+        )
         if not large:
             return small_output, None
-        shape = (self.logical_output_size, self.input_size)
-        prepared = self.workspace.prepare_input(inputs, shape)
-        output = self.workspace.project(inputs, prepared, shape)
+        prepared = self.workspace.prepare_input(inputs, self.source)
+        output = self.workspace.project(inputs, prepared, self.source)
         return output, None

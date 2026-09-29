@@ -23,7 +23,7 @@
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.gemm import (
     fp8_linear,
     fp8_linear_accepts_prepacked_input,
@@ -39,75 +39,34 @@ from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.cuda.async_copy import CudaAsyncCopy
 
 
-@triton.jit
-def _gather_prefetch_scales(
-    pointers,
-    canonical,
-    prepared,
-    N_BLOCKS: tl.constexpr,
-    K_BLOCKS: tl.constexpr,
-    P: tl.constexpr,
-    WEIGHT_WORDS: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    peer = tl.program_id(0)
-    shard_k = K_BLOCKS // P
-    offsets = tl.arange(0, BLOCK)
-    source = tl.load(pointers + peer).to(tl.pointer_type(tl.int32))
-    mask = offsets < N_BLOCKS * shard_k
-    bits = tl.load(source + WEIGHT_WORDS + offsets, mask, other=0)
-    row = offsets // shard_k
-    col = peer * shard_k + offsets % shard_k
-    tl.store(canonical + row * K_BLOCKS + col, bits, mask)
-    tl.store(prepared + col * N_BLOCKS + row, bits, mask)
-
-
-@triton.jit
-def _restore_prefetch_weight(
-    packed,
-    weight,
-    N: tl.constexpr,
-    K_WORDS: tl.constexpr,
-    P: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    # Copies arrive as [peer,N,K/P]. GEMM needs ordinary contiguous [N,K].
-    dst = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row, col = dst // K_WORDS, dst % K_WORDS
-    shard_k = K_WORDS // P
-    peer = col // shard_k
-    src = peer * N * shard_k + row * shard_k + col % shard_k
-    bits = tl.load(packed + src, dst < N * K_WORDS, other=0)
-    tl.store(weight + dst, bits, dst < N * K_WORDS)
-
-
 class CudaWeightPrefetchSource:
     """Publish one immutable layer shard; retain mappings until collective teardown.
 
     Args:
         group: Ordered TP process group, created before loading/capture.
-        weight: FP8 input-channel shard, [N,K/TP].
-        scales: Canonical FP32 scales, [N/128,K/TP/128].
-        input_size: Full input width K, including every peer's channel shard.
+        weight: FP8 output-channel shard, [ceil(N/128/TP)*128,K].
+        scales: Canonical FP32 scales, [shard_rows/128,K/128].
+        output_size: Full logical output width N, excluding shard padding.
 
     The returned weight/scales views replace the Linear parameters at setup,
     so no duplicate persistent GPU weight remains. Do not update these views
     while any rank can execute a graph or read peer mappings.
     """
 
-    def __init__(self, group, weight, scales, input_size):
+    def __init__(self, group, weight, scales, output_size):
         self.group = group
         self.size, self.rank = group.size(), group.rank()
-        self.n, self.k = weight.shape[0], input_size
+        self.n, self.k = output_size, weight.shape[1]
+        self.shard_rows = triton.cdiv(self.n // 128, self.size) * 128
         if (
             weight.device.type != "cuda"
             or weight.dtype != torch.float8_e4m3fn
             or scales.dtype != torch.float32
             or self.size < 2
             or self.n % 128
-            or self.k % (128 * self.size)
-            or weight.shape != (self.n, self.k // self.size)
-            or scales.shape != (self.n // 128, self.k // self.size // 128)
+            or self.k % 128
+            or weight.shape != (self.shard_rows, self.k)
+            or scales.shape != (self.shard_rows // 128, self.k // 128)
         ):
             raise ValueError(
                 "Weight prefetch requires CUDA FP8 weights and FP32 128x128 scales"
@@ -133,11 +92,6 @@ class CudaWeightPrefetchSource:
             )
             for peer in range(self.size)
         ]
-        self.pointers = torch.tensor(
-            [peer.data_ptr() for peer in self.peers],
-            dtype=torch.int64,
-            device=weight.device,
-        )
         self.copy = CudaAsyncCopy()
         self.closed = False
         # Publish once, before any peer may skip a forward or start capture.
@@ -162,65 +116,48 @@ class CudaWeightPrefetchSource:
     solution="cuda",
     signatures=format_signatures(("weight",), "dense", {torch.float8_e4m3fn}),
 )
-def cuda_prefetch_fp8_weights(
-    source, packed, weight, canonical_scales, prepared_scales
-):
-    """Refresh full weight/scales on the current stream from immutable peer shards.
+def cuda_prefetch_fp8_weights(source, weight):
+    """Refresh full weights on the current stream using only copy engines.
 
     Args:
         source: Published CudaWeightPrefetchSource for this layer.
-        packed: Borrowed contiguous rank-major FP8 transfer scratch, N*K bytes.
         weight: Borrowed full [N,K] FP8 destination.
-        canonical_scales: Borrowed [N/128,K/128] FP32 destination.
-        prepared_scales: Borrowed contiguous [K/128,N/128] FP32 destination.
 
     Returns:
         None. The caller must order this stream before GEMM and after the
-        preceding GEMM that consumed these destinations.
+        preceding GEMM that consumed this destination. Scales are cached at setup.
     """
     if source.closed:
         raise RuntimeError("Weight prefetch source has been closed")
-    _gather_prefetch_scales[(source.size,)](
-        source.pointers,
-        canonical_scales.view(torch.int32),
-        prepared_scales.view(torch.int32),
-        source.n // 128,
-        source.k // 128,
-        source.size,
-        source.weight_bytes // 4,
-        triton.next_power_of_2(source.scales.numel()),
-        num_warps=4,
-    )
     stream = torch.cuda.current_stream(weight.device).cuda_stream
     # Remote first, local last: this order gave the best complete KDA latency.
     for step in range(1, source.size + 1):
         peer = (source.rank - step) % source.size
+        start = peer * source.shard_rows
+        valid = max(0, min(source.shard_rows, source.n - start))
+        if not valid:
+            continue
+        # N shards land directly in GEMM's contiguous [N,K] layout. Ignore
+        # padded trailing blocks, including peers with no valid output rows.
         source.copy.device_to_device(
-            packed.data_ptr() + peer * source.weight_bytes,
+            weight.data_ptr() + start * source.k,
             source.peers[peer].data_ptr(),
-            source.weight_bytes,
+            valid * source.k,
             stream,
         )
-    _restore_prefetch_weight[(triton.cdiv(source.n * source.k // 4, 1024),)](
-        packed.view(torch.int32),
-        weight.view(torch.int32),
-        source.n,
-        source.k // 4,
-        source.size,
-        1024,
-    )
 
 
 class CudaWeightPrefetchWorkspace:
-    """Transfer and full-weight scratch reused by sequential projection layers.
+    """Shared full-weight scratch and immutable per-layer scale plans.
 
     Args:
         shapes: All logical (N,K) shapes, fixed before capture.
         device: CUDA device hosting the local full-width GEMM.
 
     The plan follows the ordinary FlashInfer FP8 path, including its canonical
-    scale fallback for large unaligned token counts. No token-dependent
-    communication allocations or weight caches are created during forward.
+    scale fallback for large unaligned token counts. Both scale layouts are
+    cached before capture; only the large weight buffer is reused across layers.
+    No token-dependent communication allocations are created during forward.
     """
 
     def __init__(self, shapes, device):
@@ -233,39 +170,61 @@ class CudaWeightPrefetchWorkspace:
         self.weight_storage = torch.empty(
             capacity, dtype=torch.float8_e4m3fn, device=device
         )
-        self.packed_storage = torch.empty_like(self.weight_storage)
-        self.scale_storage = torch.ones(
-            capacity // (128 * 128), dtype=torch.float32, device=device
-        )
         self.stream = torch.cuda.Stream(device=device, priority=-1)
         self.views = {}
-        for n, k in self.shapes:
-            weight = self.weight_storage[: n * k].view(n, k)
-            scales = self.scale_storage[: n * k // (128 * 128)].view(n // 128, k // 128)
-            plan = prepare_fp8_linear(weight, scales, (128, 128), scale_format=None)
-            if not fp8_linear_accepts_prepacked_input(plan, 128):
-                raise ValueError(
-                    "Weight prefetch requires the prepared FlashInfer FP8 plan"
+
+    def prepare(self, source):
+        """Cache a published layer's full FP32 scales and GEMM layout once.
+
+        Args:
+            source: Immutable layer shard, published on every peer before this call.
+
+        Returns:
+            None. Call before memory profiling or capture on the setup stream.
+        """
+        if source in self.views:
+            return
+        n, k = source.n, source.k
+        if (n, k) not in self.shapes:
+            raise ValueError("Weight shape is not reserved in this workspace")
+        weight = self.weight_storage[: n * k].view(n, k)
+        scales = torch.empty(
+            (n // 128, k // 128), dtype=torch.float32, device=weight.device
+        )
+        stream = torch.cuda.current_stream(weight.device).cuda_stream
+        for peer in range(source.size):
+            start = peer * source.shard_rows // 128
+            valid = max(0, min(source.shard_rows // 128, n // 128 - start))
+            if valid:
+                source.copy.device_to_device(
+                    scales.data_ptr() + start * (k // 128) * 4,
+                    source.peers[peer].data_ptr() + source.weight_bytes,
+                    valid * (k // 128) * 4,
+                    stream,
                 )
-            self.views[(n, k)] = weight, scales, plan
+        plan = prepare_fp8_linear(weight, scales, (128, 128), scale_format=None)
+        if not fp8_linear_accepts_prepacked_input(plan, 128):
+            raise ValueError(
+                "Weight prefetch requires the prepared FlashInfer FP8 plan"
+            )
+        # Same-shaped layers share weights' scratch address, never their scales.
+        self.views[source] = weight, scales, plan
 
     def gather(self, source):
-        """Enqueue a complete refresh into this shape's borrowed destinations."""
-        weight, scales, plan = self.views[(source.n, source.k)]
-        cuda_prefetch_fp8_weights(
-            source, self.packed_storage, weight, scales, plan.prepared_weight_scales
-        )
+        """Refresh shared weight scratch; this layer's scales stay unchanged."""
+        weight, _, _ = self.views[source]
+        cuda_prefetch_fp8_weights(source, weight)
 
-    def prepare_input(self, x, shape):
+    def prepare_input(self, x, source):
         """Quantize independently of weight arrival; return None for canonical input."""
-        _, _, plan = self.views[shape]
+        _, _, plan = self.views[source]
         if fp8_linear_accepts_prepacked_input(plan, x.shape[0]):
             return flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
         return None
 
-    def project(self, x, prepared_input, shape):
+    def project(self, x, prepared_input, source):
         """Return owned full-width outputs after the caller joins the prefetch stream."""
-        weight, scales, plan = self.views[shape]
+        weight, scales, plan = self.views[source]
         if prepared_input is not None:
             values, input_scales = prepared_input
             return fp8_linear_prepacked(

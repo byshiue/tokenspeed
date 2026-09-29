@@ -37,6 +37,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 from safetensors import safe_open
+from tokenspeed_kernel.ops.gemm import fp8_linear, prepare_fp8_linear
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -58,6 +59,10 @@ from tokenspeed.runtime.layers.dp_linear_communication import (
     projection_mapping,
 )
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.weight_prefetch_linear import (
+    CudaWeightPrefetchWorkspace,
+    WeightPrefetchLinear,
+)
 from tokenspeed.runtime.models.kimi_k3 import KimiLinearForCausalLM, KimiLinearKDA
 
 
@@ -298,18 +303,39 @@ def assert_output(actual, expected, full_weight):
     if full_weight or actual.numel() == 0:
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     else:
-        # K-sharded GEMM changes accumulation/rounding, as ordinary compute TP
-        # does. Keep the existing projection tolerance against replicated FP8.
+        # Ordinary K-sharded FP8 GEMM/reduction changes accumulation order.
         delta = (actual.float() - expected.float()).norm()
         assert delta / expected.float().norm().clamp_min(1e-12) < 0.015
         torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.03)
 
 
+def compute_reference(compute, fixture, counts):
+    """Run unchanged compute TP for the hybrid's selected token owners only."""
+    small_counts = [count if count <= 64 else 0 for count in counts]
+    rows = small_counts[fixture.mapping.rank]
+    ctx = SimpleNamespace(**vars(fixture.ctx))
+    ctx.bs = rows
+    ctx.global_num_tokens = ctx.collective_global_num_tokens = small_counts
+    with (
+        patch.object(fixture, "ctx", ctx),
+        patch.object(fixture, "inputs", fixture.inputs[:rows]),
+        patch.object(fixture, "positions", fixture.positions[:rows]),
+    ):
+        return fixture.pair(compute)
+
+
 @torch.no_grad()
 def validate(baseline, candidate, compute, fixture, counts):
     fixture.set_rows(counts)
+    if all(count == 65 for count in counts):
+        # Model a padded graph: routing must use its 65 physical rows, not
+        # these 64 logical requests. Scratch poisoning below checks the route.
+        fixture.ctx.global_num_tokens = [64] * len(counts)
     workspace = candidate.model.layers[0].self_attn.o_proj.workspace
-    large = counts[fixture.mapping.rank] >= 128
+    large = counts[fixture.mapping.rank] > 64
+    # TP16's unchanged NCCL compute path can exceed the TP4 quantization bound.
+    # Its oracle is exact agreement with compute TP, not a looser tolerance.
+    check_replicated = large or candidate.model.layers[0].self_attn.o_proj.tp_size <= 4
     for _ in range(2):
         fixture.pair(candidate)
     graph = torch.cuda.CUDAGraph()
@@ -318,28 +344,30 @@ def validate(baseline, candidate, compute, fixture, counts):
     for multiplier in (1.0, 0.5, -1.0):
         fixture.inputs.mul_(multiplier)
         expected = fixture.pair(baseline)
-        for actual, reference in zip(fixture.pair(candidate), expected):
-            assert_output(actual, reference, large)
-        # Below threshold the hybrid must execute the unchanged compute-TP path.
-        if max(counts) < 128:
-            for actual, reference in zip(
-                fixture.pair(candidate), fixture.pair(compute)
-            ):
+        actual_pair = fixture.pair(candidate)
+        if check_replicated:
+            for actual, reference in zip(actual_pair, expected):
+                assert_output(actual, reference, large)
+        # Mixed/idle ranks participate in exactly the same compute operation.
+        small_expected = compute_reference(compute, fixture, counts)
+        if not large:
+            for actual, reference in zip(actual_pair, small_expected):
                 torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+        # Only shared scratch is mutable. Each layer's cached scale layouts
+        # must survive another layer's prefetch and every graph replay.
         workspace.weight_storage.view(torch.uint8).fill_(255)
-        workspace.scale_storage.fill_(float("nan"))
-        for _, _, plan in workspace.views.values():
-            plan.prepared_weight_scales.fill_(float("nan"))
         if fixture.mapping.rank % 4 == 0:
             torch.cuda._sleep(100000)
         graph.replay()
-        for actual, reference in zip(graphed, expected):
-            assert_output(actual, reference, large)
+        if check_replicated:
+            for actual, reference in zip(graphed, expected):
+                assert_output(actual, reference, large)
+        if not large:
+            for actual, reference in zip(graphed, small_expected):
+                torch.testing.assert_close(actual, reference, atol=0, rtol=0)
         if large:
             linear = candidate.model.layers[1].self_attn.o_proj
-            weight, scales, _ = workspace.views[
-                (linear.logical_output_size, linear.input_size)
-            ]
+            weight, _, _ = workspace.views[linear.source]
             reference = baseline.model.layers[1].self_attn.o_proj
             torch.testing.assert_close(
                 weight.view(torch.uint8),
@@ -347,13 +375,19 @@ def validate(baseline, candidate, compute, fixture, counts):
                 atol=0,
                 rtol=0,
             )
-            torch.testing.assert_close(
-                scales, reference.weight_scale_inv, atol=0, rtol=0
-            )
         else:
-            # A small/idle owner must not refresh any full weight, even while
-            # contributing its K shard to another owner's activation collective.
+            # Small and idle owners join compute TP without refreshing weights;
+            # their immutable N shards remain readable by large owners.
             assert torch.all(workspace.weight_storage.view(torch.uint8) == 255)
+        for layer, reference_layer in zip(
+            candidate.model.layers, baseline.model.layers
+        ):
+            _, scales, plan = workspace.views[layer.self_attn.o_proj.source]
+            expected_scales = reference_layer.self_attn.o_proj.weight_scale_inv
+            torch.testing.assert_close(scales, expected_scales, atol=0, rtol=0)
+            torch.testing.assert_close(
+                plan.prepared_weight_scales, expected_scales.T, atol=0, rtol=0
+            )
     graph.reset()
     # Exercise the same eager-attention boundary used by breakable prefill
     # graphs, including repeated scratch refresh after the captured segment.
@@ -365,7 +399,11 @@ def validate(baseline, candidate, compute, fixture, counts):
             fixture.inputs.mul_(0.75)
             reference = fixture.forward(baseline, 0)
             capture.replay()
-            assert_output(output, reference, large)
+            if check_replicated:
+                assert_output(output, reference, large)
+            small_reference = compute_reference(compute, fixture, counts)[0]
+            if not large:
+                torch.testing.assert_close(output, small_reference, atol=0, rtol=0)
     del capture, output
     torch.cuda.synchronize()
     dist.barrier()
@@ -391,8 +429,12 @@ def validate_prefill(baseline, candidate, compute, fixture, lengths):
                 reference = fixture.forward(baseline, 0)
                 workspace.weight_storage.zero_()
                 capture.replay()
-                assert_output(output, reference, sum(lengths) >= 128)
-                if sum(lengths) < 128:
+                if (
+                    sum(lengths) > 64
+                    or candidate.model.layers[0].self_attn.o_proj.tp_size <= 4
+                ):
+                    assert_output(output, reference, sum(lengths) > 64)
+                if sum(lengths) <= 64:
                     torch.testing.assert_close(
                         output, fixture.forward(compute, 0), atol=0, rtol=0
                     )
@@ -417,6 +459,64 @@ def validate_prefill(baseline, candidate, compute, fixture, lengths):
 
 
 @torch.no_grad()
+def validate_padded_shards(baseline, candidate):
+    """Exercise both partially filled and empty N shards through the real loader."""
+    parallel = candidate.model.layers[0].self_attn.o_proj.parallel
+    n, k = (parallel.tp_size + 1) * 128, max(8, parallel.tp_size) * 128
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(713)
+        weight = torch.randn(n, k, device="cuda").to(torch.float8_e4m3fn)
+        scales = (
+            torch.rand(n // 128, k // 128, device="cuda", dtype=torch.float32) + 0.5
+        )
+        inputs = torch.randn(128, k, device="cuda", dtype=torch.bfloat16)
+    with torch.device("cuda"):
+        linear = WeightPrefetchLinear(
+            k, n, parallel, baseline.quant_config, "model.layers.0.self_attn.o_proj"
+        )
+    linear.weight_loader_v2(linear.weight, weight)
+    linear.weight_loader_v2(linear.weight_scale_inv, scales)
+    linear.quant_method.process_weights_after_loading(linear)
+    linear.compute_projection.quant_method.process_weights_after_loading(
+        linear.compute_projection
+    )
+    workspace = CudaWeightPrefetchWorkspace([(n, k)], weight.device)
+    linear.prepare(workspace)
+    reference = prepare_fp8_linear(weight, scales, (128, 128), scale_format=None)
+
+    def forward():
+        linear.attend(lambda: inputs)
+        return linear(inputs, [128] * parallel.world_size)[0]
+
+    forward()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    for multiplier in (1.0, -0.5):
+        inputs.mul_(multiplier)
+        workspace.weight_storage.view(torch.uint8).fill_(255)
+        graph.replay()
+        gathered, gathered_scales, _ = workspace.views[linear.source]
+        torch.testing.assert_close(
+            gathered.view(torch.uint8), weight.view(torch.uint8), rtol=0, atol=0
+        )
+        torch.testing.assert_close(gathered_scales, scales, rtol=0, atol=0)
+        expected = fp8_linear(
+            reference,
+            inputs,
+            weight,
+            scales,
+            input_scales=None,
+            bias=None,
+            out_dtype=inputs.dtype,
+            out=None,
+        )
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    graph.reset()
+    linear.source.close()
+
+
+@torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
@@ -424,16 +524,38 @@ def main():
     args = parser.parse_args()
     baseline, candidate, fixture = setup(args.model, args.tp_size, 257)
     compute = AttentionOnlyModel(args.model, fixture.mapping, 1, args.tp_size, 257)
+    for layer, reference_layer in zip(candidate.model.layers, baseline.model.layers):
+        linear = layer.self_attn.o_proj.compute_projection
+        reference = reference_layer.self_attn.o_proj
+        width = linear.input_size_per_partition
+        start = linear.tp_rank * width
+        torch.testing.assert_close(
+            linear.weight.view(torch.uint8),
+            reference.weight[:, start : start + width].view(torch.uint8),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            linear.weight_scale_inv,
+            reference.weight_scale_inv[:, start // 128 : (start + width) // 128],
+            atol=0,
+            rtol=0,
+        )
+    validate_padded_shards(baseline, candidate)
     world = fixture.mapping.world_size
     for counts in (
         [1] * world,
         [3] * world,
+        [63] * world,
+        [64] * world,
+        [65] * world,
         [127] * world,
         [128] * world,
         [129] * world,
         [257] * world,
         [0 if rank % args.tp_size == 0 else 7 for rank in range(world)],
-        [(0, 127, 128, 129)[rank % 4] for rank in range(world)],
+        [(0, 64, 65, 128)[rank % 4] for rank in range(world)],
+        [64 if rank // args.tp_size % 2 else 65 for rank in range(world)],
         [128 if rank % args.tp_size else 0 for rank in range(world)],
         [3 if rank % args.tp_size == 0 else 0 for rank in range(world)],
         [0] * world,
@@ -441,11 +563,11 @@ def main():
         validate(baseline, candidate, compute, fixture, counts)
         if fixture.mapping.rank == 0:
             print(json.dumps({"counts": counts, "passed": True}), flush=True)
-    for lengths in ((7, 10), (63, 64), (64, 64), (64, 65)):
+    for lengths in ((7, 10), (31, 32), (32, 32), (32, 33), (64, 64), (64, 65)):
         validate_prefill(baseline, candidate, compute, fixture, lengths)
     for layer in candidate.model.layers:
         layer.self_attn.o_proj.source.close()
-    candidate.model.layers[0].self_attn.o_proj.communication.close()
+    candidate.model.layers[0].self_attn.o_proj.compute_projection.communication.close()
     compute.model.layers[0].self_attn.o_proj.communication.close()
     dist.destroy_process_group()
     if fixture.mapping.rank == 0:

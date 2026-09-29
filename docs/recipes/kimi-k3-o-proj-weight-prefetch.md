@@ -2,82 +2,94 @@
 
 ## Runtime integration
 
-Hybrid activation/weight TP is available for Kimi-K3's KDA and MLA O projections:
+Kimi-K3 can select compute TP or full-weight prefetch from the local
+O-projection GEMM's physical row count, M:
 
 ```bash
 export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=1
 export TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE=4
 ```
 
-Unset the weight-TP variable, or set it to `1`, to retain the original path.
-Do not enable the separate compute-TP setting at the same time: the hybrid
-path already includes it for small local matrices. Use the
-[TP-sharding recipe](kimi-k3-tp-sharding.md) for DEP16 launch settings, the
-shared environment, and persistent GPU allocation. No scheduler or cache-layout
-change is needed. QKV and shared-expert TP remain independent options.
-
-The runtime loads one **input-channel (K)** shard of the serialized FP8
-O-projection weight and its FP32 128×128 scales. Although the checkpoint is
-called NVFP4, these attention weights are FP8. This path currently requires
-Blackwell, the prepared FlashInfer block-FP8 backend (`dense_gemm_backend=auto`),
-and peer-accessible symmetric memory. Unsupported precision or topology fails
-at startup rather than silently switching algorithms. TP must divide K into
-whole 128-element quantization blocks. No second copy of the weights is retained.
-
-Selection uses the original local DEP GEMM's physical input rows, `M`, including
-CUDA-graph padding. It does not use the TP-expanded GEMM rows, world-wide token
-count, cached context length or prefill/decode mode:
-
-| Local M | Projection path |
+| Local physical M | O-projection execution |
 | --- | --- |
-| Less than 128 | Activation A2A → scale/sharded GEMM → ReduceScatter |
-| At least 128 | Prefetch full weights beside attention → local full GEMM |
+| M ≤ 64 | TP4 compute: activation A2A → quantization/sharded GEMM → ReduceScatter |
+| M > 64 | N-weight TP4: prefetch full weights beside attention → original local GEMM |
 
-The configured activation backend may fuse quantization into A2A; the hybrid
-reuses that existing path rather than introducing a separate quantizer.
+The cutoff is strict: M=64 uses compute TP; M=65 uses weight prefetch.
+It applies to both decode and prefill, including CUDA-graph padding, not to
+global concurrency or cached context length. At one token per request without
+padding, M equals requests per rank. Prefill uses the current chunk's token rows.
 
-For prefill, M counts tokens in the current local forward, possibly across
-multiple requests. A long prompt processed in a chunk smaller than 128 still
-takes activation TP. A local batch of 128 decode tokens takes weight prefetch.
+Unset the weight-TP variable, or set it to `1`, to retain the original path.
+The weight-TP setting already enables the small-M compute route; do not also
+set `TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE` above `1`. QKV and
+shared-expert TP remain independent. See the [TP-sharding recipe](kimi-k3-tp-sharding.md)
+for DEP16 launch settings, the shared environment and persistent allocation.
 
-Each layer publishes its immutable shard once. During forward, CUDA copy
-engines pull contiguous K shards into rank-major scratch while attention runs;
-local kernels gather scales and restore the ordinary full GEMM layout. This
-restoration is needed because the same K shards serve the small-M reduction
-path. It differs from the earlier N-sharded contiguous-copy experiment below.
+The runtime loads two layouts of each KDA/MLA O-projection: an output-channel
+(N) shard for prefetch and an input-channel (K) shard for compute TP, each with
+its FP32 128×128 scales. Both copy checkpoint codes verbatim, without
+requantization or a retained full matrix. These attention weights are FP8 even
+in the NVFP4 checkpoint. TP must divide world size and preserve whole K scale
+blocks. N shards may have unequal valid sizes, with zero-padded trailing blocks.
 
-In mixed groups, only owners with M below 128 send tokens through activation
-TP, but **all peers participate**, including empty and large-M ranks. Large
-owners contribute their K-shard partials for the small owners, then compute
-their own tokens with the prefetched full matrix. If no owner has small tokens,
-activation collectives are skipped. Small and empty owners never gather full
-weights. This rule prevents mismatched collectives without replacing the local
-threshold with a subgroup maximum.
+For M > 64, an auxiliary stream pulls immutable peer weights during attention through
+CUDA copy engines directly into the full contiguous `[N,K]` GEMM buffer.
+Each layer's full canonical scales and prepared GEMM layout are gathered and
+cached once at initialization, before memory profiling and graph capture.
+Inference does not gather scales or launch a scale-layout kernel. After attention
+and weight prefetch complete, the original local full-width GEMM runs. There is
+no weight restoration kernel, activation A2A or output reduction for that
+owner's large-M output. Copy order remains peer shards first, local shard last.
+Activation quantization is unchanged.
 
-Startup prepares both communication paths before graph capture. The small-M
-activation workspace is capped at 127 rows per owner; full-weight scratch is
-shared across sequential KDA/MLA layers.
+For M ≤ 64, the existing `DPRowParallelLinear` performs compute TP without
+refreshing the full-weight buffer. In mixed subgroups, only small owners send
+tokens to this route, but every peer supplies its K-sharded partial results.
+Large and empty owners therefore participate when another owner needs compute
+TP. Only a subgroup with no small-owner tokens skips these collectives.
+Immutable N shards remain readable by large owners independently. The same
+row-count rule applies in eager execution and graphs; no scheduler or
+cache-layout changes are needed. Projection backend settings are unchanged.
 
-All layers share one transfer scratch and one full-weight scratch, sized for the larger of
-the KDA/MLA projections. The next prefetch waits for the previous GEMM to finish;
-GEMM waits for the new weight to arrive. Scratch is reused, not freed and
-allocated per token. Immutable peer mappings must remain alive until every
-rank finishes all graph replays. Weight updates during serving are not supported.
+The feature currently requires Blackwell, the prepared FlashInfer block-FP8
+backend (`dense_gemm_backend=auto`) and peer-accessible symmetric memory.
+Unsupported precision or topology fails at startup. Weight updates during
+serving are not supported.
 
-The attention wrapper keeps its prefetch stream inside the existing graph
-boundary. Decode captures both streams; eligible KDA prefill stays captured;
-an eager attention break includes the prefetch and join together. The full
-matrix has its original dimensions, so quantization and local GEMM preserve
-the replicated path's numerical contract.
+## Lifetime and memory
 
-For KDA `[N,K]=[7168,12288]`, persistent FP8 weights/scales use about 84.02 MiB
-per layer replicated, 21.01 MiB with TP4 or 5.25 MiB with TP16. Both routes use
-those same shards. Transfer and full-weight buffers total about 168 MiB per
-model instance, plus scales and activation communication storage, not per layer.
-The shared scratch, scale views, symmetric allocation granularity
-and graph/allocator reservations must also be counted in model memory.
+Each layer publishes its immutable N shard once and retains its K shard locally.
+All sequential KDA/MLA layers
+share one full-weight buffer, sized for the largest projection. Scale layouts
+and GEMM plans are keyed by layer, not shape: same-shaped layers have different
+scale values, which must remain valid across eager calls and graph replays.
+The prefetch stream waits for the preceding consumer before reusing
+scratch, and GEMM waits for the current prefetch. Buffers have stable addresses
+before capture; finishing GEMM releases their logical lifetime rather than
+allocating or freeing GPU memory every token. Peer mappings remain alive
+until every rank has finished all graph replays.
 
-Validate actual Kimi loading, startup and attention forwards with:
+The attention wrapper keeps the prefetch and stream join inside the existing
+graph boundary. Decode captures both streams; eligible KDA prefill stays
+captured; an eager attention break includes the prefetch and join together.
+
+For KDA `[N,K]=[7168,12288]`, replicated FP8 weights/scales occupy about
+84.02 MiB per layer. Each TP4 layout uses about 21.01 MiB per layer per GPU;
+retaining both costs **42.02 MiB per layer**, not 21.01 MiB. This is roughly
+half the replicated weight/scale storage, rather than one quarter. There is
+also about 84 MiB of full-weight scratch **per model**, not per layer, plus
+shared compute-TP communication scratch capped at 64 rows per owner.
+Both cached full scale layouts occupy
+42 KiB per KDA layer per GPU and replace the former shared scale scratch;
+neither full scale layout is refreshed during inference. The compute GEMM
+retains its ordinary prepared shard-scale plan as well. Direct N-layout copies
+avoid the former K-sharded prefetch path's additional 84 MiB transfer buffer.
+Count scale plans, symmetric allocation granularity and graph reservations
+separately when reporting total memory or cache capacity. TP16 requires
+N-block padding, so its per-rank storage is not exactly one sixteenth.
+
+## Correctness validation
 
 ```bash
 python -m torch.distributed.run --nnodes=NODE_COUNT --nproc-per-node=4 \
@@ -86,54 +98,126 @@ python -m torch.distributed.run --nnodes=NODE_COUNT --nproc-per-node=4 \
   --model MODEL_DIR --tp-size 4
 ```
 
-Repeat with `--tp-size 16` on 16 GPUs using supported activation backends
-(for example NCCL, rather than TP4-only Lamport reduction). The test uses real checkpoint weights,
-eager and graph execution, multiple layers sharing scratch, changing inputs,
-poisoned scratch, 127/128/129 boundaries, mixed routes and empty ranks. Large-M
-outputs must match replicated FP8 exactly; small-M outputs must match ordinary
-compute TP exactly, with the existing TP rounding tolerance against replicated
-FP8. Small-M graphs must leave poisoned full-weight scratch untouched.
-This is an attention-module
-numerical check, not a reduced-depth model or dataset accuracy evaluation.
+Repeat with `--tp-size 16` to cover partially filled and empty N shards.
+The test uses the production Kimi loader, startup and two real KDA modules.
+It checks bit-exact loaded K shards and reconstructed N-sharded weights/scales.
+Large-M outputs must match replicated FP8 exactly; small-M outputs must match
+the existing compute-TP route exactly, with its existing accumulation tolerance
+against replicated FP8 checked through TP4. TP16 uses exact compute-TP16
+equivalence: the unchanged NCCL compute path can exceed the TP4 1.5% relative-L2
+bound at M=1. This is not a wider tolerance for the hybrid. Cases include
+M=63/64/65, graph padding, mixed
+`[0,64,65,128]` owners, changing activations, poisoned weight scratch,
+per-layer scale isolation, delayed peers and all-idle subgroups. Small owners
+must leave poisoned full-weight scratch untouched. Incremental prefill tests
+the same boundary through both eager-attention breaks and inline capture.
+These checks establish attention-module equivalence, not dataset accuracy.
 
-### Hybrid runtime measurements
+## Hybrid component check
 
-The first hybrid comparison uses one four-GB300 subgroup, real NVFP4 checkpoint
-weights (FP8 for these projections), seeded KDA state/activations and CUDA
-graphs. It calls the production `KimiLinearKDA.forward`, including input
-projections, attention and O projection. The replicated reference is the local
-DEP attention computation; this is not a 16-GPU full-model serving benchmark.
+The M > 64 hybrid was checked on 16 GB300 GPUs with real checkpoint weights,
+CUDA graphs, QKV TP1 and fixed decode metadata. The complete production KDA
+module includes input projections, attention and O projection, but no MoE or
+AttnRes. Ten alternating-order samples each time 15 graph replays of 20
+forwards, using CUDA events without NSYS and the slowest rank per sample.
 
-| Local M | Replicated reference | Activation TP4 | Hybrid TP4 |
+| M/rank | Replicated TP1 | Compute TP4 | Always-prefetch N TP4 | Hybrid TP4 |
+| --- | ---: | ---: | ---: | ---: |
+| 32 | 204.85 us | 209.39 us | 277.74 us | 210.03 us |
+| 64 | 310.87 us | 310.81 us | 318.18 us | 312.03 us |
+| 65 | 316.05 us | 321.60 us | 323.51 us | 323.66 us |
+| 128 | 505.42 us | 524.74 us | 511.40 us | 511.17 us |
+
+The hybrid avoids small-M prefetch cost and keeps the large-M copy schedule.
+At M64 it is 1.93% faster than always-prefetch and 0.39% slower than standalone
+compute TP4. M65 demonstrates routing, not a measured performance crossover:
+compute TP4 is still faster there. The cutoff is the selected policy, not an
+autotuned threshold. These component timings do not establish full-model
+performance or cache capacity with the additional K-sharded weights.
+
+## Earlier C64 component comparison: cached scales
+
+These results predate the M > 64 cutoff: the weight-TP4 column forced prefetch
+at C64. The current hybrid instead selects compute TP there. The cache change
+removes the per-forward scale-gather kernel, but the C64 test
+does not show a latency gain. The production KDA module still includes input
+projections, recurrent attention and O projection; this is not a GEMM-only or
+full-model measurement.
+
+The comparison uses 16 GB300 GPUs, 64 rows per rank, real FP8 attention weights
+from the NVFP4 checkpoint, and CUDA graphs without a profiler. QKV stays TP1.
+Compute TP4 uses TokenSpeed Lamport A2A and TRT-LLM Lamport ReduceScatter.
+The pre-cache implementation and cached implementation run alternately twice;
+each run rotates the three variants over nine samples. Each sample times 15
+graph replays of 20 forwards and takes the slowest rank. Medians below include
+all 18 samples per implementation and variant.
+
+| Complete KDA module | Before scale caching | After scale caching | Change |
 | --- | ---: | ---: | ---: |
-| 32 | 203.12 µs | 208.02 µs | 208.13 µs |
-| 64 | 308.21 µs | 310.21 µs | 310.51 µs |
-| 128 | 505.47 µs | 524.96 µs | 537.79 µs |
+| DEP16 / TP1 | 310.94 us | 311.06 us | +0.04% |
+| DEP16 / compute TP4 | 312.65 us | 313.10 us | +0.15% |
+| DEP16 / N-weight TP4 | 318.87 us | 319.18 us | +0.10% |
 
-Each median uses nine alternating-order samples, 15 replays per sample and
-20 forwards per graph, taking the slowest rank; no profiler was active.
-Activation TP uses TokenSpeed Lamport A2A and TRT-LLM Lamport ReduceScatter.
-The shared environment is PyTorch 2.14.0/CUDA 13.0, NCCL 2.30.7 and FlashInfer
-0.7.0. Small-M hybrid latency is within 0.1% of ordinary activation TP.
-At M=128, prefetch is 2.4% slower than activation TP and 6.4% slower than the
-replicated reference. The common K-shard layout requires reconstruction work
-that the earlier N-sharded variant avoided. The requested threshold remains
-128; these measurements do not show a crossover in favor of prefetch there.
-The previous full-model latency and cache-capacity numbers below must not be
-used as measurements of this hybrid implementation.
+The weight-TP4 increase is small and comparable to movement in the unchanged
+controls; do not claim a speedup. Caching saves repeated scale work, not the
+bulk weight transfers or their competition with attention for memory bandwidth.
+TP4 and TP16 correctness checks pass bit-exactly against replicated FP8,
+including per-layer scale isolation, padded/empty shards, changing inputs,
+poisoned weight scratch, eager/graph decode and incremental prefill. Full-model
+E2E performance has not been rerun for this scale-cache change.
 
-A diagnostic M128 trace confirms that the hybrid emits no activation A2A or
-ReduceScatter when all owners take the large-M route. Its reconstruction kernel
-takes a median 23.65 µs and starts about 0.94 µs after attention ends, leaving
-24.64 µs of exposed prefetch tail. Attention itself takes 400.38 µs versus
-395.76 µs for the replicated reference. These are profiler diagnostics, separate
-from the unprofiled latency table.
+## Earlier 48-layer E2E comparison
+
+These measurements precede both initialization-time scale caching and the
+M > 64 hybrid. They do not validate the new hybrid's full-model latency or memory.
+
+The paired comparison uses real checkpoint weights, the first 48 text layers,
+16 GB300 GPUs, DEP16 attention/cache ownership, EP16 MoE and O weight TP4.
+QKV/shared-expert TP and speculation are disabled; CUDA graphs are enabled.
+C128 means 128 requests per rank, or 2,048 total. Both variants use the same
+hardware, serving settings and fixed-affinity inputs, without NSYS attached.
+
+Each round flushes cache, sends 1,024-token cold prompts, then sends 1,280-token
+prompts reusing the first 1,024 tokens. Cold generation uses 128 output tokens;
+incremental generation uses 512. One full warmup round precedes three measured
+rounds. Report serving completion time, TTFT and stream-observed decode intervals
+separately; none is a projection-only or full-depth model measurement.
+Medians of the three measured rounds:
+
+| Metric | Former K-sharded hybrid | N-sharded weight prefetch | N change |
+| --- | ---: | ---: | ---: |
+| Steady decode after cold prefill | 44.409 ms/token | 43.119 ms/token | -2.91% |
+| Steady decode after incremental prefill | 44.461 ms/token | 43.199 ms/token | -2.84% |
+| Cold request completion | 18.372 s | 17.841 s | -2.89% |
+| Incremental request completion | 27.262 s | 26.526 s | -2.70% |
+| Cold TTFT | 6.088 s | 5.673 s | -6.82% |
+| Incremental TTFT | 1.877 s | 2.017 s | +7.50% |
+| Incremental output throughput | 38,463 token/s | 39,530 token/s | +2.78% |
+
+The steady metric is the median per-request average streamed-token interval
+while all 2,048 requests are active, excluding 250 ms at each end. It is not a
+CUDA-event measurement. Incremental steady-decode samples span 44.395–44.577 ms
+for K versus 43.149–43.206 ms for N. This consistent large-M gain is the reason
+to keep N-sharding and remove the K-sharded hybrid. Request completion includes
+smaller startup/draining batches, where the former hybrid used activation TP.
+TTFT varies more with admission and prefill overlap; these results do not show
+an incremental-TTFT improvement.
+
+TP4 and TP16 GPU validation passed, including padded N shards, and the existing
+Kimi configuration/MoE suite passed 640 tests plus six subtests. E2E cold and
+incremental workflows completed with finite smoke-test logprobs. Across the
+three measured rounds, 5,782/6,144 cold sequences and 5,779/6,144 incremental
+sequences matched between variants. Repeated runs of the same implementation
+also differ, and the former hybrid changes FP8 accumulation at small M.
+Serving token identity is therefore not the correctness gate here: the direct
+KDA tests require exact agreement with replicated FP8. No full-depth or dataset
+accuracy claim follows from this reduced-layer performance experiment.
 
 ## Earlier always-prefetch runtime measurements (N-sharded weights)
 
-The measurements in this section precede the M=128 hybrid rule and its shared
-K-shard layout. They are historical comparisons, **not** performance or memory
-claims for the current hybrid implementation.
+These measurements precede the former M=128 hybrid and the current return to
+N-sharding. They are historical results from different workloads, not substitutes
+for the paired 48-layer comparison above.
 
 ### Integrated KDA measurements
 
@@ -271,7 +355,7 @@ requantization. A restoration kernel writes the ordinary full GEMM layout.
 The activation quantizer and GEMM match the replicated production path.
 
 Weights and scales occupy 84.02 MiB per layer. Persistent storage becomes
-21.01 MiB with TP4-weight or 5.25 MiB with TP16-weight. The current implementation
+21.01 MiB with TP4-weight or 5.25 MiB with TP16-weight. That early implementation
 also needs 168.04 MiB of reusable scratch per rank: one gathered payload and
 one restored weight/scale pair. That scratch must be shared by sequential
 layers in any later model integration, not allocated once per layer.

@@ -255,7 +255,7 @@ def _projection_counts(ctx):
 
 
 def _project_attention_output(inputs, linear, ctx):
-    if isinstance(linear, DPRowParallelLinear):
+    if isinstance(linear, (DPRowParallelLinear, WeightPrefetchLinear)):
         output, _ = linear(inputs, counts=_projection_counts(ctx))
     else:
         output, _ = linear(inputs)
@@ -771,7 +771,7 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 self._project_q_latent_gated(
                     hidden_states, ctx, comm_manager, block_scale, attnres_partial_args
                 )
-            if not isinstance(self.o_proj, DPRowParallelLinear):
+            if not isinstance(self.o_proj, (DPRowParallelLinear, WeightPrefetchLinear)):
                 return hidden_states
             return _project_attention_output(
                 hidden_states.new_empty((0, self.num_heads * self.v_head_dim)),
@@ -1601,7 +1601,7 @@ class KimiLinearKDA(nn.Module):
         if hidden_states.shape[0] == 0:
             if self.input_projection_parallel.tp_size > 1:
                 self._project_qkvfab(hidden_states, attnres_partial_args, ctx=ctx)
-            if not isinstance(self.o_proj, DPRowParallelLinear):
+            if not isinstance(self.o_proj, (DPRowParallelLinear, WeightPrefetchLinear)):
                 return hidden_states
             return _project_attention_output(
                 hidden_states.new_empty((0, self.num_heads * self.head_dim)),
@@ -3646,13 +3646,14 @@ class KimiLinearForCausalLM(BaseCausalLM):
             # One communication object for sequential O projections, never one
             # scratch allocation per Linear. It does not alias MoE aux-stream data.
             weight = next(self.parameters())
-            row_capacity = max_num_tokens
-            if all(
-                isinstance(linear, WeightPrefetchLinear) for linear in row_projections
-            ):
-                row_capacity = min(
-                    row_capacity, WeightPrefetchLinear.PREFETCH_MIN_ROWS - 1
-                )
+            hybrid_compute = {
+                linear.compute_projection for linear in weight_projections
+            }
+            row_capacity = (
+                min(max_num_tokens, WeightPrefetchLinear.COMPUTE_MAX_ROWS)
+                if all(linear in hybrid_compute for linear in row_projections)
+                else max_num_tokens
+            )
             communication = row_projections[0].communication
             if communication is None:
                 communication = DPRowParallelCommunication(
