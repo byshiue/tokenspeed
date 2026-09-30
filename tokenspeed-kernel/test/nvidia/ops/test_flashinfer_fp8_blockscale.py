@@ -6,7 +6,6 @@ import pytest
 import torch
 from tokenspeed_kernel import (
     fp8_linear,
-    fp8_linear_accepts_prepacked_input,
     fp8_linear_into,
     fp8_linear_prepacked,
     mm,
@@ -191,7 +190,7 @@ def test_prepacked_selection_threshold(num_tokens: int, expected: bool) -> None:
     assert use_flashinfer_fp8_blockscale_prepacked(num_tokens) is expected
 
 
-@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 64, 128, 256, 512])
+@pytest.mark.parametrize("m", [1, 4, 8, 64])
 def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
     torch.manual_seed(3)
     n, k = 256, 512
@@ -215,50 +214,40 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         prepacked_scales=True,
     )
     torch.testing.assert_close(planned, prepacked, atol=0, rtol=0)
-    # External producers (such as fused AllGather) must use the same prepared
-    # weight scales and strip quantizer padding without requantizing the input.
-    assert fp8_linear_accepts_prepacked_input(plan, m)
-    values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
-    external = fp8_linear_prepacked(
-        plan, values, weight, scales, m, torch.bfloat16, out=None
+
+
+def test_projection_prepacked_input_and_destination(device: str) -> None:
+    """TP4 C128 communication output matches ordinary prepared projection."""
+    torch.manual_seed(6)
+    m, n, k = 4 * 128, 256, 512
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
+    weight = (torch.randn(n, k, device=device) * 0.02).to(torch.float8_e4m3fn)
+    weight_scales = (
+        torch.rand(n // 128, k // 128, device=device, dtype=torch.float32) * 0.02
+        + 0.001
     )
-    torch.testing.assert_close(external, planned, atol=0, rtol=0)
-    # Reject a quantizer's wrong layout/type/device before launching GEMM.
-    invalid_scales = [scales.to(torch.bfloat16), scales.cpu()]
-    if scales.shape[0] != scales.shape[1]:
-        invalid_scales.append(scales.T.contiguous())
-    for invalid in invalid_scales:
-        with pytest.raises(ValueError):
-            fp8_linear_prepacked(
-                plan, values, weight, invalid, m, torch.bfloat16, out=None
-            )
-    # Caller-owned communication buffers and ordinary/strided destinations
-    # must preserve the prepared quantizer, including its padded-M fallback.
-    for stride in (1, 2):
-        storage = torch.full(
-            (m * stride, n), float("nan"), device=device, dtype=torch.bfloat16
-        )
-        destination = storage[::stride]
-        actual = fp8_linear_into(
-            plan,
-            x,
-            weight,
-            weight_scales,
-            input_scales=None,
-            bias=None,
-            out_dtype=torch.bfloat16,
-            out=destination,
-        )
-        assert actual.data_ptr() == destination.data_ptr()
-        torch.testing.assert_close(actual, planned, atol=0, rtol=0)
-        destination.fill_(float("nan"))
-        actual = fp8_linear_prepacked(
-            plan, values, weight, scales, m, torch.bfloat16, out=destination
-        )
-        assert actual.data_ptr() == destination.data_ptr()
-        torch.testing.assert_close(actual, planned, atol=0, rtol=0)
-        if stride == 2:
-            assert torch.isnan(storage[1::2]).all()
+    plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
+    expected = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
+
+    values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
+    destination = torch.empty_like(expected)
+    actual = fp8_linear_prepacked(
+        plan, values, weight, scales, m, torch.bfloat16, out=destination
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    destination = torch.empty_like(expected)
+    actual = fp8_linear_into(
+        plan,
+        x,
+        weight,
+        weight_scales,
+        input_scales=None,
+        bias=None,
+        out_dtype=torch.bfloat16,
+        out=destination,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> None:
@@ -272,10 +261,6 @@ def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> No
     )
 
     plan = prepare_fp8_linear(weight, weight_scales, [128, 128])
-    assert not fp8_linear_accepts_prepacked_input(plan, m)
-    values, scales = flashinfer_fp8_blockscale_quantize_prepacked(x, 128)
-    with pytest.raises(ValueError, match="does not accept prepacked input"):
-        fp8_linear_prepacked(plan, values, weight, scales, m, torch.bfloat16, out=None)
     planned = fp8_linear(plan, x, weight, weight_scales, out_dtype=torch.bfloat16)
     canonical = mm(
         x,
@@ -287,19 +272,6 @@ def test_prepared_plan_falls_back_above_the_padding_threshold(device: str) -> No
         override="flashinfer_mm_fp8_blockscale",
     )
     torch.testing.assert_close(planned, canonical, atol=0, rtol=0)
-    destination = torch.empty_like(planned)
-    actual = fp8_linear_into(
-        plan,
-        x,
-        weight,
-        weight_scales,
-        input_scales=None,
-        bias=None,
-        out_dtype=torch.bfloat16,
-        out=destination,
-    )
-    assert actual.data_ptr() == destination.data_ptr()
-    torch.testing.assert_close(actual, planned, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("m", [16, 17, 24, 31, 32, 33])

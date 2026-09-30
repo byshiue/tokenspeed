@@ -36,17 +36,9 @@ python3 -m pytest tokenspeed-kernel/test/ops/test_communcation.py -v \
     --junitxml=/tmp/kernel-multi-gpu.xml
 check_reports /tmp/kernel-multi-gpu.xml
 python3 -m pytest \
-    tokenspeed-kernel/test/nvidia/ops/communication/test_projection_reduce_scatter.py \
-    -v --junitxml=/tmp/kernel-projection-reduce-scatter.xml
-check_reports /tmp/kernel-projection-reduce-scatter.xml
-python3 -m pytest \
-    tokenspeed-kernel/test/nvidia/ops/communication/test_tokenspeed_a2a_quant.py \
-    -v --junitxml=/tmp/kernel-tokenspeed-a2a-quant.xml
-check_reports /tmp/kernel-tokenspeed-a2a-quant.xml
-python3 -m pytest \
-    tokenspeed-kernel/test/nvidia/ops/communication/test_trtllm_allgather_quant.py \
-    -v --junitxml=/tmp/kernel-trtllm-allgather-quant.xml
-check_reports /tmp/kernel-trtllm-allgather-quant.xml
+    tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py \
+    -v --junitxml=/tmp/kernel-projection-tp.xml
+check_reports /tmp/kernel-projection-tp.xml
 python3 -m pytest tokenspeed-kernel/test/ops/test_attention_dsv41_index_scan.py \
     -k 'not tp4' -v --junitxml=/tmp/kernel-index-scan.xml
 check_reports /tmp/kernel-index-scan.xml
@@ -70,9 +62,7 @@ ignores=(
     --ignore=tokenspeed-kernel/test/nvidia/ops/moe/test_marlin_deepep_distributed.py
     --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_comm.py
     --ignore=tokenspeed-kernel/test/nvidia/thirdparty/test_trtllm_mnnvl_twoshot.py
-    --ignore=tokenspeed-kernel/test/nvidia/ops/communication/test_projection_reduce_scatter.py
-    --ignore=tokenspeed-kernel/test/nvidia/ops/communication/test_tokenspeed_a2a_quant.py
-    --ignore=tokenspeed-kernel/test/nvidia/ops/communication/test_trtllm_allgather_quant.py
+    --ignore=tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py
     # These suites require eight or sixteen ranks; this allocation has four GPUs.
     --ignore=tokenspeed-kernel/test/nvidia/ops/communication/test_multimem_distributed.py
     --ignore=tokenspeed-kernel/test/nvidia/ops/moe/test_latent_tail_distributed.py

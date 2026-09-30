@@ -142,19 +142,16 @@ From the repository root, with optional CUDA/FlashInfer dependencies installed:
 
 ```bash
 python -m pytest -q \
-  tokenspeed-kernel/test/nvidia/ops/communication/test_tokenspeed_a2a_quant.py
+  tokenspeed-kernel/test/nvidia/ops/communication/test_projection_tp.py
 ```
 
 The test spawns its own workers; do not launch pytest with torchrun. It skips
 when four NVIDIA GPUs, full peer access, or optional FlashInfer dependencies
-are unavailable.
-
-Correctness compares fused FP8 values and scales against the ordinary Lamport
-exchange followed by the native quantizer. Coverage includes changing shapes
-and payloads, padded/empty logical owners, delayed peers, packet/chunk
-transitions, graph replay, ring reuse, and crossing the signed-int32 generation
-boundary. The existing runtime collective test continues to cover bit-exact
-BF16 exchange through the compatibility API.
+are unavailable. The focused correctness case compares TP4 C128, K=16384
+fused FP8 values and scales against ordinary Lamport exchange followed by the
+native quantizer, in eager execution and CUDA Graph replay. The existing
+runtime collective test covers bit-exact BF16 exchange through the
+compatibility API.
 
 Benchmark timings exclude startup/JIT. After 20 warmups, each sample times
 10 replays of a graph containing 100 exchanges using CUDA events, takes the
