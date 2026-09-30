@@ -24,12 +24,19 @@ For a combined TP4 run:
 ```bash
 export TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE=4
 export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=4
+export TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE=1
 export TOKENSPEED_KIMI_K3_SHARED_EXPERT_TP_SIZE=4
 ```
 
-Set all three to `1` for DEP16. To measure one component, enable only its
-variable and leave the other two at `1`. Label combined results separately:
-a projection-only speedup is not a shared-expert or full-model speedup.
+The optional `TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE` also defaults to `1`.
+It selects [hybrid O-projection weight prefetch](#hybrid-o-projection-weight-prefetch)
+instead of compute-only O-projection TP; do not set both O-projection variables
+above `1`.
+
+Set all four variables to `1` for the replicated DEP16 baseline. To measure one
+component, enable only its variable and leave the others at `1`. Label combined
+results separately: a projection-only speedup is not a shared-expert or
+full-model speedup.
 
 Projection TP must divide world size and respect the checkpoint's quantization
 alignment. QKV currently supports TP2/4/8/16 with block-scaled FP8 weights and
@@ -188,6 +195,76 @@ routed dispatch. Shared GEMMs finish before routed BMM. Shared ReduceScatter
 starts after dispatch and can overlap routed BMM; it completes before combine.
 Shared collectives do not overlap routed dispatch/combine.
 
+## Hybrid O-projection weight prefetch
+
+This opt-in mode uses compute TP for small local batches and gathers weights
+for a full-width local GEMM at larger M. To enable it with TP4:
+
+```bash
+export TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=1
+export TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE=4
+```
+
+| Local physical M | O-projection execution |
+| --- | --- |
+| M ≤ 64 | Compute TP4: activation A2A → quantization/sharded GEMM → ReduceScatter |
+| M > 64 | N-weight TP4: prefetch full weights alongside attention → original local GEMM |
+
+M is the local O-projection GEMM's physical row count, including CUDA-graph
+padding. For unpadded single-token decode, it equals requests per rank; for
+prefill, it is the current chunk's token rows, not cached context length or
+global concurrency. M=64 uses compute TP and M=65 uses weight prefetch. This
+is a fixed policy, not an autotuned performance crossover.
+
+Unset the weight-TP variable or set it to `1` to disable the hybrid; the
+ordinary O-projection TP setting then controls execution. QKV and shared-expert
+TP remain independent. Weight TP must divide world size and preserve whole
+128-element K scale blocks; N shards pad trailing 128-row blocks as needed.
+The hybrid requires Blackwell, serialized block-FP8 attention weights with
+FP32 128×128 scales, `dense_gemm_backend=auto` for the prepared FlashInfer
+GEMM, and peer-accessible symmetric memory across the subgroup. Unsupported
+precision or topology fails at startup. Weight updates during serving are
+not supported.
+
+Each KDA/MLA O projection retains two checkpoint layouts: an output-channel
+(N) shard for prefetch and an input-channel (K) shard for compute TP. Both
+load checkpoint codes and scales without requantization. For M > 64, an
+auxiliary stream copies peer weights directly into the full contiguous GEMM
+buffer while attention runs. Full weight scales and their prepared GEMM layout
+are cached per layer at startup. Inference needs no scale-gather or weight
+restoration kernel; activation quantization remains unchanged. GEMM waits for
+attention and the weight copies, with no activation A2A or output reduction
+for that owner's large-M output.
+
+For M ≤ 64, the existing compute-TP route runs without refreshing full-weight
+scratch and uses the projection backends described above. In mixed subgroups,
+large and empty owners still contribute their K-sharded partial results for
+small owners. These collectives are skipped only when no owner has small-M
+tokens. Prefill, decode, eager execution and graph replay use the same rule.
+
+### Weight-prefetch memory and lifetime
+
+Sequential KDA/MLA layers reuse one full-weight buffer sized for the largest
+projection. Prefetch waits for the preceding GEMM before overwriting it; GEMM
+waits for the current prefetch. Initialization prepares stable buffers and
+per-layer scales before cache budgeting and graph capture. Finishing GEMM
+releases scratch for reuse, not a per-token GPU allocation/free. Immutable
+peer shards remain mapped until every rank finishes its graph replays.
+
+For KDA `[N,K]=[7168,12288]`, replicated FP8 weights/scales occupy about
+84.02 MiB per layer per GPU. TP4 retains about 21.01 MiB in each shard layout,
+or **42.02 MiB per layer** together: roughly half the replicated storage,
+not one quarter. Add about 84 MiB of full-weight scratch per model, shared
+compute-TP communication scratch capped at 64 rows per owner, 42 KiB of cached
+full scale layouts per KDA layer, and the ordinary prepared K-shard scale plan.
+TP16 needs N-block padding, so its shard storage does not scale exactly as 1/16.
+
+Account for symmetric allocation granularity and graph reservations when
+measuring total memory and cache capacity. Copy engines still compete with
+attention for memory bandwidth, and communication need not be fully hidden.
+Treat this as a memory/latency tradeoff; measure the intended workload before
+claiming an end-to-end speedup.
+
 ## Reserve GPUs and use the shared environment
 
 For four GPUs per node, reserve a persistent allocation:
@@ -248,6 +325,11 @@ python -m torch.distributed.run --nnodes=4 --nproc-per-node=4 \
   --node-rank=NODE_RANK --master-addr=HEAD_NODE --master-port=PORT \
   -m test.runtime.distributed.validate_kimi_k3_shared_expert_tp \
   --model MODEL_DIR --layer 1 --tp-size 4
+
+python -m torch.distributed.run --nnodes=4 --nproc-per-node=4 \
+  --node-rank=NODE_RANK --master-addr=HEAD_NODE --master-port=PORT \
+  -m test.runtime.distributed.validate_kimi_k3_weight_prefetch \
+  --model MODEL_DIR --tp-size 4
 ```
 
 The validators cover uneven/empty owners, exact shards, retained-output lifetime
@@ -257,6 +339,17 @@ projections against a dequantized FP32 reference, including the 128/129,
 execution, packet/chunk/NCCL transitions and delayed peers. Shared-expert
 validation covers rank agreement, real collectives, row-count boundaries and
 runtime widths; repeat with TP2 and TP8 on the intended topology.
+
+The weight-prefetch validator uses the production loader and two real KDA
+modules. It checks exact weight/scale reconstruction, M=63/64/65, graph padding,
+mixed and empty owners, per-layer scale isolation, poisoned scratch, delayed
+peers and incremental prefill through both eager attention and inline capture.
+Large-M outputs must match replicated FP8 exactly; small-M outputs must match
+the existing compute-TP route exactly. The TP4 checks also retain its existing
+error bounds against replicated FP8. Repeat with `--tp-size 16` for padded and
+empty N shards; small-M comparisons there use exact compute-TP16 equivalence,
+not the TP4 accumulation-error bound. These checks establish attention-module
+equivalence, not dataset accuracy.
 
 On four GPUs, run kernel correctness separately from runtime tests:
 
@@ -283,17 +376,6 @@ CUDA graphs, identical weights/counts and repeated unprofiled measurements.
 Include packing, quantization, communication, GEMM and output restoration.
 Separate baseline quantization error from sharding's accumulation-order error.
 Neither a unit benchmark nor a serving smoke test establishes dataset accuracy.
-
-For the large-M weight-storage optimization, see
-[Kimi-K3 weight prefetch](kimi-k3-o-proj-weight-prefetch.md). At local physical
-M > 64 it gathers N-sharded weights beside attention for a full-width GEMM;
-at M ≤ 64 it uses the existing A2A → sharded GEMM → ReduceScatter route.
-Both N and K shards are retained, so TP4 uses roughly half the replicated
-per-layer weight storage rather than one quarter. Full weight scales are cached
-at startup. Select this hybrid with `TOKENSPEED_KIMI_K3_O_PROJ_WEIGHT_TP_SIZE=4`
-and leave `TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE=1`; the hybrid enables compute TP
-internally. The cutoff includes graph padding and prefill token rows. All peers
-participate in small-owner collectives, including large and empty owners.
 
 ## Full-model launch and comparison
 
