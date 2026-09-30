@@ -18,7 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""NVIDIA CUDA communication kernels."""
+"""NVIDIA CUDA communication kernels with caller-managed persistent state.
+
+The Lamport A2A APIs exchange TP4 BF16 channel shards directly, optionally
+quantizing received 128-element groups for a prepared FP8 GEMM. Callers must
+construct the state collectively before CUDA-graph capture, serialize calls
+and consumers on one stream, pad empty owners so every peer participates, and
+select any fallback outside this module. Returned buffers are borrowed until
+the next call unless an explicit destination is supplied.
+"""
 
 from tokenspeed_kernel.ops.communication._cuda.lamport_a2a import (
     TokenSpeedA2ALamportState,

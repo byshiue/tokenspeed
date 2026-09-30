@@ -1442,7 +1442,11 @@ if current_platform().is_nvidia:
         capacity (1..128), ``hidden`` is a multiple of 128, and ``num_blocks``
         bounds the launch grid to at most one CTA per SM. Outputs are borrowed
         until the next quantized gather; calls sharing this state are serialized.
-        Ordinary ``gather`` remains available as the numerical reference.
+        Every peer supplies equal positive physical rows, so empty logical
+        owners must participate with zero padding. Communication remains BF16;
+        fusion removes gathered-BF16 materialization and a separate quantizer,
+        but does not reduce link traffic. Ordinary ``gather`` remains available
+        as the numerical reference and fallback building block.
         """
 
         def __init__(self, group, max_rows, hidden, device, num_blocks):

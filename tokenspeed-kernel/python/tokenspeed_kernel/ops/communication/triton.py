@@ -124,8 +124,17 @@ def _owner_reduce_kernel(
 
 
 class ProjectionPeerState:
+    """Persistent TP4 scratch for reducing row-parallel projection partials.
+
+    Prepare the state collectively before graph capture. Each peer contributes
+    ``[4 * rows, hidden]`` partials in subgroup-rank order; reduction returns
+    the ``[rows, hidden]`` segment owned by the local token rank. Empty logical
+    owners still use equal positive physical rows and enter both barriers.
+    Calls and consumers are serialized on one stream because the input buffer
+    is borrowed and reused by the next projection.
+    """
+
     def __init__(self, group, max_rows, hidden, device):
-        """Allocate TP4 BF16 partials before capture for serialized stream calls."""
         if group.size() != 4 or max_rows <= 0 or hidden <= 0:
             raise ValueError(
                 "Projection peer reduction requires TP4 and positive capacity"
