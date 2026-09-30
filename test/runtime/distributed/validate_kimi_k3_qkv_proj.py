@@ -204,7 +204,7 @@ def validate_empty_owner_forward(mapping, parallel):
         with patch.dict(
             os.environ,
             {
-                envs.TOKENSPEED_O_PROJ_A2A_BACKEND.name: "nccl",
+                envs.TOKENSPEED_PROJ_A2A_BACKEND.name: "nccl",
                 envs.TOKENSPEED_O_PROJ_RS_BACKEND.name: "nccl",
             },
         ):
@@ -352,7 +352,7 @@ def main():
             torch.bfloat16,
             torch.device("cuda"),
             "trtllm",
-            envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+            envs.TOKENSPEED_PROJ_A2A_BACKEND.get(),
         )
         linear.communication = communication
         reference_weight = weight.float().cuda() * scale.cuda().repeat_interleave(
@@ -437,17 +437,18 @@ def main():
             for _ in range(3):
                 linear(x, counts=counts)[0]
             torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                captured = linear(x, counts=counts)[0]
-            original = x.clone()
-            for factor in (0.5, -1.0, 0.0):
-                x.copy_(original * factor)
-                graph.replay()
-                eager = linear(x, counts=counts)[0]
-                torch.testing.assert_close(captured, eager, rtol=0, atol=0)
-            torch.cuda.synchronize()
-            del graph, captured
+            if max(counts):
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    captured = linear(x, counts=counts)[0]
+                original = x.clone()
+                for factor in (0.5, -1.0, 0.0):
+                    x.copy_(original * factor)
+                    graph.replay()
+                    eager = linear(x, counts=counts)[0]
+                    torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+                torch.cuda.synchronize()
+                del graph, captured
             if rank == 0:
                 print(
                     json.dumps(

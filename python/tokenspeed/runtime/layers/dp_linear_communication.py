@@ -30,11 +30,11 @@ import socket
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+from tokenspeed_kernel.ops.communication.cuda import (
     TokenSpeedA2ALamportState,
     tokenspeed_a2a_lamport,
 )
-from tokenspeed_kernel.ops.communication.triton_projection import (
+from tokenspeed_kernel.ops.communication.triton import (
     ProjectionPeerState,
     triton_projection_reduce_scatter,
 )
@@ -188,17 +188,23 @@ class DPRowParallelCommunication:
     ) -> None:
         """Allocate bounded symmetric scratch per output width before capture.
 
-        Explicit opt-in accepts a different BF16 reduction order. Initialization
-        failures are fatal; never retry a failed collective with
-        another backend inside forward.
+        Unsupported group sizes/dtypes use NCCL. Initialization failures on a
+        supported topology are fatal; never retry a failed collective with
+        another backend inside forward. Fast paths may change BF16 summation order.
         """
         if self._rs_initialized:
             return
         if backend not in ("nccl", "triton_peer", "trtllm_lamport"):
             raise ValueError("Invalid projection reduction backend")
+        if backend != "nccl" and (
+            parallel.tp_size != 4 or self.send.dtype != torch.bfloat16
+        ):
+            logger.warning(
+                f"Projection {backend} reduction requires TP4 BF16; using NCCL"
+            )
+            self._rs_initialized = True
+            return
         if backend == "trtllm_lamport":
-            if parallel.tp_size != 4 or self.send.dtype != torch.bfloat16:
-                raise ValueError("Lamport projection reduction requires TP4 BF16")
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
             for width in sorted(set(output_sizes)):
                 state = TrtllmReduceScatterState(
@@ -216,16 +222,6 @@ class DPRowParallelCommunication:
                 f"{min(self.max_tokens, LAMPORT_MAX_TOKENS)} rows/rank; NCCL above"
             )
         if backend == "triton_peer":
-            if parallel.tp_size != 4:
-                logger.warning("Projection peer reduction requires TP4; using NCCL")
-                self._rs_initialized = True
-                return
-            if self.send.dtype != torch.bfloat16 or any(
-                width <= 0 for width in output_sizes
-            ):
-                raise ValueError(
-                    "Projection peer reduction requires BF16 and positive widths"
-                )
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
             for width in sorted(set(output_sizes)):
                 state = ProjectionPeerState(
@@ -395,7 +391,7 @@ class DPColumnParallelCommunication:
                 group, max_tokens, padded_output_size, dtype, device
             )
 
-    def _padded_inputs(self, inputs: torch.Tensor, rows: int) -> torch.Tensor:
+    def padded_inputs(self, inputs: torch.Tensor, rows: int) -> torch.Tensor:
         """Use identical owner padding for BF16 and fused-quantized gathers."""
         if inputs.shape[0] == rows and inputs.is_contiguous():
             return inputs
@@ -406,7 +402,7 @@ class DPColumnParallelCommunication:
 
     def gather_inputs(self, inputs: torch.Tensor, rows: int) -> torch.Tensor:
         """Gather equal padded rank-major token blocks; return borrowed storage."""
-        send = self._padded_inputs(inputs, rows)
+        send = self.padded_inputs(inputs, rows)
         if self.gather_state is not None and rows <= self.gather_state.max_rows:
             return trtllm_allgather(self.gather_state, send)
         gathered = self.gathered[: self.parallel.tp_size * rows]

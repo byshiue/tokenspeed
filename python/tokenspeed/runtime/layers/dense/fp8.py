@@ -285,6 +285,9 @@ class Fp8LinearMethod(LinearMethodBase):
                         layer.input_scale.max(), requires_grad=False
                     )
 
+    def input_shard_alignment(self) -> int:
+        return self.quant_config.weight_block_size[-1] if self.block_quant else 1
+
     def apply_into(self, layer, x, bias, block_scale, output_dtype, out):
         """Apply into caller-owned storage, using direct block-FP8 GEMM output."""
         dtype = output_dtype or x.dtype
@@ -327,6 +330,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 out_dtype=output_dtype,
                 out=destination,
             )
+        # GEMM wrote destination, a view of out. Preserve the caller's object
+        # identity as well as its storage instead of returning another view.
+        if out is not None:
+            return out
         return output.to(dtype=output_dtype).view(*output_shape)
 
     def apply(

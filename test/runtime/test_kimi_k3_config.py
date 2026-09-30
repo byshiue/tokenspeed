@@ -753,7 +753,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
             out=down_out,
         )
 
-    @mock.patch.dict(os.environ, {"TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1"})
+    @mock.patch.dict(
+        os.environ,
+        {
+            "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1",
+            "TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE": "1",
+        },
+    )
     def test_kda_stacks_qkvfab_projection_weights(self):
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
 
@@ -826,7 +832,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
             gate.untyped_storage().data_ptr(),
         )
 
-    @mock.patch.dict(os.environ, {"TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1"})
+    @mock.patch.dict(
+        os.environ,
+        {
+            "TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE": "1",
+            "TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE": "1",
+        },
+    )
     def test_kda_compacts_prefill_qkv_before_backend_break(self):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA

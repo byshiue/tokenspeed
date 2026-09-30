@@ -191,6 +191,13 @@ def _validate_flashinfer_fp8_blockscale_prepacked(
 
     expected_a_scales = (A.shape[1] // 128, A.shape[0])
     expected_b_scales = (B.shape[1] // 128, B.shape[0] // 128)
+    if (
+        A_scales.dtype != torch.float32
+        or B_scales.dtype != torch.float32
+        or A_scales.device != A.device
+        or B_scales.device != B.device
+    ):
+        raise ValueError("Prepacked scales must be FP32 on their operand's device")
     if tuple(A_scales.shape) != expected_a_scales or not A_scales.is_contiguous():
         raise ValueError(
             "prepacked activation scales must be contiguous with shape "

@@ -224,6 +224,15 @@ def test_prepared_plan_takes_the_prepacked_path(device: str, m: int) -> None:
         plan, values, weight, scales, m, torch.bfloat16, out=None
     )
     torch.testing.assert_close(external, planned, atol=0, rtol=0)
+    # Reject a quantizer's wrong layout/type/device before launching GEMM.
+    invalid_scales = [scales.to(torch.bfloat16), scales.cpu()]
+    if scales.shape[0] != scales.shape[1]:
+        invalid_scales.append(scales.T.contiguous())
+    for invalid in invalid_scales:
+        with pytest.raises(ValueError):
+            fp8_linear_prepacked(
+                plan, values, weight, invalid, m, torch.bfloat16, out=None
+            )
     # Caller-owned communication buffers and ordinary/strided destinations
     # must preserve the prepared quantizer, including its padded-M fallback.
     for stride in (1, 2):

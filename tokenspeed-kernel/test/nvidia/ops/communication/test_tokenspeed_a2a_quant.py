@@ -26,7 +26,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+from tokenspeed_kernel.ops.communication.cuda import (
     TokenSpeedA2ALamportState,
     tokenspeed_a2a_lamport,
     tokenspeed_a2a_lamport_fp8_quantize,

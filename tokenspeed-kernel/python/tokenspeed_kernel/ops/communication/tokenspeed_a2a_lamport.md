@@ -30,14 +30,15 @@ independent of TRT-LLM's bindings; a CuTe DSL port remains a possible follow-up.
 
 ## Contract and limits
 
-- The Python entry point lives in `tokenspeed_a2a_lamport.py`. Both packet and chunk
-  exchange require **exactly four GPUs per process group on one host**,
+- The public Python entry point lives in `cuda.py`; its private implementation
+  lives under `_cuda/`. Both packet and chunk exchange require **exactly four
+  GPUs per process group on one host**,
   not necessarily four GPUs in the entire job. Peer indexing and scratch
   layouts are specialized for four peers; other group sizes are rejected.
 - Prepare `TokenSpeedA2ALamportState(group, max_rows, channels, device, blocks)` on all
   four peers before capture. This creates symmetric scratch and compiles the
   kernel. All peers must agree on the physical shape and direction of each call.
-- Inputs are contiguous BF16 matrices; `K` is a positive multiple of eight.
+- Inputs are contiguous, 16-byte-aligned BF16 matrices; `K` is a positive multiple of eight.
   Uneven/empty logical owners must be padded to the same positive physical `M`.
 - Serialize this communicator and its consumers on one CUDA stream. Pass
   `out=None` to borrow persistent **local output**, valid until the next call.

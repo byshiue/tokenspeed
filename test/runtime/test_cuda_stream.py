@@ -22,6 +22,7 @@
 
 import os
 import sys
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -39,6 +40,11 @@ from tokenspeed.runtime.utils.cuda_stream import StreamFork
 @pytest.mark.parametrize("overlap", [False, True])
 def test_staged_branch_tensor_dependencies(enable, overlap):
     fork = StreamFork(torch.cuda.Stream())
+    # Keep real CUDA events, but observe the disabled/serialized contracts
+    # that numerical equality alone cannot distinguish from overlapping work.
+    fork.fork_event = Mock(wraps=fork.fork_event)
+    fork.join_event = Mock(wraps=fork.join_event)
+    fork.checkpoint_event = Mock(wraps=fork.checkpoint_event)
     inputs = torch.randn(4096, device="cuda")
     first, tail, main, combined, output = [torch.empty_like(inputs) for _ in range(5)]
 
@@ -71,6 +77,14 @@ def test_staged_branch_tensor_dependencies(enable, overlap):
         expected = ((inputs + 1) + 3 + (inputs + 1) * 2 + 5) * 3
         for actual in captured:
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    if enable:
+        scopes = fork.checkpoint_event.record.call_count
+        assert scopes > 0
+        assert fork.join_event.wait.call_count == scopes * (3 if overlap else 5)
+    else:
+        for event in (fork.fork_event, fork.join_event, fork.checkpoint_event):
+            event.record.assert_not_called()
+            event.wait.assert_not_called()
 
 
 if __name__ == "__main__":

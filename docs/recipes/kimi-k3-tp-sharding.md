@@ -86,22 +86,21 @@ one execution path for prefill, decode, eager execution and graph replay.
 The default projection settings are:
 
 ```bash
-export TOKENSPEED_O_PROJ_A2A_BACKEND=tokenspeed_a2a_lamport
+export TOKENSPEED_PROJ_A2A_BACKEND=tokenspeed_a2a_lamport
 export TOKENSPEED_O_PROJ_RS_BACKEND=triton_peer
 ```
 
-Despite its historical `O_PROJ` name, the A2A setting controls both QKV and
-output projections. Valid A2A values are `tokenspeed_a2a_lamport` and `nccl`.
-The branch-added Ulysses wrappers and their `flashinfer`/`auto` selections
-have been removed; update old explicit `cuda_lamport` settings to
-`tokenspeed_a2a_lamport` as well. There are no compatibility aliases.
+`TOKENSPEED_PROJ_A2A_BACKEND` selects the A2A implementation for both QKV and
+output projections. Use `tokenspeed_a2a_lamport` for the optimized TP4 path on
+a supported single-host NVLink topology. Set it to `nccl` to use the reference
+collective path or when the optimized path does not support the deployment.
 
 | Operation | Fast path | NCCL fallback |
 | --- | --- | --- |
 | QKV AllGather | TRT-LLM, up to 128 physical rows/rank | Larger batches |
 | QKV and O-projection A2A | TokenSpeed Lamport, TP4 BF16 on one NVLink-connected host, up to 512 rows/rank | Other group sizes/topologies, incompatible shapes or larger batches |
-| O-projection ReduceScatter | `triton_peer`, TP4, up to 8192 rows/rank | Other group sizes or larger batches |
-| Optional O-projection ReduceScatter | `trtllm_lamport`, TP4 BF16, up to 128 rows/rank | Larger batches; selecting it for non-TP4 is an error |
+| O-projection ReduceScatter | `triton_peer`, TP4 BF16, up to 8192 rows/rank | Other group sizes/dtypes or larger batches |
+| Optional O-projection ReduceScatter | `trtllm_lamport`, TP4 BF16, up to 128 rows/rank | Other group sizes/dtypes or larger batches |
 | Shared-expert AllGather/ReduceScatter | TRT-LLM, TP2/4/8/16, positive 128-aligned hidden width, up to 128 rows/rank | Other sizes, unaligned widths or larger batches |
 
 Explicit `nccl` selects the reference projection A2A or reduction path.

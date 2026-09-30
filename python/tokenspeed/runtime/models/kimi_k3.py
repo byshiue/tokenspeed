@@ -526,13 +526,6 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                 self._fused_qkv_a_pad_rows = padded_out - fused_out
                 self._fused_qkv_a_fp8_layout = True
                 fused_out = padded_out
-            self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
-                hidden_size,
-                fused_out,
-                bias=False,
-                quant_config=quant_config,
-                prefix=fused_prefix,
-            )
             if self.input_projection_parallel.tp_size > 1:
                 parallel = self.input_projection_parallel
                 self.fused_qkv_a_proj_with_mqa = DPColumnParallelLinear(
@@ -552,6 +545,14 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
                     params_dtype=None,
                     quant_config=quant_config,
                     prefix=add_prefix("q_b_proj", prefix),
+                )
+            else:
+                self.fused_qkv_a_proj_with_mqa = DeepseekV3FusedQkvAProjWithMqa(
+                    hidden_size,
+                    fused_out,
+                    bias=False,
+                    quant_config=quant_config,
+                    prefix=fused_prefix,
                 )
 
     def _split_fused_qkv_a(
@@ -3364,7 +3365,7 @@ class KimiLinearModel(nn.Module):
         validate_projection_settings(
             mapping,
             envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
-            envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+            envs.TOKENSPEED_PROJ_A2A_BACKEND.get(),
             envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
         )
         parallel = _output_projection_mapping(mapping)
@@ -3372,7 +3373,7 @@ class KimiLinearModel(nn.Module):
         validate_projection_settings(
             mapping,
             envs.TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE.get(),
-            envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+            envs.TOKENSPEED_PROJ_A2A_BACKEND.get(),
             "nccl",
         )
         input_parallel = _projection_mapping(
@@ -3719,19 +3720,20 @@ class KimiLinearForCausalLM(BaseCausalLM):
         if row_projections:
             # One communication object for sequential O projections, never one
             # scratch allocation per Linear. It does not alias MoE aux-stream data.
-            weight = next(self.parameters())
+            weight = row_projections[0].weight
+            model_activation_dtype = row_projections[0].params_dtype
             communication = row_projections[0].communication
             if communication is None:
                 communication = DPRowParallelCommunication(
                     max_tokens=max_num_tokens,
                     max_input_size=max(linear.input_size for linear in row_projections),
-                    dtype=weight.dtype,
+                    dtype=model_activation_dtype,
                     device=weight.device,
                 )
                 communication.initialize_a2a(
                     row_projections[0].parallel,
                     [linear.input_size for linear in row_projections],
-                    backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+                    backend=envs.TOKENSPEED_PROJ_A2A_BACKEND.get(),
                 )
                 communication.initialize_reduce_scatter(
                     row_projections[0].parallel,
@@ -3755,15 +3757,16 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     raise RuntimeError("Cannot grow prepared QKV communication")
                 column_communications[key] = existing
             if key not in column_communications:
+                model_activation_dtype = linear.params_dtype
                 column_communications[key] = DPColumnParallelCommunication(
                     linear.parallel,
                     linear.input_size,
                     linear.output_size,
                     max_num_tokens,
-                    torch.bfloat16,
+                    model_activation_dtype,
                     linear.weight.device,
                     "trtllm",
-                    envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+                    envs.TOKENSPEED_PROJ_A2A_BACKEND.get(),
                 )
             linear.communication = column_communications[key]
         routed_hidden_size = (

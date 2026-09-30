@@ -25,7 +25,7 @@
 
 import torch
 from tokenspeed_kernel import fp8_linear_accepts_prepacked_input, fp8_linear_prepacked
-from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+from tokenspeed_kernel.ops.communication.cuda import (
     tokenspeed_a2a_lamport,
     tokenspeed_a2a_lamport_fp8_quantize,
 )
@@ -72,8 +72,8 @@ from tokenspeed.runtime.layers.quantization import (
     W8A8Fp8Config,
 )
 from tokenspeed.runtime.layers.quantization.base_config import (
+    LinearMethodBase,
     QuantizationConfig,
-    QuantizeMethodBase,
 )
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
@@ -214,7 +214,7 @@ class LinearBase(torch.nn.Module):
         if quant_config is None or should_ignore_quant_layer(
             prefix=prefix, ignored_layers=quant_config.ignored_layers
         ):
-            self.quant_method: QuantizeMethodBase | None = UnquantizedLinearMethod()
+            self.quant_method: LinearMethodBase | None = UnquantizedLinearMethod()
         elif isinstance(quant_config, Nvfp4Config):
             # For NVFP4, excluded layers use unquantized (bf16)
             if should_exclude_quant_module(prefix, quant_config.exclude_modules):
@@ -1312,7 +1312,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
 
-        if out is not None and hasattr(self.quant_method, "apply_into"):
+        if out is not None:
             output_parallel = self.quant_method.apply_into(
                 self,
                 input_parallel,
@@ -1464,7 +1464,7 @@ class DPColumnParallelLinear(ColumnParallelLinear):
             and fp8_linear_accepts_prepacked_input(plan, num_tokens)
         ):
             values, scales = trtllm_allgather_fp8_quantize(
-                communication.gather_state, communication._padded_inputs(inputs, rows)
+                communication.gather_state, communication.padded_inputs(inputs, rows)
             )
             local = fp8_linear_prepacked(
                 plan, values, self.weight, scales, num_tokens, inputs.dtype, out=None
@@ -1524,9 +1524,7 @@ class DPRowParallelLinear(RowParallelLinear):
         )
         # Mixed checkpoints select quantization per Linear. Validate the resolved
         # method's alignment, not the model-level precision label.
-        resolved = getattr(self.quant_method, "quant_config", None)
-        block = getattr(resolved, "weight_block_size", None)
-        alignment = block[-1] if block else getattr(resolved, "group_size", 1)
+        alignment = self.quant_method.input_shard_alignment()
         if self.input_size_per_partition % alignment:
             raise ValueError("Output projection TP shard splits a quantization block")
         self.parallel = parallel

@@ -520,7 +520,7 @@ def _test_all_to_all_single(rank, world_size, device, group, ref_group, backend)
 def _check_lamport_all_to_all(rank, world_size, device, ref_group):
     # This is a direct kernel check, not a runtime backend registration. The
     # kernel exchanges channel shards; NCCL expects destination-major input.
-    from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+    from tokenspeed_kernel.ops.communication.cuda import (
         TokenSpeedA2ALamportState,
         tokenspeed_a2a_lamport,
     )
@@ -634,6 +634,8 @@ def _check_lamport_all_to_all(rank, world_size, device, ref_group):
         x = torch.randn((1, channels), dtype=torch.bfloat16, device=device)
         shape = (world_size, channels // world_size)
         misaligned = torch.empty(channels + 1, dtype=x.dtype, device=device)[1:]
+        with pytest.raises(ValueError, match="16-byte alignment"):
+            tokenspeed_a2a_lamport(state, misaligned.view(1, channels), False, out=None)
         for out in (
             x.view(shape),
             state.output[:channels].view(shape),

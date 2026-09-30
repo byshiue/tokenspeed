@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 from test.runtime.distributed.kimi_k3_o_proj_helpers import (
+    ENV_NAME,
     dep_mapping,
     load_projection,
     make_linears,
@@ -37,7 +38,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.communication.tokenspeed_a2a_lamport import (
+from tokenspeed_kernel.ops.communication.cuda import (
     tokenspeed_a2a_lamport,
 )
 
@@ -52,8 +53,6 @@ from tokenspeed.runtime.layers.dp_linear_communication import (
 )
 from tokenspeed.runtime.layers.linear import RowParallelLinear
 from tokenspeed.runtime.utils.env import envs
-
-ENV_NAME = envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.name
 
 
 def validate_backend_transitions(linear, baseline, k, world):
@@ -139,7 +138,7 @@ def main():
     parallel = validate_projection_settings(
         mapping,
         envs.TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE.get(),
-        envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+        envs.TOKENSPEED_PROJ_A2A_BACKEND.get(),
         envs.TOKENSPEED_O_PROJ_RS_BACKEND.get(),
     )
     initialize_projection_group(parallel)
@@ -186,7 +185,7 @@ def main():
         linear.communication.initialize_a2a(
             linear.parallel,
             [k],
-            backend=envs.TOKENSPEED_O_PROJ_A2A_BACKEND.get(),
+            backend=envs.TOKENSPEED_PROJ_A2A_BACKEND.get(),
         )
         linear.communication.initialize_reduce_scatter(
             linear.parallel,

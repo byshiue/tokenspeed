@@ -107,7 +107,7 @@ class TokenSpeedA2ALamportState:
         )
         self.module = build_cuda_module(
             "tokenspeed_lamport_a2a_v1",
-            [Path(__file__).with_name("_cuda") / "lamport_a2a.cu"],
+            [Path(__file__).with_name("lamport_a2a.cu")],
         )
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
@@ -191,7 +191,7 @@ class TokenSpeedA2ALamportState:
         self.chunk_control = torch.tensor([1, 0], dtype=torch.int32, device=device)
         self.chunk_module = build_cuda_module(
             "tokenspeed_chunk_a2a_v1",
-            [Path(__file__).with_name("_cuda") / "chunk_a2a.cu"],
+            [Path(__file__).with_name("chunk_a2a.cu")],
         )
         torch.cuda.synchronize(device)
         dist.barrier(group=self.group)
@@ -201,6 +201,7 @@ class TokenSpeedA2ALamportState:
 @register_kernel(
     family="communication",
     mode="all_to_all",
+    name="cuda_tokenspeed_a2a_lamport",
     solution="cuda",
     signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
 )
@@ -208,6 +209,7 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
     """Exchange BF16 channel shards while preserving every input bit.
 
     Forward: [M,K] -> [4*M,K/4]. Inverse: [4*M,K/4] -> [M,K].
+    inputs must be contiguous BF16 with a 16-byte-aligned address.
     state owns persistent scratch; inverse explicitly chooses layout.
     out=None returns borrowed state.output, valid until the next call. A supplied
     out must have the exact result shape, be contiguous BF16 on the same device,
@@ -237,9 +239,11 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
         or inputs.dtype != torch.bfloat16
         or inputs.device != state.output.device
         or not inputs.is_contiguous()
+        or inputs.data_ptr() % 16
     ):
         raise ValueError(
-            "Input shape, dtype, device, or contiguity violates the A2A contract"
+            "Input shape, dtype, device, contiguity, or 16-byte alignment "
+            "violates the A2A contract"
         )
     result_shape = (
         (rows, state.channels) if inverse else (4 * rows, state.channels // 4)
@@ -314,6 +318,7 @@ def tokenspeed_a2a_lamport(state, inputs, inverse, out: torch.Tensor | None):
 @register_kernel(
     family="communication",
     mode="all_to_all_fp8_quantize",
+    name="cuda_tokenspeed_a2a_lamport_fp8_quantize",
     solution="cuda",
     signatures=format_signatures(("inputs",), "dense", {torch.bfloat16}),
 )

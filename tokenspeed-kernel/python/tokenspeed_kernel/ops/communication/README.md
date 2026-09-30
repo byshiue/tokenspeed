@@ -1,4 +1,17 @@
-# Fused AllGather and FP8 quantization
+# Communication kernels
+
+Stateful AllGather/ReduceScatter APIs require a collectively prepared workspace.
+Their `stateful_allgather` and `stateful_reduce_scatter` registrations are
+excluded from stateless autodispatch; callers own initialization, capacity,
+stream ordering and fallback selection.
+
+TokenSpeed Lamport A2A is exported from `communication/cuda.py`. Its private
+Python implementation and CUDA sources live under `_cuda/`. The public APIs
+are `tokenspeed_a2a_lamport` and `tokenspeed_a2a_lamport_fp8_quantize`. Inputs
+must be 16-byte aligned even when contiguous; see
+[the protocol contract](tokenspeed_a2a_lamport.md).
+
+## Fused AllGather and FP8 quantization
 
 `TrtllmAllGatherQuantState` and `trtllm_allgather_fp8_quantize` combine BF16
 Lamport AllGather with 128-element FP8 activation quantization. Each ready

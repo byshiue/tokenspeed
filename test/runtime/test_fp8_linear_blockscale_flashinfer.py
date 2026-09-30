@@ -68,7 +68,7 @@ def test_process_weights_prepares_and_uses_native_scales(
     prepared = method.apply(layer, x)
     destination = torch.full_like(prepared, float("nan"))
     written = method.apply_into(layer, x, None, None, torch.bfloat16, destination)
-    assert written.data_ptr() == destination.data_ptr()
+    assert written is destination
     torch.testing.assert_close(written, prepared, atol=0, rtol=0)
     dequant = layer.weight.float() * canonical_scales.repeat_interleave(
         128, dim=0
