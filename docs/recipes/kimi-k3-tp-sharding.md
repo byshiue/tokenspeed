@@ -114,7 +114,7 @@ TokenSpeed A2A fuses exchange and channel-layout conversion in both directions.
 Messages through 8 MiB use tagged packets; larger messages use vectorized chunk
 exchange when channels are divisible by 32. The threshold is the whole per-rank
 BF16 payload, including padding, not one peer's share. It is independent of the
-512-row limit. See the [kernel protocol and lifetime contract](../../tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/tokenspeed_a2a_lamport.md).
+512-row limit. See the [kernel protocol and lifetime contract](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-kernel/python/tokenspeed_kernel/ops/communication/tokenspeed_a2a_lamport.md).
 
 `--all2all-backend flashinfer` in the launch command below selects **routed MoE
 transport**, not projection A2A. That transport and other FlashInfer kernels
