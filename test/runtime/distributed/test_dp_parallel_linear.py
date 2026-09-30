@@ -20,13 +20,19 @@
 
 """Small checkpoint-free DP linear tests using real collectives and GEMMs."""
 
+import os
+import sys
 from datetime import timedelta
-from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=90, suite="runtime-2gpu")
 
@@ -170,3 +176,7 @@ def test_dp_linears(size, a2a_backend, rs_backend, tmp_path):
         nprocs=size,
         join=True,
     )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
