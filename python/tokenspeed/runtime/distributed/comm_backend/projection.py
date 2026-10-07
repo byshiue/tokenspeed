@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Prepared, backend-neutral contracts for DP projection collectives."""
+"""Projection collective dispatch with separately owned persistent workspaces."""
 
 import socket
 from dataclasses import dataclass
@@ -55,7 +55,7 @@ class ProjectionSpec:
 
 
 class PreparedProjection(Protocol):
-    """Collectives with persistent storage prepared before memory profiling.
+    """Backend-neutral operations prepared before memory profiling.
 
     Intermediate results, including FP8 values/scales and GEMM destinations,
     are borrowed until the next call to that operation on this object. Final
@@ -101,22 +101,16 @@ class PreparedProjection(Protocol):
         """Collectively release persistent resources after graphs are gone."""
 
 
-class ProjectionCollectives:
-    """Backend-owned layout conversion and optional node-local Lamport kernels.
+class ProjectionWorkspace:
+    """Own scratch tensors and native resources for one prepared projection.
 
-    Construct through comm_ops, not in model/Linear code. Fallbacks use the
-    supplied backend, including its deterministic reduction policy. Capacities
-    and physical rows, never this owner's valid rows, select the collective on
-    every peer. Initialization errors are fatal; forward never retries setup.
+    The backend installs eligible native resources during preparation. This
+    object keeps their storage alive until collective teardown; dispatch and
+    layout conversion belong to ProjectionBackend. Sequential layers may share
+    one workspace, while independent preparations own separate allocations.
     """
 
-    def __init__(
-        self,
-        spec: ProjectionSpec,
-        fallback: "CommBackend",
-        use_lamport: bool,
-        use_lamport_reduction: bool,
-    ):
+    def __init__(self, spec: ProjectionSpec):
         if (
             spec.kind not in ("column", "row")
             or len(spec.group) < 2
@@ -126,15 +120,15 @@ class ProjectionCollectives:
         width = spec.input_size if spec.kind == "row" else spec.output_size
         if width % len(spec.group):
             raise ValueError("Projection channel width must be divisible by TP")
-        self.spec, self._fallback = spec, fallback
-        self._closed = False
-        self._send = torch.empty(
+        self.spec = spec
+        self.closed = False
+        self.send = torch.empty(
             spec.max_tokens * spec.input_size, dtype=spec.dtype, device=spec.device
         )
-        self._received = torch.empty(
+        self.received = torch.empty(
             spec.max_tokens * width, dtype=spec.dtype, device=spec.device
         )
-        self._gathered = (
+        self.gathered = (
             torch.empty(
                 len(spec.group) * spec.max_tokens,
                 spec.input_size,
@@ -144,7 +138,7 @@ class ProjectionCollectives:
             if spec.kind == "column"
             else None
         )
-        self._partial = (
+        self.partial = (
             torch.empty(
                 len(spec.group) * spec.max_tokens,
                 spec.output_size,
@@ -154,10 +148,47 @@ class ProjectionCollectives:
             if spec.kind == "row"
             else None
         )
-        self._gather = None
-        self._gather_quant = None
-        self._a2a = None
-        self._reduction = None
+        self.gather = None
+        self.gather_quant = None
+        self.a2a = None
+        self.reduction = None
+
+    def close(self) -> None:
+        """Release native resources after consumers and referencing graphs finish."""
+        if self.closed:
+            return
+        if self.spec.device.type == "cuda":
+            torch.cuda.synchronize(self.spec.device)
+        dist.barrier(group=pg_manager.get_device_process_group(self.spec.group))
+        self.a2a = None
+        if self.gather is not None:
+            self.gather.close()
+            self.gather = self.gather_quant = None
+        if self.reduction is not None:
+            self.reduction.close()
+            self.reduction = None
+        self.closed = True
+
+
+class ProjectionBackend:
+    """Dispatch prepared projection operations through native or fallback kernels.
+
+    Like TritonRSAGBackend, this composes a CommBackend fallback. Each prepared
+    instance owns a separate workspace; the model runner shares instances among
+    sequential same-spec layers. Physical subgroup rows select the same path on
+    every peer, including empty owners. All allocation and warmup precedes capture.
+    """
+
+    def __init__(
+        self,
+        spec: ProjectionSpec,
+        fallback: "CommBackend",
+        use_lamport: bool,
+        use_lamport_reduction: bool,
+    ):
+        self.spec = spec
+        self._fallback = fallback
+        self._workspace = ProjectionWorkspace(spec)
         if use_lamport:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.
@@ -170,9 +201,14 @@ class ProjectionCollectives:
             if len(set(hosts)) == 1:
                 self._prepare_lamport(use_lamport_reduction)
 
+        self._warmup()
+
+    def _warmup(self) -> None:
+        spec = self.spec
+
         # Initialize fallback communicators and all selected native kernels
         # before capture. No persistent allocation is deferred to forward.
-        probe = self._send[: spec.input_size].view(1, spec.input_size)
+        probe = self._workspace.send[: spec.input_size].view(1, spec.input_size)
         probe.zero_()
         if spec.kind == "column":
             self.all_gather(probe, 1, False)
@@ -209,6 +245,7 @@ class ProjectionCollectives:
         from tokenspeed_kernel.ops.gemm.flashinfer import has_flashinfer_fp8_blockscale
 
         spec = self.spec
+        workspace = self._workspace
         size = len(spec.group)
         group = pg_manager.get_device_process_group(spec.group)
         sms = torch.cuda.get_device_properties(spec.device).multi_processor_count
@@ -218,12 +255,12 @@ class ProjectionCollectives:
             and spec.input_size % 128 == 0
         ):
             if size in (2, 4) and has_flashinfer_fp8_blockscale():
-                self._gather_quant = TrtllmAllGatherQuantState(
+                workspace.gather_quant = TrtllmAllGatherQuantState(
                     group, min(spec.max_tokens, 128), spec.input_size, spec.device, sms
                 )
-                self._gather = self._gather_quant
+                workspace.gather = workspace.gather_quant
             else:
-                self._gather = TrtllmAllGatherState(
+                workspace.gather = TrtllmAllGatherState(
                     group, min(spec.max_tokens, 128), spec.input_size, spec.device, True
                 )
         if (
@@ -232,21 +269,21 @@ class ProjectionCollectives:
             and size in (2, 4, 8, 16)
             and spec.output_size % 8 == 0
         ):
-            self._reduction = TrtllmReduceScatterState(
+            workspace.reduction = TrtllmReduceScatterState(
                 group, min(spec.max_tokens, 128), spec.output_size, spec.device
             )
         channels = spec.input_size if spec.kind == "row" else spec.output_size
         if size == 4 and channels % 8 == 0:
-            self._a2a = TokenSpeedA2ALamportState(
+            workspace.a2a = TokenSpeedA2ALamportState(
                 group, min(spec.max_tokens, 512), channels, spec.device, min(128, sms)
             )
             if channels % 32 == 0:
-                self._a2a.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
+                workspace.a2a.prepare_chunk_exchange(threshold_bytes=8 * 2**20 + 1)
             if spec.kind == "row" and channels % 512 == 0:
-                self._a2a.prepare_fp8_quantization()
+                workspace.a2a.prepare_fp8_quantization()
 
     def _check(self, rows: int) -> None:
-        if self._closed or not 0 < rows <= self.spec.max_tokens:
+        if self._workspace.closed or not 0 < rows <= self.spec.max_tokens:
             raise RuntimeError("Projection communication is closed or exceeds capacity")
 
     def _pad(self, inputs: torch.Tensor, rows: int) -> torch.Tensor:
@@ -256,7 +293,7 @@ class ProjectionCollectives:
             and inputs.data_ptr() % 16 == 0
         ):
             return inputs
-        padded = self._send[: rows * self.spec.input_size].view(
+        padded = self._workspace.send[: rows * self.spec.input_size].view(
             rows, self.spec.input_size
         )
         padded.zero_()
@@ -267,17 +304,18 @@ class ProjectionCollectives:
         self, inputs: torch.Tensor, rows: int, quantize: bool
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self._check(rows)
+        workspace = self._workspace
         send = self._pad(inputs, rows)
-        if self._gather is not None and rows <= self._gather.max_rows:
+        if workspace.gather is not None and rows <= workspace.gather.max_rows:
             from tokenspeed_kernel.ops.communication.trtllm import (
                 trtllm_allgather,
                 trtllm_allgather_fp8_quantize,
             )
 
-            if quantize and self._gather_quant is not None:
-                return trtllm_allgather_fp8_quantize(self._gather_quant, send)
-            return trtllm_allgather(self._gather, send), None
-        gathered = self._gathered[: len(self.spec.group) * rows]
+            if quantize and workspace.gather_quant is not None:
+                return trtllm_allgather_fp8_quantize(workspace.gather_quant, send)
+            return trtllm_allgather(workspace.gather, send), None
+        gathered = workspace.gathered[: len(self.spec.group) * rows]
         self._fallback.all_gather_single(gathered, send, self.spec.group)
         return gathered, None
 
@@ -294,33 +332,34 @@ class ProjectionCollectives:
         )
 
         self._check(rows)
+        workspace = self._workspace
         if inverse and (quantize or out is None):
             raise ValueError("Inverse A2A requires owned output and no quantization")
         if not inverse and out is not None:
             # Forward may return BF16 or FP8 borrowed scratch. Do not silently
             # discard a destination when fusion or a fallback changes the path.
             raise ValueError("Forward A2A returns borrowed output; out must be None")
-        if self._a2a is not None and rows <= self._a2a.max_rows:
+        if workspace.a2a is not None and rows <= workspace.a2a.max_rows:
             from tokenspeed_kernel.ops.communication.cuda import (
                 tokenspeed_a2a_lamport,
                 tokenspeed_a2a_lamport_fp8_quantize,
             )
 
             sent = inputs.contiguous() if inverse else self._pad(inputs, rows)
-            if quantize and self._a2a.fp8_output is not None:
-                return tokenspeed_a2a_lamport_fp8_quantize(self._a2a, sent)
+            if quantize and workspace.a2a.fp8_output is not None:
+                return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
             return (
-                tokenspeed_a2a_lamport(self._a2a, sent, inverse=inverse, out=out),
+                tokenspeed_a2a_lamport(workspace.a2a, sent, inverse=inverse, out=out),
                 None,
             )
         size = len(self.spec.group)
         width = self.spec.output_size if inverse else self.spec.input_size
         shard = width // size
-        received = self._received[: rows * width].view(size * rows, shard)
+        received = workspace.received[: rows * width].view(size * rows, shard)
         if inverse:
             sent = inputs.contiguous()
         else:
-            scratch = self._send[: rows * width].view(size, rows, shard)
+            scratch = workspace.send[: rows * width].view(size, rows, shard)
             sent = triton_pack_channel_shards_for_a2a(inputs, scratch)
         self._fallback.all_to_all_single(
             received,
@@ -338,29 +377,19 @@ class ProjectionCollectives:
 
     def acquire_output(self, rows: int) -> torch.Tensor:
         self._check(rows)
-        if self._reduction is not None and rows <= self._reduction.max_rows:
-            return self._reduction.input_buffer(rows)
-        return self._partial[: len(self.spec.group) * rows]
+        workspace = self._workspace
+        if workspace.reduction is not None and rows <= workspace.reduction.max_rows:
+            return workspace.reduction.input_buffer(rows)
+        return workspace.partial[: len(self.spec.group) * rows]
 
     def reduce_scatter(self, partial: torch.Tensor, rows: int) -> torch.Tensor:
         self._check(rows)
-        if self._reduction is not None and rows <= self._reduction.max_rows:
+        workspace = self._workspace
+        if workspace.reduction is not None and rows <= workspace.reduction.max_rows:
             from tokenspeed_kernel.ops.communication.trtllm import trtllm_reduce_scatter
 
-            return trtllm_reduce_scatter(self._reduction, partial, rows)
+            return trtllm_reduce_scatter(workspace.reduction, partial, rows)
         return self._fallback.reduce_scatter(partial, self.spec.group)
 
     def close(self) -> None:
-        if self._closed:
-            return
-        if self.spec.device.type == "cuda":
-            torch.cuda.synchronize(self.spec.device)
-        dist.barrier(group=pg_manager.get_device_process_group(self.spec.group))
-        self._a2a = None
-        if self._gather is not None:
-            self._gather.close()
-            self._gather = self._gather_quant = None
-        if self._reduction is not None:
-            self._reduction.close()
-            self._reduction = None
-        self._closed = True
+        self._workspace.close()

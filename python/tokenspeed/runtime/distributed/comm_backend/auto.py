@@ -125,7 +125,7 @@ class AutoBackend(CommBackend):
         batch-invariant reductions retain the rank-ordered fold at every size.
         """
         from tokenspeed.runtime.distributed.comm_backend.projection import (
-            ProjectionCollectives,
+            ProjectionBackend,
         )
 
         use_lamport = (
@@ -134,7 +134,7 @@ class AutoBackend(CommBackend):
             and spec.dtype == torch.bfloat16
             and not self._force_deterministic_rsag()
         )
-        return ProjectionCollectives(
+        return ProjectionBackend(
             spec,
             self,
             use_lamport,

@@ -58,6 +58,12 @@ def _context(rank, counts):
 def _worker(rank, size, tp_size, rendezvous, backend_name):
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.comm_ops import (
+        acquire_projection_output,
+        prepare_projection_collectives,
+        projection_all_gather,
+        projection_reduce_scatter,
+    )
     from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
     from tokenspeed.runtime.execution.context import report_collective_sizing
     from tokenspeed.runtime.layers.linear import (
@@ -120,8 +126,35 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
     backend = AutoBackend() if backend_name == "auto" else NcclBackend()
     prepare_dp_linear_communication(model, capacity, torch.bfloat16, backend)
 
+    # Separate preparations on the same backend keep borrowed activations and
+    # producer-direct destinations independent, even for identical specs.
+    other_column, other_row = [
+        prepare_projection_collectives(linear.communication.spec, backend)
+        for linear in (columns[0], row)
+    ]
+    local = torch.full((32, width), rank + 1, dtype=torch.bfloat16, device=device)
+    expected = torch.cat(
+        [torch.full_like(local, peer + 1) for peer in parallel.tp_group]
+    )
+    gathered, _ = projection_all_gather(local, 32, False, columns[0].communication)
+    other_gathered, _ = projection_all_gather(-local, 32, False, other_column)
+    torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+    torch.testing.assert_close(other_gathered, -expected, rtol=0, atol=0)
+    partial = acquire_projection_output(32, row.communication)
+    partial.fill_(rank + 1)
+    other_partial = acquire_projection_output(32, other_row)
+    other_partial.fill_(-(rank + 1))
+    reduced = projection_reduce_scatter(partial, 32, row.communication)
+    other_reduced = projection_reduce_scatter(other_partial, 32, other_row)
+    expected = torch.full_like(reduced, sum(peer + 1 for peer in parallel.tp_group))
+    torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
+    torch.testing.assert_close(other_reduced, -expected, rtol=0, atol=0)
+    other_column.close()
+    other_row.close()
+
     # Same-shape layers share communication, but previous forward results must
     # remain valid when the next layer overwrites its borrowed intermediate.
+    # These calls also exercise the original workspaces after the others close.
     cases = (
         [32] * size,
         [64] * size,
@@ -176,11 +209,6 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
     if backend_name == "auto" and tp_size == 4:
         from tokenspeed.runtime.distributed.comm_backend.projection import (
             ProjectionSpec,
-        )
-        from tokenspeed.runtime.distributed.comm_ops import (
-            acquire_projection_output,
-            prepare_projection_collectives,
-            projection_reduce_scatter,
         )
         from tokenspeed.runtime.utils.env import global_server_args_dict
 

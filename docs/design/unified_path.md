@@ -176,28 +176,17 @@ from one first bound to that pool:
 
 ### DP projection communication
 
-`DPColumnParallelLinear` and `DPRowParallelLinear` accept and return this
-rank's token rows, like a replicated linear. They inherit weight creation,
-sharded loading and quantization from the ordinary TP linears. The column
-composition is AllGather → GEMM → AllToAll; the row composition is
-AllToAll → GEMM → ReduceScatter. Both restore token ownership before returning.
-They read physical per-rank counts from `ForwardContext`, respecting a
-`report_collective_sizing` override, on the same eager and graph path.
-An empty owner still participates when another subgroup rank has rows.
-
-Models select linear classes, not communication kernels. Before cache profiling
-and graph capture, the model runner prepares their communication through
-`comm_ops` and shares one prepared object among sequential layers with the
-same shape, group, capacity and activation dtype. Backends own layout conversion,
-optional fused FP8 quantization, scratch and fallback selection. Layer code
-does not inspect a concrete backend state. Batch-invariant and forced
-deterministic reductions retain the configured collective policy.
-
-Gathered activations, quantization scales and GEMM destinations borrow scratch
-until the next call on that object. The final local outputs are caller-owned
-and survive later forwards. Shared scratch is stream-serialized: concurrent
-streams or models need separate objects. Capacity never grows during forward,
-and referencing graphs must be destroyed before collective teardown.
+`DPColumnParallelLinear` and `DPRowParallelLinear` read the same physical
+per-rank token counts from `ForwardContext` in eager and CUDA-graph execution,
+including `report_collective_sizing` overrides. Empty owners participate when
+another rank in their subgroup has work. The model runner prepares fixed-capacity
+communication workspaces before cache-memory profiling and graph capture.
+Sequential layers with matching configurations may share a workspace on one
+stream; concurrent streams or models use separate workspaces. Intermediate
+tensors borrow storage until the next call to their operation, so consumers
+finish before that storage is reused. Final outputs belong to the caller and
+remain valid across later forwards. Graphs referencing a workspace are destroyed
+before it is released.
 
 ### Padding contract
 

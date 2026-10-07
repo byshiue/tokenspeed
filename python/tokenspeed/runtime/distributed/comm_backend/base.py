@@ -50,10 +50,10 @@ class CommBackend(ABC):
         so independent models/streams cannot accidentally share IPC buffers.
         """
         from tokenspeed.runtime.distributed.comm_backend.projection import (
-            ProjectionCollectives,
+            ProjectionBackend,
         )
 
-        return ProjectionCollectives(spec, self, False, False)
+        return ProjectionBackend(spec, self, False, False)
 
     @abstractmethod
     def all_reduce(
