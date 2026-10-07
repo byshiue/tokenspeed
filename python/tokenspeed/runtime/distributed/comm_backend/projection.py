@@ -31,11 +31,11 @@ from tokenspeed.runtime.distributed.mapping import Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.execution.workspace import WorkspacePool
 from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
+    from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
 @dataclass(frozen=True)
@@ -84,7 +84,7 @@ class ProjectionWorkspace:
         self,
         spec: ProjectionSpec,
         backend: "CommBackend",
-        scratch_pool: WorkspacePool | None = None,
+        scratch_pool: "WorkspacePool | None" = None,
     ):
         if (
             spec.kind not in ("column", "row")
@@ -99,6 +99,10 @@ class ProjectionWorkspace:
         self.backend = backend
         self.closed = False
         if scratch_pool is None:
+            # env -> server_args -> comm_ops imports this module before envs
+            # exists. Load the env-dependent allocator only at preparation.
+            from tokenspeed.runtime.execution.workspace import WorkspacePool
+
             scratch_pool = WorkspacePool(spec.device, initial_nbytes=0)
             scratch_pool.allocate(*spec.scratch_specs)
             scratch_pool.freeze()
@@ -107,7 +111,7 @@ class ProjectionWorkspace:
         # Projection retains these views until teardown. Keep their addresses
         # independent of the executor-managed global pool, which can be unfrozen
         # and grown during reconfiguration.
-        self.scratch_pool: WorkspacePool | None = scratch_pool
+        self.scratch_pool: "WorkspacePool | None" = scratch_pool
         self.send, self.received, gemm = scratch_pool.allocate(*spec.scratch_specs)
         self.gathered = gemm if spec.kind == "column" else None
         self.partial = gemm if spec.kind == "row" else None
@@ -144,7 +148,7 @@ class ProjectionWorkspace:
 def prepare_projection_workspace(
     spec: ProjectionSpec,
     backend: "CommBackend",
-    scratch_pool: WorkspacePool | None,
+    scratch_pool: "WorkspacePool | None",
 ) -> ProjectionWorkspace:
     """Allocate and warm model-owned scratch using backend's ordinary collectives."""
     workspace = ProjectionWorkspace(spec, backend, scratch_pool)
@@ -303,7 +307,7 @@ class ProjectionBackend:
         spec: ProjectionSpec,
         use_lamport: bool,
         use_lamport_reduction: bool,
-        scratch_pool: WorkspacePool | None,
+        scratch_pool: "WorkspacePool | None",
     ) -> ProjectionWorkspace:
         """Allocate and warm a workspace bound to this dispatcher's backend."""
         workspace = ProjectionWorkspace(spec, self._fallback, scratch_pool)

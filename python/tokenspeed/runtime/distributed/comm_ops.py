@@ -26,6 +26,7 @@ Groups are looked up from pg_manager internally via comm_backend.
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed
@@ -55,7 +56,9 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # no
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.execution.workspace import WorkspacePool
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
 def _get_process_group(group: Group):
@@ -124,7 +127,7 @@ class FusionParams:
 def prepare_projection_collectives(
     spec: ProjectionSpec,
     backend: CommBackend | None,
-    scratch_pool: WorkspacePool | None = None,
+    scratch_pool: "WorkspacePool | None" = None,
 ) -> ProjectionWorkspace:
     """Collectively allocate bounded projection scratch before graph capture.
 
