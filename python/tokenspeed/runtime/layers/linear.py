@@ -29,10 +29,10 @@ import torch
 from tokenspeed_kernel import fp8_linear_accepts_prepacked_input, fp8_linear_prepacked
 from torch.nn.parameter import Parameter
 
-from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
+from tokenspeed.runtime.distributed.comm_backend import CommBackend, get_global_backend
 from tokenspeed.runtime.distributed.comm_backend.projection import (
-    PreparedProjection,
     ProjectionSpec,
+    ProjectionWorkspace,
 )
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_projection_output,
@@ -1377,17 +1377,17 @@ def _projection_rows(
     inputs: torch.Tensor,
     ctx: "ForwardContext",
     parallel: DenseLayerMapping,
-    communication: PreparedProjection | None,
+    workspace: ProjectionWorkspace | None,
 ) -> int:
     """Read physical owner counts on both eager and captured execution paths."""
-    if communication is None:
+    if workspace is None:
         raise RuntimeError("DP linear communication must be prepared before forward")
     counts = (
         ctx.collective_global_num_tokens
         if ctx.collective_global_num_tokens is not None
         else ctx.global_num_tokens
     )
-    spec = communication.spec
+    spec = workspace.spec
     if (
         counts is None
         or len(counts) != parallel.world_size
@@ -1445,7 +1445,8 @@ class DPColumnParallelLinear(ColumnParallelLinear):
         )
         self.parallel = parallel
         self.logical_output_size = output_size
-        self.communication: PreparedProjection | None = None
+        self.projection_workspace: ProjectionWorkspace | None = None
+        self.comm_backend: CommBackend | None = None
 
     def forward(
         self,
@@ -1453,7 +1454,7 @@ class DPColumnParallelLinear(ColumnParallelLinear):
         *,
         ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, None]:
-        rows = _projection_rows(inputs, ctx, self.parallel, self.communication)
+        rows = _projection_rows(inputs, ctx, self.parallel, self.projection_workspace)
         if rows == 0:
             return inputs.new_empty((0, self.logical_output_size)), None
         plan = self.quant_method.prepared_linear_plan(self)
@@ -1462,7 +1463,8 @@ class DPColumnParallelLinear(ColumnParallelLinear):
             inputs,
             rows,
             fp8_linear_accepts_prepacked_input(plan, num_tokens),
-            self.communication,
+            self.projection_workspace,
+            self.comm_backend,
         )
         if scales is None:
             local, _ = super().forward(values, block_scale=None, output_dtype=None)
@@ -1477,7 +1479,8 @@ class DPColumnParallelLinear(ColumnParallelLinear):
             True,
             False,
             output,
-            self.communication,
+            self.projection_workspace,
+            self.comm_backend,
         )
         return output[: inputs.shape[0], : self.logical_output_size], None
 
@@ -1520,7 +1523,8 @@ class DPRowParallelLinear(RowParallelLinear):
             interleave_linear_and_gate=False,
         )
         self.parallel = parallel
-        self.communication: PreparedProjection | None = None
+        self.projection_workspace: ProjectionWorkspace | None = None
+        self.comm_backend: CommBackend | None = None
 
     def forward(
         self,
@@ -1528,7 +1532,7 @@ class DPRowParallelLinear(RowParallelLinear):
         *,
         ctx: "ForwardContext",
     ) -> tuple[torch.Tensor, None]:
-        rows = _projection_rows(inputs, ctx, self.parallel, self.communication)
+        rows = _projection_rows(inputs, ctx, self.parallel, self.projection_workspace)
         if rows == 0:
             return inputs.new_empty((0, self.output_size)), None
         plan = self.quant_method.prepared_linear_plan(self)
@@ -1539,9 +1543,12 @@ class DPRowParallelLinear(RowParallelLinear):
             False,
             fp8_linear_accepts_prepacked_input(plan, num_tokens),
             None,
-            self.communication,
+            self.projection_workspace,
+            self.comm_backend,
         )
-        destination = acquire_projection_output(rows, self.communication)
+        destination = acquire_projection_output(
+            rows, self.projection_workspace, self.comm_backend
+        )
         if scales is None:
             partial, _ = super().forward(values, scale=None, out=destination)
         else:
@@ -1554,7 +1561,9 @@ class DPRowParallelLinear(RowParallelLinear):
                 inputs.dtype,
                 out=destination,
             )
-        output = projection_reduce_scatter(partial, rows, self.communication)
+        output = projection_reduce_scatter(
+            partial, rows, self.projection_workspace, self.comm_backend
+        )
         return output[: inputs.shape[0]], None
 
 
@@ -1567,19 +1576,23 @@ def prepare_dp_linear_communication(
     """Bind model-owned, same-shape shared communication before cache profiling.
 
     Models only select DP Linear modules. This generic preparation discovers the
-    modules, creates their groups and deduplicates scratch. Repeated preparation
-    with the same capacity preserves captured pointers; replacing/growing a
-    prepared allocation requires destroying the model's graphs first.
+    modules, binds their backend, creates their groups and deduplicates scratch.
+    Repeated preparation with the same backend and capacity preserves captured
+    pointers; replacing/growing an allocation requires destroying its graphs.
     """
     linears = [
         module
         for module in model.modules()
         if isinstance(module, (DPColumnParallelLinear, DPRowParallelLinear))
     ]
+    if not linears:
+        return False
+    if backend is None:
+        backend = get_global_backend()
     prepared = {
-        module.communication.spec: module.communication
+        module.projection_workspace.spec: module.projection_workspace
         for module in linears
-        if module.communication is not None
+        if module.projection_workspace is not None
     }
     for module in linears:
         spec = ProjectionSpec(
@@ -1591,9 +1604,13 @@ def prepare_dp_linear_communication(
             dtype=model_activation_dtype,
             device=module.weight.device,
         )
-        if module.communication is not None and module.communication.spec != spec:
+        if module.projection_workspace is not None and (
+            module.projection_workspace.spec != spec
+            or module.projection_workspace.backend is not backend
+        ):
             raise RuntimeError("Cannot replace prepared DP linear communication")
         if spec not in prepared:
             prepared[spec] = prepare_projection_collectives(spec, backend)
-        module.communication = prepared[spec]
-    return bool(linears)
+        module.projection_workspace = prepared[spec]
+        module.comm_backend = backend
+    return True

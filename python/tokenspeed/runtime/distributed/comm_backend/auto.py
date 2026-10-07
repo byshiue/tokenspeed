@@ -98,6 +98,7 @@ class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
     def __init__(self):
+        super().__init__()
         self._nccl = NcclBackend()
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)
@@ -124,19 +125,14 @@ class AutoBackend(CommBackend):
         large-message and unsupported-topology paths return to this backend;
         batch-invariant reductions retain the rank-ordered fold at every size.
         """
-        from tokenspeed.runtime.distributed.comm_backend.projection import (
-            ProjectionBackend,
-        )
-
         use_lamport = (
             current_platform().is_nvidia
             and spec.device.type == "cuda"
             and spec.dtype == torch.bfloat16
             and not self._force_deterministic_rsag()
         )
-        return ProjectionBackend(
+        return self._projection.prepare(
             spec,
-            self,
             use_lamport,
             use_lamport and not self._batch_invariant_collectives(),
         )

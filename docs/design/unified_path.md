@@ -181,6 +181,8 @@ per-rank token counts from `ForwardContext` in eager and CUDA-graph execution,
 including `report_collective_sizing` overrides. Empty owners participate when
 another rank in their subgroup has work. The model runner prepares fixed-capacity
 communication workspaces before cache-memory profiling and graph capture.
+Preparation binds each Linear and its workspace to the selected communication
+backend; forward operations dispatch through that same backend.
 Sequential layers with matching configurations may share a workspace on one
 stream; concurrent streams or models use separate workspaces. Intermediate
 tensors borrow storage until the next call to their operation, so consumers

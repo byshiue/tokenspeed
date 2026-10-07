@@ -50,6 +50,7 @@ class TrtllmAllReduceBackend(CommBackend):
     """
 
     def __init__(self, fallback: CommBackend):
+        super().__init__()
         self._fallback = fallback
         self._resources = {}  # group_tuple -> {device_group, rank, ...}
 

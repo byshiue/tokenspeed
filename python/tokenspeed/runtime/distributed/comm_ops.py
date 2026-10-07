@@ -46,8 +46,8 @@ from tokenspeed.runtime.distributed.comm_backend import (
     get_global_backend,
 )
 from tokenspeed.runtime.distributed.comm_backend.projection import (
-    PreparedProjection,
     ProjectionSpec,
+    ProjectionWorkspace,
 )
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
     MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
@@ -123,12 +123,14 @@ class FusionParams:
 def prepare_projection_collectives(
     spec: ProjectionSpec,
     backend: CommBackend | None,
-) -> PreparedProjection:
+) -> ProjectionWorkspace:
     """Collectively allocate bounded projection scratch before graph capture.
 
     The backend owns optimized selection, padding, layout conversion and
     fallbacks. Callers may share the result across sequential same-spec layers,
-    but never across concurrently executing streams or models.
+    but never across concurrently executing streams or models. Execute with
+    the same backend used to prepare the workspace; None selects the global
+    backend, as for ordinary collectives.
     """
     pg_manager.init_process_group(spec.group, backend=None)
     if backend is None:
@@ -140,10 +142,18 @@ def projection_all_gather(
     tensor: torch.Tensor,
     rows: int,
     quantize: bool,
-    communication: PreparedProjection,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Gather owner rows; return borrowed activations and optional FP8 scales."""
-    return communication.all_gather(tensor, rows, quantize)
+    """Gather padded owner rows into borrowed activations and optional FP8 scales.
+
+    rows is the physical per-owner extent. quantize permits fused 1x128 FP8
+    quantization with MN-major scales; unsupported paths return ordinary
+    activations and None so the Linear can use its usual GEMM.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_all_gather(tensor, rows, quantize, workspace)
 
 
 def projection_all_to_all(
@@ -152,31 +162,43 @@ def projection_all_to_all(
     inverse: bool,
     quantize: bool,
     out: torch.Tensor | None,
-    communication: PreparedProjection,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Exchange token/channel axes, optionally fusing forward FP8 quantization.
 
-    Forward requires out=None and returns borrowed output, with optional
-    quantization. Inverse requires quantize=False and writes into caller-owned
-    out; callers may retain it across later communication calls.
+    Forward maps [local_rows,K] to [TP*rows,K/TP] with zero owner padding.
+    It requires out=None and returns borrowed output, optionally quantized to
+    FP8 with 1x128 MN-major scales. Inverse maps [TP*rows,N/TP] to [rows,N],
+    requires quantize=False and writes into caller-owned out; callers may
+    retain it across later communication calls.
     """
-    return communication.all_to_all(tensor, rows, inverse, quantize, out)
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_all_to_all(
+        tensor, rows, inverse, quantize, out, workspace
+    )
 
 
 def acquire_projection_output(
-    rows: int, communication: PreparedProjection
+    rows: int, workspace: ProjectionWorkspace, backend: CommBackend | None
 ) -> torch.Tensor:
-    """Borrow a GEMM destination consumed by the following ReduceScatter."""
-    return communication.acquire_output(rows)
+    """Borrow a [TP*rows,N] GEMM destination for the following ReduceScatter."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.acquire_projection_output(rows, workspace)
 
 
 def projection_reduce_scatter(
     tensor: torch.Tensor,
     rows: int,
-    communication: PreparedProjection,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
 ) -> torch.Tensor:
-    """Reduce padded owner segments into an owned local output tensor."""
-    return communication.reduce_scatter(tensor, rows)
+    """Sum [TP*rows,N] partials into owned [rows,N] local outputs."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.projection_reduce_scatter(tensor, rows, workspace)
 
 
 def all_reduce(

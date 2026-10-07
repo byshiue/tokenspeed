@@ -129,23 +129,25 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
     # Separate preparations on the same backend keep borrowed activations and
     # producer-direct destinations independent, even for identical specs.
     other_column, other_row = [
-        prepare_projection_collectives(linear.communication.spec, backend)
+        prepare_projection_collectives(linear.projection_workspace.spec, backend)
         for linear in (columns[0], row)
     ]
     local = torch.full((32, width), rank + 1, dtype=torch.bfloat16, device=device)
     expected = torch.cat(
         [torch.full_like(local, peer + 1) for peer in parallel.tp_group]
     )
-    gathered, _ = projection_all_gather(local, 32, False, columns[0].communication)
-    other_gathered, _ = projection_all_gather(-local, 32, False, other_column)
+    gathered, _ = projection_all_gather(
+        local, 32, False, columns[0].projection_workspace, backend
+    )
+    other_gathered, _ = projection_all_gather(-local, 32, False, other_column, backend)
     torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
     torch.testing.assert_close(other_gathered, -expected, rtol=0, atol=0)
-    partial = acquire_projection_output(32, row.communication)
+    partial = acquire_projection_output(32, row.projection_workspace, backend)
     partial.fill_(rank + 1)
-    other_partial = acquire_projection_output(32, other_row)
+    other_partial = acquire_projection_output(32, other_row, backend)
     other_partial.fill_(-(rank + 1))
-    reduced = projection_reduce_scatter(partial, 32, row.communication)
-    other_reduced = projection_reduce_scatter(other_partial, 32, other_row)
+    reduced = projection_reduce_scatter(partial, 32, row.projection_workspace, backend)
+    other_reduced = projection_reduce_scatter(other_partial, 32, other_row, backend)
     expected = torch.full_like(reduced, sum(peer + 1 for peer in parallel.tp_group))
     torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
     torch.testing.assert_close(other_reduced, -expected, rtol=0, atol=0)
@@ -204,8 +206,8 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
             x.copy_(original)
             torch.cuda.synchronize()
             del graph, captured
-    columns[0].communication.close()
-    row.communication.close()
+    columns[0].projection_workspace.close()
+    row.projection_workspace.close()
     if backend_name == "auto" and tp_size == 4:
         from tokenspeed.runtime.distributed.comm_backend.projection import (
             ProjectionSpec,
@@ -213,22 +215,23 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
         # Cancellation distinguishes the required rank-ordered FP32 fold from
-        # a shape-dependent BF16 reduction tree. It must not switch to Lamport.
+        # a shape-dependent BF16 reduction tree. Resolve the global backend for
+        # both preparation and execution, matching the ordinary comm_ops API.
         global_server_args_dict["batch_invariant_collectives"] = True
-        communication = prepare_projection_collectives(
+        workspace = prepare_projection_collectives(
             ProjectionSpec(
                 parallel.tp_group, "row", width, stored, 128, torch.bfloat16, device
             ),
-            AutoBackend(),
+            None,
         )
         for rows in (32, 128):
-            partial = acquire_projection_output(rows, communication)
+            partial = acquire_projection_output(rows, workspace, None)
             partial.fill_((1e8, 1, -1e8, 1)[rank])
-            reduced = projection_reduce_scatter(partial, rows, communication)
+            reduced = projection_reduce_scatter(partial, rows, workspace, None)
             torch.testing.assert_close(
                 reduced, torch.ones_like(reduced), rtol=0, atol=0
             )
-        communication.close()
+        workspace.close()
     dist.destroy_process_group()
 
 
@@ -330,8 +333,8 @@ def _fp8_worker(rank, rendezvous):
             torch.testing.assert_close(captured, refreshed, rtol=0, atol=0)
             torch.cuda.synchronize()
             del graph, captured
-        baseline.communication.close()
-        optimized.communication.close()
+        baseline.projection_workspace.close()
+        optimized.projection_workspace.close()
     dist.destroy_process_group()
 
 

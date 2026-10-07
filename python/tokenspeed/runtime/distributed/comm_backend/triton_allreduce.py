@@ -53,6 +53,7 @@ class TritonAllReduceBackend(CommBackend):
         fallback: CommBackend,
         producer_direct_max_bytes: int = _DEFAULT_PRODUCER_DIRECT_MAX_BYTES,
     ):
+        super().__init__()
         self._fallback = fallback
         self._instances = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
