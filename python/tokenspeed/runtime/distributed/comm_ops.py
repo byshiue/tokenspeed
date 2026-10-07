@@ -45,6 +45,10 @@ from tokenspeed.runtime.distributed.comm_backend import (
     Group,
     get_global_backend,
 )
+from tokenspeed.runtime.distributed.comm_backend.projection import (
+    PreparedProjection,
+    ProjectionSpec,
+)
 from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # noqa: F401
     MAX_ONESHOT_BYTES as COMM_ONESHOT_MAX_BYTES,
 )
@@ -114,6 +118,65 @@ class FusionParams:
 # ---------------------------------------------------------------------------
 # Basic primitives
 # ---------------------------------------------------------------------------
+
+
+def prepare_projection_collectives(
+    spec: ProjectionSpec,
+    backend: CommBackend | None,
+) -> PreparedProjection:
+    """Collectively allocate bounded projection scratch before graph capture.
+
+    The backend owns optimized selection, padding, layout conversion and
+    fallbacks. Callers may share the result across sequential same-spec layers,
+    but never across concurrently executing streams or models.
+    """
+    pg_manager.init_process_group(spec.group, backend=None)
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_projection(spec)
+
+
+def projection_all_gather(
+    tensor: torch.Tensor,
+    rows: int,
+    quantize: bool,
+    communication: PreparedProjection,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Gather owner rows; return borrowed activations and optional FP8 scales."""
+    return communication.all_gather(tensor, rows, quantize)
+
+
+def projection_all_to_all(
+    tensor: torch.Tensor,
+    rows: int,
+    inverse: bool,
+    quantize: bool,
+    out: torch.Tensor | None,
+    communication: PreparedProjection,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Exchange token/channel axes, optionally fusing forward FP8 quantization.
+
+    Forward requires out=None and returns borrowed output, with optional
+    quantization. Inverse requires quantize=False and writes into caller-owned
+    out; callers may retain it across later communication calls.
+    """
+    return communication.all_to_all(tensor, rows, inverse, quantize, out)
+
+
+def acquire_projection_output(
+    rows: int, communication: PreparedProjection
+) -> torch.Tensor:
+    """Borrow a GEMM destination consumed by the following ReduceScatter."""
+    return communication.acquire_output(rows)
+
+
+def projection_reduce_scatter(
+    tensor: torch.Tensor,
+    rows: int,
+    communication: PreparedProjection,
+) -> torch.Tensor:
+    """Reduce padded owner segments into an owned local output tensor."""
+    return communication.reduce_scatter(tensor, rows)
 
 
 def all_reduce(

@@ -21,10 +21,17 @@
 """Abstract base class for communication backends."""
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import torch
 
 from tokenspeed.runtime.distributed.mapping import Group
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.distributed.comm_backend.projection import (
+        PreparedProjection,
+        ProjectionSpec,
+    )
 
 
 class CommBackend(ABC):
@@ -35,6 +42,18 @@ class CommBackend(ABC):
     """
 
     # ---- Collective ops ----
+
+    def prepare_projection(self, spec: "ProjectionSpec") -> "PreparedProjection":
+        """Prepare layout-aware projection collectives using this backend.
+
+        Persistent state belongs to the returned object, not the global backend,
+        so independent models/streams cannot accidentally share IPC buffers.
+        """
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            ProjectionCollectives,
+        )
+
+        return ProjectionCollectives(spec, self, False, False)
 
     @abstractmethod
     def all_reduce(

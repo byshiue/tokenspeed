@@ -117,6 +117,30 @@ class AutoBackend(CommBackend):
     def configure(self, use_pynccl: bool = False) -> None:
         self._nccl.configure(use_pynccl=use_pynccl)
 
+    def prepare_projection(self, spec):
+        """Prepare optional Lamport paths without changing ordinary routing.
+
+        Projection collectives have an explicit pre-capture lifetime. Their
+        large-message and unsupported-topology paths return to this backend;
+        batch-invariant reductions retain the rank-ordered fold at every size.
+        """
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            ProjectionCollectives,
+        )
+
+        use_lamport = (
+            current_platform().is_nvidia
+            and spec.device.type == "cuda"
+            and spec.dtype == torch.bfloat16
+            and not self._force_deterministic_rsag()
+        )
+        return ProjectionCollectives(
+            spec,
+            self,
+            use_lamport,
+            use_lamport and not self._batch_invariant_collectives(),
+        )
+
     @staticmethod
     def _force_deterministic_rsag() -> bool:
         return bool(global_server_args_dict.get("force_deterministic_rsag", False))
