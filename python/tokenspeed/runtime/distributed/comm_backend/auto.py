@@ -123,57 +123,6 @@ class AutoBackend(CommBackend):
     def configure(self, use_pynccl: bool = False) -> None:
         self._nccl.configure(use_pynccl=use_pynccl)
 
-    def prepare_projection(self, spec):
-        """Prepare optional Lamport paths without changing ordinary routing.
-
-        Projection collectives have an explicit pre-capture lifetime. Their
-        large-message and unsupported-topology paths return to this backend;
-        batch-invariant reductions retain the rank-ordered fold at every size.
-        """
-        use_lamport = (
-            current_platform().is_nvidia
-            and spec.device.type == "cuda"
-            and spec.dtype == torch.bfloat16
-            and not self._force_deterministic_rsag()
-        )
-        return self._projection.prepare(
-            spec,
-            use_lamport,
-            use_lamport and not self._batch_invariant_collectives(),
-        )
-
-    def projection_all_gather(
-        self,
-        tensor: torch.Tensor,
-        rows: int,
-        quantize: bool,
-        workspace: ProjectionWorkspace,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return self._projection.all_gather(tensor, rows, quantize, workspace)
-
-    def projection_all_to_all(
-        self,
-        tensor: torch.Tensor,
-        rows: int,
-        inverse: bool,
-        quantize: bool,
-        out: torch.Tensor | None,
-        workspace: ProjectionWorkspace,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        return self._projection.all_to_all(
-            tensor, rows, inverse, quantize, out, workspace
-        )
-
-    def acquire_projection_output(
-        self, rows: int, workspace: ProjectionWorkspace
-    ) -> torch.Tensor:
-        return self._projection.acquire_output(rows, workspace)
-
-    def projection_reduce_scatter(
-        self, tensor: torch.Tensor, rows: int, workspace: ProjectionWorkspace
-    ) -> torch.Tensor:
-        return self._projection.reduce_scatter(tensor, rows, workspace)
-
     @staticmethod
     def _force_deterministic_rsag() -> bool:
         return bool(global_server_args_dict.get("force_deterministic_rsag", False))
@@ -587,6 +536,57 @@ class AutoBackend(CommBackend):
             output_split_sizes=output_split_sizes,
             input_split_sizes=input_split_sizes,
         )
+
+    def prepare_projection(self, spec):
+        """Prepare optional Lamport paths without changing ordinary routing.
+
+        Projection collectives have an explicit pre-capture lifetime. Their
+        large-message and unsupported-topology paths return to this backend;
+        batch-invariant reductions retain the rank-ordered fold at every size.
+        """
+        use_lamport = (
+            current_platform().is_nvidia
+            and spec.device.type == "cuda"
+            and spec.dtype == torch.bfloat16
+            and not self._force_deterministic_rsag()
+        )
+        return self._projection.prepare(
+            spec,
+            use_lamport,
+            use_lamport and not self._batch_invariant_collectives(),
+        )
+
+    def projection_all_gather(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        quantize: bool,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_gather(tensor, rows, quantize, workspace)
+
+    def projection_all_to_all(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        inverse: bool,
+        quantize: bool,
+        out: torch.Tensor | None,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_to_all(
+            tensor, rows, inverse, quantize, out, workspace
+        )
+
+    def acquire_projection_output(
+        self, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.acquire_output(rows, workspace)
+
+    def projection_reduce_scatter(
+        self, tensor: torch.Tensor, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.reduce_scatter(tensor, rows, workspace)
 
     def send(self, tensor: torch.Tensor, dst: int, group: Group) -> None:
         return self._nccl.send(tensor, dst, group)
