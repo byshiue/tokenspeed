@@ -58,6 +58,9 @@ def _context(rank, counts):
 def _worker(rank, size, tp_size, rendezvous, backend_name):
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
+        TrtllmAllReduceBackend,
+    )
     from tokenspeed.runtime.distributed.comm_ops import (
         acquire_projection_output,
         prepare_projection_collectives,
@@ -126,10 +129,14 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
     backend = AutoBackend() if backend_name == "auto" else NcclBackend()
     prepare_dp_linear_communication(model, capacity, torch.bfloat16, backend)
 
-    # Separate preparations on the same backend keep borrowed activations and
-    # producer-direct destinations independent, even for identical specs.
+    # Separate preparations keep borrowed activations and producer-direct
+    # destinations independent, even for identical specs. The NCCL case also
+    # exercises the generic projection path inherited by an AllReduce wrapper.
+    other_backend = (
+        TrtllmAllReduceBackend(fallback=backend) if backend_name == "nccl" else backend
+    )
     other_column, other_row = [
-        prepare_projection_collectives(linear.projection_workspace.spec, backend)
+        prepare_projection_collectives(linear.projection_workspace.spec, other_backend)
         for linear in (columns[0], row)
     ]
     local = torch.full((32, width), rank + 1, dtype=torch.bfloat16, device=device)
@@ -139,15 +146,19 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
     gathered, _ = projection_all_gather(
         local, 32, False, columns[0].projection_workspace, backend
     )
-    other_gathered, _ = projection_all_gather(-local, 32, False, other_column, backend)
+    other_gathered, _ = projection_all_gather(
+        -local, 32, False, other_column, other_backend
+    )
     torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
     torch.testing.assert_close(other_gathered, -expected, rtol=0, atol=0)
     partial = acquire_projection_output(32, row.projection_workspace, backend)
     partial.fill_(rank + 1)
-    other_partial = acquire_projection_output(32, other_row, backend)
+    other_partial = acquire_projection_output(32, other_row, other_backend)
     other_partial.fill_(-(rank + 1))
     reduced = projection_reduce_scatter(partial, 32, row.projection_workspace, backend)
-    other_reduced = projection_reduce_scatter(other_partial, 32, other_row, backend)
+    other_reduced = projection_reduce_scatter(
+        other_partial, 32, other_row, other_backend
+    )
     expected = torch.full_like(reduced, sum(peer + 1 for peer in parallel.tp_group))
     torch.testing.assert_close(reduced, expected, rtol=0, atol=0)
     torch.testing.assert_close(other_reduced, -expected, rtol=0, atol=0)

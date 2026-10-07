@@ -36,6 +36,10 @@ from tokenspeed.runtime.distributed.comm_backend.base import (
     Group,
 )
 from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+from tokenspeed.runtime.distributed.comm_backend.projection import (
+    ProjectionBackend,
+    ProjectionWorkspace,
+)
 from tokenspeed.runtime.distributed.comm_backend.triton_allreduce import (
     TritonAllReduceBackend,
 )
@@ -98,11 +102,12 @@ class AutoBackend(CommBackend):
     """Composite backend that selects the best strategy per call."""
 
     def __init__(self):
-        super().__init__()
         self._nccl = NcclBackend()
         self._trtllm_ar = TrtllmAllReduceBackend(fallback=self._nccl)
         self._triton_ar = TritonAllReduceBackend(fallback=self._nccl)
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
+        # Projection fallbacks retain Auto's ordinary routing and numerics.
+        self._projection = ProjectionBackend(fallback=self)
         # Groups the startup self-check moved off the in-switch reduction
         # (``pin_ordered_fold``); set once, world-uniformly, before serving.
         self._fold_pinned_groups: set[Group] = set()
@@ -136,6 +141,38 @@ class AutoBackend(CommBackend):
             use_lamport,
             use_lamport and not self._batch_invariant_collectives(),
         )
+
+    def projection_all_gather(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        quantize: bool,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_gather(tensor, rows, quantize, workspace)
+
+    def projection_all_to_all(
+        self,
+        tensor: torch.Tensor,
+        rows: int,
+        inverse: bool,
+        quantize: bool,
+        out: torch.Tensor | None,
+        workspace: ProjectionWorkspace,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        return self._projection.all_to_all(
+            tensor, rows, inverse, quantize, out, workspace
+        )
+
+    def acquire_projection_output(
+        self, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.acquire_output(rows, workspace)
+
+    def projection_reduce_scatter(
+        self, tensor: torch.Tensor, rows: int, workspace: ProjectionWorkspace
+    ) -> torch.Tensor:
+        return self._projection.reduce_scatter(tensor, rows, workspace)
 
     @staticmethod
     def _force_deterministic_rsag() -> bool:

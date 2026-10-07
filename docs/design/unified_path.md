@@ -183,6 +183,9 @@ another rank in their subgroup has work. The model runner prepares fixed-capacit
 communication workspaces before cache-memory profiling and graph capture.
 Preparation binds each Linear and its workspace to the selected communication
 backend; forward operations dispatch through that same backend.
+Generic projection operations use the backend's ordinary collectives.
+`AutoBackend` composes the optimized projection dispatcher and reuses those
+generic operations for fallback.
 Sequential layers with matching configurations may share a workspace on one
 stream; concurrent streams or models use separate workspaces. Intermediate
 tensors borrow storage until the next call to their operation, so consumers

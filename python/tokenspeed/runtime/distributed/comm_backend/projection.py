@@ -59,7 +59,7 @@ class ProjectionWorkspace:
 
     The backend installs eligible native resources during preparation. This
     object keeps their storage alive until collective teardown; dispatch and
-    layout conversion belong to ProjectionBackend. Sequential layers may share
+    layout conversion belong to the backend. Sequential layers may share
     one workspace, while independent preparations own separate allocations.
     Intermediate tensors borrow storage until the next call to their operation;
     consumers finish on the same stream before reuse. Final inverse-A2A/RS
@@ -127,10 +127,170 @@ class ProjectionWorkspace:
         self.closed = True
 
 
+def prepare_projection_workspace(
+    spec: ProjectionSpec, backend: "CommBackend"
+) -> ProjectionWorkspace:
+    """Allocate and warm model-owned scratch using backend's ordinary collectives."""
+    workspace = ProjectionWorkspace(spec, backend)
+    _warmup_projection(workspace)
+    return workspace
+
+
+def _warmup_projection(workspace: ProjectionWorkspace) -> None:
+    spec = workspace.spec
+    backend = workspace.backend
+    # Exercise the selected paths before capture, including optional fusion.
+    # Generic backends use ordinary collectives; Auto may use native resources.
+    probe = workspace.send[: spec.input_size].view(1, spec.input_size)
+    probe.zero_()
+    if spec.kind == "column":
+        backend.projection_all_gather(probe, 1, False, workspace)
+        backend.projection_all_gather(probe, 1, True, workspace)
+        local = probe.new_zeros(len(spec.group), spec.output_size // len(spec.group))
+        backend.projection_all_to_all(
+            local, 1, True, False, probe.new_empty(1, spec.output_size), workspace
+        )
+    else:
+        backend.projection_all_to_all(probe, 1, False, False, None, workspace)
+        backend.projection_all_to_all(probe, 1, False, True, None, workspace)
+        partial = backend.acquire_projection_output(1, workspace)
+        partial.zero_()
+        backend.projection_reduce_scatter(partial, 1, workspace)
+    # Warm fallbacks even when all probes selected a small-message kernel.
+    small = probe.new_zeros(len(spec.group), 1)
+    backend.all_to_all_single(
+        torch.empty_like(small),
+        small,
+        spec.group,
+        output_split_sizes=None,
+        input_split_sizes=None,
+    )
+    backend.all_gather_single(small, probe.new_zeros(1, 1), spec.group)
+    backend.reduce_scatter(small, spec.group)
+
+
+def _check_workspace(
+    rows: int, workspace: ProjectionWorkspace, backend: "CommBackend"
+) -> None:
+    if workspace.backend is not backend:
+        raise ValueError("Projection workspace belongs to another backend")
+    if workspace.closed or not 0 < rows <= workspace.spec.max_tokens:
+        raise RuntimeError("Projection communication is closed or exceeds capacity")
+
+
+def _pad_input(
+    inputs: torch.Tensor, rows: int, workspace: ProjectionWorkspace
+) -> torch.Tensor:
+    if (
+        inputs.shape[0] == rows
+        and inputs.is_contiguous()
+        and inputs.data_ptr() % 16 == 0
+    ):
+        return inputs
+    padded = workspace.send[: rows * workspace.spec.input_size].view(
+        rows, workspace.spec.input_size
+    )
+    padded.zero_()
+    padded[: inputs.shape[0]].copy_(inputs)
+    return padded
+
+
+def _check_a2a_options(inverse: bool, quantize: bool, out: torch.Tensor | None) -> None:
+    if inverse and (quantize or out is None):
+        raise ValueError("Inverse A2A requires owned output and no quantization")
+    if not inverse and out is not None:
+        # Forward can return BF16 or FP8 borrowed scratch, not an owned output.
+        raise ValueError("Forward A2A returns borrowed output; out must be None")
+
+
+def projection_all_gather(
+    inputs: torch.Tensor,
+    rows: int,
+    quantize: bool,
+    workspace: ProjectionWorkspace,
+    backend: "CommBackend",
+) -> tuple[torch.Tensor, None]:
+    """Gather padded owner rows through backend into borrowed activation scratch.
+
+    quantize permits fusion; this generic path returns unquantized values and
+    None for scales so the Linear uses its ordinary quantization/GEMM path.
+    """
+    _check_workspace(rows, workspace, backend)
+    send = _pad_input(inputs, rows, workspace)
+    gathered = workspace.gathered[: len(workspace.spec.group) * rows]
+    backend.all_gather_single(gathered, send, workspace.spec.group)
+    return gathered, None
+
+
+def projection_all_to_all(
+    inputs: torch.Tensor,
+    rows: int,
+    inverse: bool,
+    quantize: bool,
+    out: torch.Tensor | None,
+    workspace: ProjectionWorkspace,
+    backend: "CommBackend",
+) -> tuple[torch.Tensor, None]:
+    """Exchange token/channel axes using backend's ordinary AllToAll.
+
+    Forward returns borrowed padded channel shards without fused quantization.
+    Inverse restores complete owner rows into the caller-provided out tensor.
+    """
+    from tokenspeed_kernel.ops.communication.triton import (
+        triton_pack_channel_shards_for_a2a,
+    )
+
+    _check_workspace(rows, workspace, backend)
+    _check_a2a_options(inverse, quantize, out)
+    spec = workspace.spec
+    size = len(spec.group)
+    width = spec.output_size if inverse else spec.input_size
+    shard = width // size
+    received = workspace.received[: rows * width].view(size * rows, shard)
+    if inverse:
+        sent = inputs.contiguous()
+    else:
+        scratch = workspace.send[: rows * width].view(size, rows, shard)
+        sent = triton_pack_channel_shards_for_a2a(inputs, scratch)
+    backend.all_to_all_single(
+        received,
+        sent,
+        spec.group,
+        output_split_sizes=None,
+        input_split_sizes=None,
+    )
+    if inverse:
+        out.view(rows, size, shard).copy_(
+            received.view(size, rows, shard).transpose(0, 1)
+        )
+        return out, None
+    return received, None
+
+
+def acquire_projection_output(
+    rows: int, workspace: ProjectionWorkspace, backend: "CommBackend"
+) -> torch.Tensor:
+    """Borrow [TP*rows,N] ordinary GEMM scratch for a following ReduceScatter."""
+    _check_workspace(rows, workspace, backend)
+    return workspace.partial[: len(workspace.spec.group) * rows]
+
+
+def projection_reduce_scatter(
+    partial: torch.Tensor,
+    rows: int,
+    workspace: ProjectionWorkspace,
+    backend: "CommBackend",
+) -> torch.Tensor:
+    """Reduce [TP*rows,N] partials through backend into owned [rows,N] outputs."""
+    _check_workspace(rows, workspace, backend)
+    return backend.reduce_scatter(partial, workspace.spec.group)
+
+
 class ProjectionBackend:
     """Dispatch prepared projection operations through native or fallback kernels.
 
-    Like TritonRSAGBackend, this composes a CommBackend fallback. Workspaces are
+    AutoBackend composes this dispatcher, like TritonRSAGBackend. Generic
+    fallbacks above reuse its ordinary collectives and numerics. Workspaces are
     passed explicitly, so one dispatcher can serve independent models/streams.
     Physical subgroup rows select the same path on every peer, including empty
     owners. All workspace allocation and warmup precedes capture.
@@ -159,42 +319,8 @@ class ProjectionBackend:
             if len(set(hosts)) == 1:
                 self._prepare_lamport(workspace, use_lamport_reduction)
 
-        self._warmup(workspace)
+        _warmup_projection(workspace)
         return workspace
-
-    def _warmup(self, workspace: ProjectionWorkspace) -> None:
-        spec = workspace.spec
-
-        # Initialize fallback communicators and all selected native kernels
-        # before capture. No persistent allocation is deferred to forward.
-        probe = workspace.send[: spec.input_size].view(1, spec.input_size)
-        probe.zero_()
-        if spec.kind == "column":
-            self.all_gather(probe, 1, False, workspace)
-            self.all_gather(probe, 1, True, workspace)
-            local = probe.new_zeros(
-                len(spec.group), spec.output_size // len(spec.group)
-            )
-            self.all_to_all(
-                local, 1, True, False, probe.new_empty(1, spec.output_size), workspace
-            )
-        else:
-            self.all_to_all(probe, 1, False, False, None, workspace)
-            self.all_to_all(probe, 1, False, True, None, workspace)
-            partial = self.acquire_output(1, workspace)
-            partial.zero_()
-            self.reduce_scatter(partial, 1, workspace)
-        # Warm NCCL even when all probes above selected a small-message kernel.
-        small = probe.new_zeros(len(spec.group), 1)
-        self._fallback.all_to_all_single(
-            torch.empty_like(small),
-            small,
-            spec.group,
-            output_split_sizes=None,
-            input_split_sizes=None,
-        )
-        self._fallback.all_gather_single(small, probe.new_zeros(1, 1), spec.group)
-        self._fallback.reduce_scatter(small, spec.group)
 
     def _prepare_lamport(
         self, workspace: ProjectionWorkspace, use_reduction: bool
@@ -244,29 +370,6 @@ class ProjectionBackend:
             if spec.kind == "row" and channels % 512 == 0:
                 workspace.a2a.prepare_fp8_quantization()
 
-    def _check(self, rows: int, workspace: ProjectionWorkspace) -> None:
-        if workspace.backend is not self._fallback:
-            raise ValueError("Projection workspace belongs to another backend")
-        if workspace.closed or not 0 < rows <= workspace.spec.max_tokens:
-            raise RuntimeError("Projection communication is closed or exceeds capacity")
-
-    @staticmethod
-    def _pad(
-        inputs: torch.Tensor, rows: int, workspace: ProjectionWorkspace
-    ) -> torch.Tensor:
-        if (
-            inputs.shape[0] == rows
-            and inputs.is_contiguous()
-            and inputs.data_ptr() % 16 == 0
-        ):
-            return inputs
-        padded = workspace.send[: rows * workspace.spec.input_size].view(
-            rows, workspace.spec.input_size
-        )
-        padded.zero_()
-        padded[: inputs.shape[0]].copy_(inputs)
-        return padded
-
     def all_gather(
         self,
         inputs: torch.Tensor,
@@ -274,20 +377,20 @@ class ProjectionBackend:
         quantize: bool,
         workspace: ProjectionWorkspace,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        self._check(rows, workspace)
-        send = self._pad(inputs, rows, workspace)
-        if workspace.gather is not None and rows <= workspace.gather.max_rows:
-            from tokenspeed_kernel.ops.communication.trtllm import (
-                trtllm_allgather,
-                trtllm_allgather_fp8_quantize,
+        if workspace.gather is None or rows > workspace.gather.max_rows:
+            return projection_all_gather(
+                inputs, rows, quantize, workspace, self._fallback
             )
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            trtllm_allgather,
+            trtllm_allgather_fp8_quantize,
+        )
 
-            if quantize and workspace.gather_quant is not None:
-                return trtllm_allgather_fp8_quantize(workspace.gather_quant, send)
-            return trtllm_allgather(workspace.gather, send), None
-        gathered = workspace.gathered[: len(workspace.spec.group) * rows]
-        self._fallback.all_gather_single(gathered, send, workspace.spec.group)
-        return gathered, None
+        _check_workspace(rows, workspace, self._fallback)
+        send = _pad_input(inputs, rows, workspace)
+        if quantize and workspace.gather_quant is not None:
+            return trtllm_allgather_fp8_quantize(workspace.gather_quant, send)
+        return trtllm_allgather(workspace.gather, send), None
 
     def all_to_all(
         self,
@@ -298,68 +401,37 @@ class ProjectionBackend:
         out: torch.Tensor | None,
         workspace: ProjectionWorkspace,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        from tokenspeed_kernel.ops.communication.triton import (
-            triton_pack_channel_shards_for_a2a,
+        if workspace.a2a is None or rows > workspace.a2a.max_rows:
+            return projection_all_to_all(
+                inputs, rows, inverse, quantize, out, workspace, self._fallback
+            )
+        from tokenspeed_kernel.ops.communication.cuda import (
+            tokenspeed_a2a_lamport,
+            tokenspeed_a2a_lamport_fp8_quantize,
         )
 
-        self._check(rows, workspace)
-        if inverse and (quantize or out is None):
-            raise ValueError("Inverse A2A requires owned output and no quantization")
-        if not inverse and out is not None:
-            # Forward may return BF16 or FP8 borrowed scratch. Do not silently
-            # discard a destination when fusion or a fallback changes the path.
-            raise ValueError("Forward A2A returns borrowed output; out must be None")
-        if workspace.a2a is not None and rows <= workspace.a2a.max_rows:
-            from tokenspeed_kernel.ops.communication.cuda import (
-                tokenspeed_a2a_lamport,
-                tokenspeed_a2a_lamport_fp8_quantize,
-            )
-
-            sent = (
-                inputs.contiguous() if inverse else self._pad(inputs, rows, workspace)
-            )
-            if quantize and workspace.a2a.fp8_output is not None:
-                return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
-            return (
-                tokenspeed_a2a_lamport(workspace.a2a, sent, inverse=inverse, out=out),
-                None,
-            )
-        spec = workspace.spec
-        size = len(spec.group)
-        width = spec.output_size if inverse else spec.input_size
-        shard = width // size
-        received = workspace.received[: rows * width].view(size * rows, shard)
-        if inverse:
-            sent = inputs.contiguous()
-        else:
-            scratch = workspace.send[: rows * width].view(size, rows, shard)
-            sent = triton_pack_channel_shards_for_a2a(inputs, scratch)
-        self._fallback.all_to_all_single(
-            received,
-            sent,
-            spec.group,
-            output_split_sizes=None,
-            input_split_sizes=None,
+        _check_workspace(rows, workspace, self._fallback)
+        _check_a2a_options(inverse, quantize, out)
+        sent = inputs.contiguous() if inverse else _pad_input(inputs, rows, workspace)
+        if quantize and workspace.a2a.fp8_output is not None:
+            return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
+        return (
+            tokenspeed_a2a_lamport(workspace.a2a, sent, inverse=inverse, out=out),
+            None,
         )
-        if inverse:
-            out.view(rows, size, shard).copy_(
-                received.view(size, rows, shard).transpose(0, 1)
-            )
-            return out, None
-        return received, None
 
     def acquire_output(self, rows: int, workspace: ProjectionWorkspace) -> torch.Tensor:
-        self._check(rows, workspace)
-        if workspace.reduction is not None and rows <= workspace.reduction.max_rows:
-            return workspace.reduction.input_buffer(rows)
-        return workspace.partial[: len(workspace.spec.group) * rows]
+        if workspace.reduction is None or rows > workspace.reduction.max_rows:
+            return acquire_projection_output(rows, workspace, self._fallback)
+        _check_workspace(rows, workspace, self._fallback)
+        return workspace.reduction.input_buffer(rows)
 
     def reduce_scatter(
         self, partial: torch.Tensor, rows: int, workspace: ProjectionWorkspace
     ) -> torch.Tensor:
-        self._check(rows, workspace)
-        if workspace.reduction is not None and rows <= workspace.reduction.max_rows:
-            from tokenspeed_kernel.ops.communication.trtllm import trtllm_reduce_scatter
+        if workspace.reduction is None or rows > workspace.reduction.max_rows:
+            return projection_reduce_scatter(partial, rows, workspace, self._fallback)
+        from tokenspeed_kernel.ops.communication.trtllm import trtllm_reduce_scatter
 
-            return trtllm_reduce_scatter(workspace.reduction, partial, rows)
-        return self._fallback.reduce_scatter(partial, workspace.spec.group)
+        _check_workspace(rows, workspace, self._fallback)
+        return trtllm_reduce_scatter(workspace.reduction, partial, rows)

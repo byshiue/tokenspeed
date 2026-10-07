@@ -41,18 +41,15 @@ class CommBackend(ABC):
     Process groups are looked up from pg_manager, not created here.
     """
 
-    def __init__(self):
-        from tokenspeed.runtime.distributed.comm_backend.projection import (
-            ProjectionBackend,
-        )
-
-        self._projection = ProjectionBackend(self)
-
     # ---- Collective ops ----
 
     def prepare_projection(self, spec: "ProjectionSpec") -> "ProjectionWorkspace":
         """Prepare model-owned scratch for this backend before graph capture."""
-        return self._projection.prepare(spec, False, False)
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            prepare_projection_workspace,
+        )
+
+        return prepare_projection_workspace(spec, self)
 
     def projection_all_gather(
         self,
@@ -62,7 +59,11 @@ class CommBackend(ABC):
         workspace: "ProjectionWorkspace",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Gather owner rows into borrowed activations and optional FP8 scales."""
-        return self._projection.all_gather(tensor, rows, quantize, workspace)
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_all_gather,
+        )
+
+        return projection_all_gather(tensor, rows, quantize, workspace, self)
 
     def projection_all_to_all(
         self,
@@ -74,21 +75,33 @@ class CommBackend(ABC):
         workspace: "ProjectionWorkspace",
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Exchange token/channel axes using prepared layout and fusion resources."""
-        return self._projection.all_to_all(
-            tensor, rows, inverse, quantize, out, workspace
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_all_to_all,
+        )
+
+        return projection_all_to_all(
+            tensor, rows, inverse, quantize, out, workspace, self
         )
 
     def acquire_projection_output(
         self, rows: int, workspace: "ProjectionWorkspace"
     ) -> torch.Tensor:
         """Borrow a GEMM destination consumed by projection_reduce_scatter."""
-        return self._projection.acquire_output(rows, workspace)
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            acquire_projection_output,
+        )
+
+        return acquire_projection_output(rows, workspace, self)
 
     def projection_reduce_scatter(
         self, tensor: torch.Tensor, rows: int, workspace: "ProjectionWorkspace"
     ) -> torch.Tensor:
         """Reduce padded owner segments into an owned local output tensor."""
-        return self._projection.reduce_scatter(tensor, rows, workspace)
+        from tokenspeed.runtime.distributed.comm_backend.projection import (
+            projection_reduce_scatter,
+        )
+
+        return projection_reduce_scatter(tensor, rows, workspace, self)
 
     @abstractmethod
     def all_reduce(

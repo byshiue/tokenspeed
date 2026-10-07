@@ -40,7 +40,6 @@ class NcclBackend(CommBackend):
     """
 
     def __init__(self):
-        super().__init__()
         self._resources = {}  # group_tuple → {pynccl_comm, device_group, world_size}
         self._use_pynccl = False
 
