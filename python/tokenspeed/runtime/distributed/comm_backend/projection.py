@@ -80,10 +80,10 @@ class ProjectionWorkspace:
         self.spec = spec
         self.backend = backend
         self.closed = False
-        self.send = torch.empty(
+        self.send: torch.Tensor | None = torch.empty(
             spec.max_tokens * spec.input_size, dtype=spec.dtype, device=spec.device
         )
-        self.received = torch.empty(
+        self.received: torch.Tensor | None = torch.empty(
             spec.max_tokens * width, dtype=spec.dtype, device=spec.device
         )
         self.gathered = (
@@ -112,7 +112,13 @@ class ProjectionWorkspace:
         self.reduction = None
 
     def close(self) -> None:
-        """Release native resources after consumers and referencing graphs finish."""
+        """Collectively release native resources and owned scratch references.
+
+        Call on every subgroup rank after consumers finish and referencing CUDA
+        graphs are destroyed, before process-group teardown. Repeated calls are
+        harmless. Borrowed tensor views must also be dropped to reclaim storage;
+        caller-owned final outputs remain valid.
+        """
         if self.closed:
             return
         if self.spec.device.type == "cuda":
@@ -125,6 +131,7 @@ class ProjectionWorkspace:
         if self.reduction is not None:
             self.reduction.close()
             self.reduction = None
+        self.send = self.received = self.gathered = self.partial = None
         self.closed = True
 
 

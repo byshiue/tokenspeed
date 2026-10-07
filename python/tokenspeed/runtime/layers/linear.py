@@ -1630,3 +1630,29 @@ def prepare_dp_linear_communication(
         module.projection_workspace = prepared[spec]
         module.comm_backend = backend
     return True
+
+
+def release_dp_linear_communication(model: torch.nn.Module) -> None:
+    """Release a model's DP projection workspaces and allow preparation again.
+
+    All subgroup ranks must call with the same module order, after forwards
+    finish and their CUDA graphs are destroyed, before process groups close.
+    Shared workspaces close once, in first-use module order. This releases only
+    DP Linear resources, not other communication owned by the model. Repeated
+    release is harmless; callers must also drop borrowed intermediate views.
+    """
+    linears = [
+        module
+        for module in model.modules()
+        if isinstance(module, (DPColumnParallelLinear, DPRowParallelLinear))
+    ]
+    workspaces = dict.fromkeys(
+        module.projection_workspace
+        for module in linears
+        if module.projection_workspace is not None
+    )
+    for workspace in workspaces:
+        workspace.close()
+    for module in linears:
+        module.projection_workspace = None
+        module.comm_backend = None
