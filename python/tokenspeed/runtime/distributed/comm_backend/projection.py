@@ -31,6 +31,7 @@ from tokenspeed.runtime.distributed.mapping import Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.distributed.comm_backend.base import CommBackend
@@ -178,23 +179,6 @@ def _check_workspace(
         raise RuntimeError("Projection communication is closed or exceeds capacity")
 
 
-def _pad_input(
-    inputs: torch.Tensor, rows: int, workspace: ProjectionWorkspace
-) -> torch.Tensor:
-    if (
-        inputs.shape[0] == rows
-        and inputs.is_contiguous()
-        and inputs.data_ptr() % 16 == 0
-    ):
-        return inputs
-    padded = workspace.send[: rows * workspace.spec.input_size].view(
-        rows, workspace.spec.input_size
-    )
-    padded.zero_()
-    padded[: inputs.shape[0]].copy_(inputs)
-    return padded
-
-
 def _check_a2a_options(inverse: bool, quantize: bool, out: torch.Tensor | None) -> None:
     if inverse and (quantize or out is None):
         raise ValueError("Inverse A2A requires owned output and no quantization")
@@ -216,7 +200,7 @@ def projection_all_gather(
     None for scales so the Linear uses its ordinary quantization/GEMM path.
     """
     _check_workspace(rows, workspace, backend)
-    send = _pad_input(inputs, rows, workspace)
+    send = prepare_padded_rows(inputs, rows, workspace.send, alignment_bytes=16)
     gathered = workspace.gathered[: len(workspace.spec.group) * rows]
     backend.all_gather_single(gathered, send, workspace.spec.group)
     return gathered, None
@@ -387,7 +371,7 @@ class ProjectionBackend:
         )
 
         _check_workspace(rows, workspace, self._fallback)
-        send = _pad_input(inputs, rows, workspace)
+        send = prepare_padded_rows(inputs, rows, workspace.send, alignment_bytes=16)
         if quantize and workspace.gather_quant is not None:
             return trtllm_allgather_fp8_quantize(workspace.gather_quant, send)
         return trtllm_allgather(workspace.gather, send), None
@@ -412,7 +396,11 @@ class ProjectionBackend:
 
         _check_workspace(rows, workspace, self._fallback)
         _check_a2a_options(inverse, quantize, out)
-        sent = inputs.contiguous() if inverse else _pad_input(inputs, rows, workspace)
+        sent = (
+            inputs.contiguous()
+            if inverse
+            else prepare_padded_rows(inputs, rows, workspace.send, alignment_bytes=16)
+        )
         if quantize and workspace.a2a.fp8_output is not None:
             return tokenspeed_a2a_lamport_fp8_quantize(workspace.a2a, sent)
         return (
