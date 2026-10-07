@@ -85,6 +85,8 @@ def _worker(rank, size, tp_size, rendezvous, backend_name):
         timeout=timedelta(seconds=240),
         device_id=device,
     )
+    # This mapping shards projection weights; each rank owns independent tokens,
+    # including when one TP group spans the world (projection dp_size == 1).
     parallel = DenseLayerMapping(
         rank=rank, world_size=size, tp_size=tp_size, dp_size=size // tp_size
     )
@@ -285,6 +287,7 @@ def _fp8_worker(rank, rendezvous):
         timeout=timedelta(seconds=240),
         device_id=device,
     )
+    # TP4 projection over four independent token owners, not attention TP4.
     parallel = DenseLayerMapping(rank=rank, world_size=4, tp_size=4, dp_size=1)
     config = Fp8Config(
         is_checkpoint_fp8_serialized=True,

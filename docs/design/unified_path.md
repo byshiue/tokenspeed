@@ -176,11 +176,24 @@ from one first bound to that pool:
 
 ### DP projection communication
 
-`DPColumnParallelLinear` and `DPRowParallelLinear` read the same physical
-per-rank token counts from `ForwardContext` in eager and CUDA-graph execution,
-including `report_collective_sizing` overrides. Empty owners participate when
-another rank in their subgroup has work. The model runner prepares fixed-capacity
-communication workspaces before cache-memory profiling and graph capture.
+`DPColumnParallelLinear` and `DPRowParallelLinear` accept full input channels
+for each rank's own tokens and return complete outputs in the same local token
+order. Their parallel mapping describes projection weight sharding, independently
+of attention's token ownership. For example, attention DP4 can use one TP4
+projection group with projection `dp_size=1`; this does not mean the attention
+inputs are replicated.
+
+Both eager and CUDA-graph execution require explicit physical row counts indexed
+by global rank in `ForwardContext`: `collective_global_num_tokens` from
+`report_collective_sizing` takes precedence over `global_num_tokens`. The counts
+include any graph padding and match the input rows on each owner. Empty owners
+participate when another rank in their subgroup has work. Missing counts are an
+error, not an instruction to assume equal counts across ranks. Ordinary TP with
+replicated token rows uses the existing `ColumnParallelLinear` and
+`RowParallelLinear` contracts instead.
+
+The model runner prepares fixed-capacity communication workspaces before
+cache-memory profiling and graph capture.
 Preparation binds each Linear and its workspace to the selected communication
 backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.

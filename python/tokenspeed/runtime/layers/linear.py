@@ -331,6 +331,7 @@ class ReplicatedLinear(LinearBase):
         *,
         ctx: "ForwardContext | None" = None,
     ) -> torch.Tensor:
+        # ctx keeps the DP Linear call interface; replicated GEMM needs no owner counts.
         bias = self.bias if not self.skip_bias_add else None
         assert self.quant_method is not None
         if block_scale is not None:
@@ -518,6 +519,7 @@ class ColumnParallelLinear(LinearBase):
         *,
         ctx: "ForwardContext | None" = None,
     ):
+        # ctx keeps the DP Linear call interface; ordinary TP needs no owner counts.
         bias = self.bias if not self.skip_bias_add else None
 
         # Matrix multiply.
@@ -1301,6 +1303,7 @@ class RowParallelLinear(LinearBase):
         ctx: "ForwardContext | None" = None,
         out: torch.Tensor | None = None,
     ):
+        # ctx keeps the DP Linear call interface; ordinary TP needs no owner counts.
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1379,7 +1382,11 @@ def _projection_rows(
     parallel: DenseLayerMapping,
     workspace: ProjectionWorkspace | None,
 ) -> int:
-    """Read physical owner counts on both eager and captured execution paths."""
+    """Read explicit physical owner counts, including graph padding, by global rank.
+
+    Projection TP/DP sizes describe weight sharding, not attention row ownership;
+    they cannot supply missing counts or imply replicated inputs.
+    """
     if workspace is None:
         raise RuntimeError("DP linear communication must be prepared before forward")
     counts = (
@@ -1387,10 +1394,15 @@ def _projection_rows(
         if ctx.collective_global_num_tokens is not None
         else ctx.global_num_tokens
     )
+    if counts is None:
+        raise ValueError(
+            "DP linear requires explicit physical owner counts in "
+            "ForwardContext.collective_global_num_tokens or global_num_tokens; "
+            "counts cannot be inferred from the projection TP/DP mapping"
+        )
     spec = workspace.spec
     if (
-        counts is None
-        or len(counts) != parallel.world_size
+        len(counts) != parallel.world_size
         or any(count < 0 for count in counts)
         or inputs.ndim != 2
         or inputs.shape != (counts[parallel.rank], spec.input_size)
@@ -1407,6 +1419,8 @@ def _projection_rows(
 class DPColumnParallelLinear(ColumnParallelLinear):
     """Column-sharded weights with the replicated Linear's local-row contract.
 
+    Inputs contain all channels of locally owned tokens; ctx supplies explicit
+    physical per-rank row counts. Outputs preserve those tokens and their order.
     The parent owns weight creation, sharded loading and quantization. Stored
     output_size includes checkpoint padding; logical_output_size is returned.
     Forward composes AG -> GEMM -> inverse A2A through comm_ops, without knowing
@@ -1488,6 +1502,8 @@ class DPColumnParallelLinear(ColumnParallelLinear):
 class DPRowParallelLinear(RowParallelLinear):
     """Row-sharded weights with complete outputs for the original local tokens.
 
+    Inputs contain all channels of locally owned tokens; ctx supplies explicit
+    physical per-rank row counts. Outputs preserve those tokens and their order.
     A2A -> GEMM -> RS lives here; backends own padding and communication scratch.
     Parent reduction is disabled to avoid reducing GEMM partials twice. All
     subgroup ranks participate, including empty local owners. Bias is unsupported.
