@@ -537,7 +537,7 @@ class AutoBackend(CommBackend):
             input_split_sizes=input_split_sizes,
         )
 
-    def prepare_projection(self, spec):
+    def prepare_projection(self, spec, scratch_pool=None):
         """Prepare optional Lamport paths without changing ordinary routing.
 
         Projection collectives have an explicit pre-capture lifetime. Their
@@ -554,6 +554,7 @@ class AutoBackend(CommBackend):
             spec,
             use_lamport,
             use_lamport and not self._batch_invariant_collectives(),
+            scratch_pool,
         )
 
     def projection_all_gather(

@@ -45,6 +45,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
 )
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
+from tokenspeed.runtime.execution.workspace import WorkspacePool
 from tokenspeed.runtime.layers.dense import (
     Fp8LinearMethod,
     Mxfp4LinearMethod,
@@ -1589,10 +1590,12 @@ def prepare_dp_linear_communication(
     model_activation_dtype: torch.dtype,
     backend: CommBackend | None,
 ) -> bool:
-    """Bind model-owned, same-shape shared communication before cache profiling.
+    """Bind model-owned communication before cache profiling.
 
     Models only select DP Linear modules. This generic preparation discovers the
-    modules, binds their backend, creates their groups and deduplicates scratch.
+    modules, binds their backend and creates their groups. Sequential projections
+    share one fixed scratch pool per device; matching specs also share native
+    resources. Concurrent models or streams need separate preparations.
     Repeated preparation with the same backend and capacity preserves captured
     pointers; replacing/growing an allocation requires destroying its graphs.
     """
@@ -1610,8 +1613,8 @@ def prepare_dp_linear_communication(
         for module in linears
         if module.projection_workspace is not None
     }
-    for module in linears:
-        spec = ProjectionSpec(
+    specs = [
+        ProjectionSpec(
             group=module.tp_group,
             kind="column" if isinstance(module, DPColumnParallelLinear) else "row",
             input_size=module.input_size,
@@ -1620,13 +1623,32 @@ def prepare_dp_linear_communication(
             dtype=model_activation_dtype,
             device=module.weight.device,
         )
+        for module in linears
+    ]
+    pools = {}
+    for module, spec in zip(linears, specs):
         if module.projection_workspace is not None and (
             module.projection_workspace.spec != spec
             or module.projection_workspace.backend is not backend
+            or module.projection_workspace.closed
         ):
             raise RuntimeError("Cannot replace prepared DP linear communication")
+        if module.projection_workspace is not None:
+            pools[spec.device] = module.projection_workspace.scratch_pool
+    # Size private pools before any workspace holds views. Reusing a prepared
+    # pool keeps it frozen, so a larger request cannot invalidate graph pointers.
+    for spec in specs:
+        if spec.device not in pools:
+            pools[spec.device] = WorkspacePool(spec.device, initial_nbytes=0)
+        pools[spec.device].allocate(*spec.scratch_specs)
+    for pool in pools.values():
+        if not pool.frozen:
+            pool.freeze()
+    for module, spec in zip(linears, specs):
         if spec not in prepared:
-            prepared[spec] = prepare_projection_collectives(spec, backend)
+            prepared[spec] = prepare_projection_collectives(
+                spec, backend, scratch_pool=pools[spec.device]
+            )
         module.projection_workspace = prepared[spec]
         module.comm_backend = backend
     return True

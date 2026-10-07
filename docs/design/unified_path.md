@@ -199,10 +199,11 @@ backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.
 `AutoBackend` composes the optimized projection dispatcher and reuses those
 generic operations for fallback.
-Sequential layers with matching configurations may share a workspace on one
-stream; concurrent streams or models use separate workspaces. Intermediate
-tensors borrow storage until the next call to their operation, so consumers
-finish before that storage is reused. Final outputs belong to the caller and
+Sequential layers share model-private scratch on one stream, sized for the
+largest projection; matching configurations also share native resources.
+Concurrent streams or models use separate workspaces. Intermediate tensors
+borrow storage only for the current projection, so consumers finish before
+another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 

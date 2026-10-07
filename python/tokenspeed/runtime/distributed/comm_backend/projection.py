@@ -31,6 +31,7 @@ from tokenspeed.runtime.distributed.mapping import Group
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.execution.workspace import WorkspacePool
 from tokenspeed.runtime.utils.tensor import prepare_padded_rows
 
 if TYPE_CHECKING:
@@ -54,6 +55,17 @@ class ProjectionSpec:
     dtype: torch.dtype
     device: torch.device
 
+    @property
+    def scratch_specs(self) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        """Simultaneously live send, receive and GEMM buffers for this layout."""
+        width = self.input_size if self.kind == "row" else self.output_size
+        gemm_width = self.input_size if self.kind == "column" else self.output_size
+        return (
+            ((self.max_tokens * self.input_size,), self.dtype),
+            ((self.max_tokens * width,), self.dtype),
+            ((len(self.group) * self.max_tokens, gemm_width), self.dtype),
+        )
+
 
 class ProjectionWorkspace:
     """Own scratch tensors and native resources for one prepared projection.
@@ -61,13 +73,19 @@ class ProjectionWorkspace:
     The backend installs eligible native resources during preparation. This
     object keeps their storage alive until collective teardown; dispatch and
     layout conversion belong to the backend. Sequential layers may share
-    one workspace, while independent preparations own separate allocations.
-    Intermediate tensors borrow storage until the next call to their operation;
-    consumers finish on the same stream before reuse. Final inverse-A2A/RS
+    generic scratch across shapes while retaining separate native resources.
+    Intermediate tensors borrow storage only for the current projection;
+    consumers finish on the same stream before another projection reuses it.
+    Independent preparations own separate allocations. Final inverse-A2A/RS
     outputs are caller-owned. Destroy referencing CUDA graphs before close().
     """
 
-    def __init__(self, spec: ProjectionSpec, backend: "CommBackend"):
+    def __init__(
+        self,
+        spec: ProjectionSpec,
+        backend: "CommBackend",
+        scratch_pool: WorkspacePool | None = None,
+    ):
         if (
             spec.kind not in ("column", "row")
             or len(spec.group) < 2
@@ -80,32 +98,19 @@ class ProjectionWorkspace:
         self.spec = spec
         self.backend = backend
         self.closed = False
-        self.send: torch.Tensor | None = torch.empty(
-            spec.max_tokens * spec.input_size, dtype=spec.dtype, device=spec.device
-        )
-        self.received: torch.Tensor | None = torch.empty(
-            spec.max_tokens * width, dtype=spec.dtype, device=spec.device
-        )
-        self.gathered = (
-            torch.empty(
-                len(spec.group) * spec.max_tokens,
-                spec.input_size,
-                dtype=spec.dtype,
-                device=spec.device,
-            )
-            if spec.kind == "column"
-            else None
-        )
-        self.partial = (
-            torch.empty(
-                len(spec.group) * spec.max_tokens,
-                spec.output_size,
-                dtype=spec.dtype,
-                device=spec.device,
-            )
-            if spec.kind == "row"
-            else None
-        )
+        if scratch_pool is None:
+            scratch_pool = WorkspacePool(spec.device, initial_nbytes=0)
+            scratch_pool.allocate(*spec.scratch_specs)
+            scratch_pool.freeze()
+        if scratch_pool.device != spec.device or not scratch_pool.frozen:
+            raise ValueError("Projection scratch must be frozen on the same device")
+        # Projection retains these views until teardown. Keep their addresses
+        # independent of the executor-managed global pool, which can be unfrozen
+        # and grown during reconfiguration.
+        self.scratch_pool: WorkspacePool | None = scratch_pool
+        self.send, self.received, gemm = scratch_pool.allocate(*spec.scratch_specs)
+        self.gathered = gemm if spec.kind == "column" else None
+        self.partial = gemm if spec.kind == "row" else None
         self.gather = None
         self.gather_quant = None
         self.a2a = None
@@ -132,14 +137,17 @@ class ProjectionWorkspace:
             self.reduction.close()
             self.reduction = None
         self.send = self.received = self.gathered = self.partial = None
+        self.scratch_pool = None
         self.closed = True
 
 
 def prepare_projection_workspace(
-    spec: ProjectionSpec, backend: "CommBackend"
+    spec: ProjectionSpec,
+    backend: "CommBackend",
+    scratch_pool: WorkspacePool | None,
 ) -> ProjectionWorkspace:
     """Allocate and warm model-owned scratch using backend's ordinary collectives."""
-    workspace = ProjectionWorkspace(spec, backend)
+    workspace = ProjectionWorkspace(spec, backend, scratch_pool)
     _warmup_projection(workspace)
     return workspace
 
@@ -295,9 +303,10 @@ class ProjectionBackend:
         spec: ProjectionSpec,
         use_lamport: bool,
         use_lamport_reduction: bool,
+        scratch_pool: WorkspacePool | None,
     ) -> ProjectionWorkspace:
         """Allocate and warm a workspace bound to this dispatcher's backend."""
-        workspace = ProjectionWorkspace(spec, self._fallback)
+        workspace = ProjectionWorkspace(spec, self._fallback, scratch_pool)
         if use_lamport:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.

@@ -55,6 +55,7 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (  # no
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
+from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
 def _get_process_group(group: Group):
@@ -123,6 +124,7 @@ class FusionParams:
 def prepare_projection_collectives(
     spec: ProjectionSpec,
     backend: CommBackend | None,
+    scratch_pool: WorkspacePool | None = None,
 ) -> ProjectionWorkspace:
     """Collectively allocate bounded projection scratch before graph capture.
 
@@ -130,12 +132,14 @@ def prepare_projection_collectives(
     fallbacks. Callers may share the result across sequential same-spec layers,
     but never across concurrently executing streams or models. Execute with
     the same backend used to prepare the workspace; None selects the global
-    backend, as for ordinary collectives.
+    backend, as for ordinary collectives. An optional frozen, model-private
+    scratch_pool shares generic buffers across serialized projections; borrowed
+    intermediates expire when another projection starts using that pool.
     """
     pg_manager.init_process_group(spec.group, backend=None)
     if backend is None:
         backend = get_global_backend()
-    return backend.prepare_projection(spec)
+    return backend.prepare_projection(spec, scratch_pool)
 
 
 def projection_all_gather(

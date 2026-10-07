@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         ProjectionSpec,
         ProjectionWorkspace,
     )
+    from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
 class CommBackend(ABC):
@@ -43,13 +44,15 @@ class CommBackend(ABC):
 
     # ---- Collective ops ----
 
-    def prepare_projection(self, spec: "ProjectionSpec") -> "ProjectionWorkspace":
+    def prepare_projection(
+        self, spec: "ProjectionSpec", scratch_pool: "WorkspacePool | None" = None
+    ) -> "ProjectionWorkspace":
         """Prepare model-owned scratch for this backend before graph capture."""
         from tokenspeed.runtime.distributed.comm_backend.projection import (
             prepare_projection_workspace,
         )
 
-        return prepare_projection_workspace(spec, self)
+        return prepare_projection_workspace(spec, self, scratch_pool)
 
     def projection_all_gather(
         self,
