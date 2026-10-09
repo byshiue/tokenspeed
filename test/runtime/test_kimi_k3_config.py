@@ -473,6 +473,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mapping=mapping,
                 layer_id=1,
                 model_scope="model.layers",
+                qkv_parallel=None,
+                output_parallel=None,
             )
 
         self.assertEqual(len(recorded), 1)
@@ -506,6 +508,8 @@ class KimiK3RegistrationTests(unittest.TestCase):
                 mapping=staged,
                 layer_id=31,
                 model_scope="model.layers",
+                qkv_parallel=None,
+                output_parallel=None,
             )
         self.assertEqual(recorded[0]["moe_block_count"], 31)
         self.assertNotEqual(31, kimi_k3._k3_local_moe_blocks(config, mapping))
@@ -778,7 +782,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
-        layer = KimiLinearKDA(config, mapping, layer_id=0)
+        layer = KimiLinearKDA(
+            config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
+        )
 
         self.assertEqual(tuple(layer.qkvgb_proj.weight.shape), (288, 64))
         for value, shard_id in enumerate(("q", "k", "v", "g"), start=1):
@@ -809,7 +815,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
             )
             for index in range(4)
         ]
-        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states)
+        mixed_qkv, gate, f_a, beta = layer._project_qkvfab(hidden_states, ctx=None)
         self.assertTrue(torch.equal(mixed_qkv, torch.cat(expected_qkvg[:3], dim=-1)))
         self.assertTrue(torch.equal(gate, expected_qkvg[3]))
         self.assertTrue(
@@ -848,7 +854,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
             linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
         )
-        layer = KimiLinearKDA(config, mapping, layer_id=0)
+        layer = KimiLinearKDA(
+            config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
+        )
         rows, projection_width = 4, 64
         packed = torch.randn(rows, 288, dtype=torch.bfloat16)
         projection_outputs = (
@@ -1239,6 +1247,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention.qk_rope_head_dim = 1
         attention._qkv_a_width = 6
         attention._gate_width = 4
+        attention.qkv_parallel = None
         attention.fused_qkv_a_proj_with_mqa = FakeProjection()
         attention.fused_qk_layernorm = FakeFusedNorm()
         attention.q_a_layernorm = FakeQueryNorm()
@@ -1283,6 +1292,7 @@ class KimiK3RegistrationTests(unittest.TestCase):
         attention = KimiLinearMLAAttention.__new__(KimiLinearMLAAttention)
         torch.nn.Module.__init__(attention)
 
+        attention.qkv_parallel = None
         self.assertFalse(attention.can_fuse_attnres_partials(torch.empty(1, 4), ()))
 
     def test_config_registry_maps_model_type(self):
