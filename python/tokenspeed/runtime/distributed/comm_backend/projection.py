@@ -119,6 +119,7 @@ class ProjectionWorkspace:
         self.gather_quant = None
         self.a2a = None
         self.reduction = None
+        self.fused_column = None
 
     def close(self) -> None:
         """Collectively release native resources and owned scratch references.
@@ -133,6 +134,9 @@ class ProjectionWorkspace:
         if self.spec.device.type == "cuda":
             torch.cuda.synchronize(self.spec.device)
         dist.barrier(group=pg_manager.get_device_process_group(self.spec.group))
+        if self.fused_column is not None:
+            self.fused_column.close()
+            self.fused_column = None
         self.a2a = None
         if self.gather is not None:
             self.gather.close()
@@ -307,6 +311,7 @@ class ProjectionBackend:
         spec: ProjectionSpec,
         use_lamport: bool,
         use_lamport_reduction: bool,
+        use_fused_projection: bool,
         scratch_pool: "WorkspacePool | None",
     ) -> ProjectionWorkspace:
         """Allocate and warm a workspace bound to this dispatcher's backend."""
@@ -314,17 +319,69 @@ class ProjectionBackend:
         if use_lamport:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                fused_tp4_projection_supported,
+            )
+
+            eligible = spec.kind == "column" and fused_tp4_projection_supported(
+                len(spec.group),
+                spec.input_size,
+                spec.output_size,
+                spec.max_tokens,
+                spec.dtype,
+                spec.device,
+            )
             hosts = [None] * len(spec.group)
             dist.all_gather_object(
                 hosts,
-                socket.gethostname(),
+                (socket.gethostname(), use_fused_projection, eligible),
                 group=pg_manager.get_process_group("gloo", spec.group),
             )
-            if len(set(hosts)) == 1:
+            if len({value[1] for value in hosts}) != 1:
+                raise ValueError("Fused projection setting differs across ranks")
+            if len({value[0] for value in hosts}) == 1:
                 self._prepare_lamport(workspace, use_lamport_reduction)
+                if use_fused_projection and all(value[2] for value in hosts):
+                    from tokenspeed_kernel.ops.communication.cute_dsl import (
+                        create_fused_tp4_projection_state,
+                    )
+
+                    workspace.fused_column = create_fused_tp4_projection_state(
+                        pg_manager.get_device_process_group(spec.group), spec.device
+                    )
 
         _warmup_projection(workspace)
         return workspace
+
+    def try_column(
+        self,
+        inputs: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        """Write the complete column projection when its prepared fusion applies."""
+        if (
+            workspace.fused_column is None
+            or owner_rows != (128, 128, 128, 128)
+            or weight_scales is None
+            or weight.dtype != torch.float8_e4m3fn
+            or weight_scales.dtype != torch.float32
+            or not weight.is_contiguous()
+            or not weight_scales.is_contiguous()
+        ):
+            return False
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            cute_dsl_fused_tp4_projection,
+        )
+
+        _check_workspace(128, workspace, self._fallback)
+        cute_dsl_fused_tp4_projection(
+            workspace.fused_column, inputs.contiguous(), weight, weight_scales, out
+        )
+        return True
 
     def _prepare_lamport(
         self, workspace: ProjectionWorkspace, use_reduction: bool

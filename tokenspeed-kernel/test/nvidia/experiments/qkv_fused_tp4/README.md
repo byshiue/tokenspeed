@@ -7,8 +7,9 @@ kernel per rank. It preserves caller-owned outputs and uses device-resident
 
 The selected and frozen baseline kernels live in
 [`thirdparty/cute_dsl/fused_tp4_projection`](../../../../python/tokenspeed_kernel/thirdparty/cute_dsl/fused_tp4_projection).
-They are experimental implementations, without runtime registration. The
-baseline retains its original zero-group quantization convention for timing
+The selected kernel also has an opt-in
+[registered runtime interface](../../../../python/tokenspeed_kernel/ops/communication/README.md).
+The baseline retains its original zero-group quantization convention for timing
 comparison; the selected kernel matches the aligned reference quantizer's
 epsilon clamp and the one-shot AllGather's signed-zero handling.
 

@@ -145,6 +145,28 @@ def prepare_projection_collectives(
     return backend.prepare_projection(spec, scratch_pool)
 
 
+def try_projection_column(
+    tensor: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scales: torch.Tensor | None,
+    owner_rows: tuple[int, ...],
+    out: torch.Tensor,
+    workspace: ProjectionWorkspace,
+    backend: CommBackend | None,
+) -> bool:
+    """Attempt a complete block-FP8 column projection into caller-owned out.
+
+    owner_rows contains physical counts in subgroup order, including graph
+    padding. None scales means the Linear's quantization format is unsupported.
+    False leaves out untouched and selects the ordinary AG/GEMM/A2A sequence.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.try_projection_column(
+        tensor, weight, weight_scales, owner_rows, out, workspace
+    )
+
+
 def projection_all_gather(
     tensor: torch.Tensor,
     rows: int,

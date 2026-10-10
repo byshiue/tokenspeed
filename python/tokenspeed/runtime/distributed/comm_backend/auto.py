@@ -48,7 +48,7 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     MAX_ONESHOT_BYTES,
     TrtllmAllReduceBackend,
 )
-from tokenspeed.runtime.utils.env import global_server_args_dict
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 
 def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -554,7 +554,22 @@ class AutoBackend(CommBackend):
             spec,
             use_lamport,
             use_lamport and not self._batch_invariant_collectives(),
+            envs.TOKENSPEED_FUSED_TP4_PROJECTION.get()
+            and not self._batch_invariant_collectives(),
             scratch_pool,
+        )
+
+    def try_projection_column(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: ProjectionWorkspace,
+    ) -> bool:
+        return self._projection.try_column(
+            tensor, weight, weight_scales, owner_rows, out, workspace
         )
 
     def projection_all_gather(

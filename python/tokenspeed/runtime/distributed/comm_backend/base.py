@@ -54,6 +54,18 @@ class CommBackend(ABC):
 
         return prepare_projection_workspace(spec, self, scratch_pool)
 
+    def try_projection_column(
+        self,
+        tensor: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> bool:
+        """Write a fused column projection, or return False for ordinary dispatch."""
+        return False
+
     def projection_all_gather(
         self,
         tensor: torch.Tensor,

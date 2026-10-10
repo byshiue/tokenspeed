@@ -221,6 +221,12 @@ another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 
+An optional complete projection kernel follows the same ownership contract:
+the backend prepares its shared communication storage, each Linear supplies
+its own weights, and the caller owns the final output. Selection uses all
+physical subgroup counts so every peer takes the same collective path.
+Unsupported shapes retain the ordinary projection operations.
+
 ### Padding contract
 
 `bs` is the request count being prepared (the padded graph batch under

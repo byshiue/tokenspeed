@@ -41,6 +41,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     projection_all_gather,
     projection_all_to_all,
     projection_reduce_scatter,
+    try_projection_column,
 )
 from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
 from tokenspeed.runtime.distributed.utils import divide, split_tensor_along_last_dim
@@ -1452,11 +1453,33 @@ class DPColumnParallelLinear(ColumnParallelLinear):
         rows = _projection_rows(inputs, ctx, self.parallel, self.projection_workspace)
         if rows == 0:
             return inputs.new_empty((0, self.logical_output_size)), None
+        output = inputs.new_empty((rows, self.output_size))
+        counts = (
+            ctx.collective_global_num_tokens
+            if ctx.collective_global_num_tokens is not None
+            else ctx.global_num_tokens
+        )
+        scales = (
+            self.weight_scale_inv
+            if isinstance(self.quant_method, Fp8LinearMethod)
+            and self.quant_method.block_quant
+            and tuple(self.quant_method.quant_config.weight_block_size) == (128, 128)
+            else None
+        )
+        if try_projection_column(
+            inputs,
+            self.weight,
+            scales,
+            tuple(counts[rank] for rank in self.tp_group),
+            output,
+            self.projection_workspace,
+            self.comm_backend,
+        ):
+            return output[:, : self.logical_output_size], None
         values, _ = projection_all_gather(
             inputs, rows, False, self.projection_workspace, self.comm_backend
         )
         local, _ = super().forward(values, block_scale=None, output_dtype=None)
-        output = inputs.new_empty((rows, self.output_size))
         output, _ = projection_all_to_all(
             local,
             rows,
