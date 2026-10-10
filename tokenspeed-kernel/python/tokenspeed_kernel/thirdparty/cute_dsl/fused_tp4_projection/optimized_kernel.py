@@ -54,9 +54,12 @@ input owner, once, after independent pipeline initialization. Quantization
 uses 64-bit BF16 loads and hardware warp-max reduction. Scale storage is
 released after register loads; the final partial-accumulator slot is released
 after its TMEM read completes and before the remaining FP32 arithmetic.
-64-column epilogue tiles use x64 TMEM transfers. Two scale stages and two
-output stages preserve all six A/B stages within shared-memory capacity.
-The accumulator and epilogue warp register budgets are 256 and 128.
+The accumulator loop uses four statically unrolled 32-column TMEM transfers;
+the epilogue retains 64-column transfers and releases TMEM after its last read.
+Two scale stages and two output stages preserve all six A/B stages within
+shared-memory capacity. Accumulator and epilogue register budgets remain 256
+and 128. Four lanes in CTA zero acquire the final peer acknowledgements;
+other warps can retire while stream ordering protects the next scratch reuse.
 
 The validated case is four node-local GB300 GPUs with 128 equal rows per
 rank, aligned widths and a fixed, fully resident grid on otherwise idle GPUs.
@@ -1525,7 +1528,7 @@ class FusedBlockwiseGemmKernel:
                 tCgC,
                 sSFA_view_as_C,
                 sSFB_view_as_C,
-                epi_tile,
+                (128, 32),
             )
 
             #
@@ -1637,13 +1640,15 @@ class FusedBlockwiseGemmKernel:
                     # Update accumulator by scale factor in subtiles
                     #
                     subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                    for subtile_idx in cutlass.range(subtile_cnt):
-                        #
-                        # Load accumulator from tensor memory buffer to register
-                        #
-                        tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                        cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-                        if subtile_idx == subtile_cnt - 1:
+                    # Static 32-column subtiles reduce live temporaries while
+                    # retaining all 128 final accumulator values per thread.
+                    for subtile_idx in cutlass.range_constexpr(subtile_cnt):
+                        cute.copy(
+                            tiled_copy_t2r,
+                            tTR_tAcc[(None, None, None, subtile_idx)],
+                            tTR_rAcc,
+                        )
+                        if cutlass.const_expr(subtile_idx == subtile_cnt - 1):
                             cute.arch.fence_view_async_tmem_load()
                             with cute.arch.elect_one():
                                 acc_pipeline.consumer_release(acc_consumer_state)
@@ -1876,6 +1881,10 @@ class FusedBlockwiseGemmKernel:
                     #
                     tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
                     cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+                    # Return the TMEM stage immediately after its last read.
+                    if subtile_idx == subtile_cnt - 1:
+                        cute.arch.fence_view_async_tmem_load()
+                        epi_pipeline.consumer_release(epi_consumer_state)
 
                     #
                     # Convert to C type
@@ -1939,7 +1948,6 @@ class FusedBlockwiseGemmKernel:
                 #
                 # Async arrive accumulator buffer empty
                 #
-                epi_pipeline.consumer_release(epi_consumer_state)
                 epi_consumer_state.advance()
 
                 #
@@ -2251,19 +2259,21 @@ class FusedBlockwiseGemmKernel:
                 cute.arch.store(ready.iterator, epoch, sem="release", scope="sys")
                 cute.arch.store(ack.iterator, epoch, sem="release", scope="sys")
             cute.arch.barrier()
-        for step in cutlass.range_constexpr(len(peer_ready)):
-            if tid == 0:
+        # Four lanes in CTA zero acquire the independent peer acknowledgements.
+        # Other warps may retire: stream order waits for these polling lanes.
+        if block == 0:
+            address = peer_ack[0].iterator
+            for step in cutlass.range_constexpr(len(peer_ack)):
+                if tid == step:
+                    address = peer_ack[step].iterator
+            if tid < len(peer_ack):
                 count = cute.arch.load(
-                    peer_ack[step].iterator, cutlass.Int64, sem="acquire", scope="sys"
+                    address, cutlass.Int64, sem="acquire", scope="sys"
                 )
                 while count < epoch:
                     count = cute.arch.load(
-                        peer_ack[step].iterator,
-                        cutlass.Int64,
-                        sem="acquire",
-                        scope="sys",
+                        address, cutlass.Int64, sem="acquire", scope="sys"
                     )
-            cute.arch.barrier()
 
     def acc_update_tmem_copy_and_partition(
         self,
@@ -2327,7 +2337,7 @@ class FusedBlockwiseGemmKernel:
             )
         else:
             tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(64)),
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
                 self.acc_dtype,
             )
         if cutlass.const_expr(self.mma_tiler[0] == 64):
@@ -2337,7 +2347,7 @@ class FusedBlockwiseGemmKernel:
             )
         else:
             tmem_store_atom = cute.make_copy_atom(
-                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(64)),
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)),
                 self.acc_dtype,
             )
 

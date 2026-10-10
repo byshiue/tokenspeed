@@ -25,15 +25,29 @@ with 152 SMs each.
   M-major scheduling keeps that owner unchanged across persistent tiles.
 - Release scale buffers after their values reach registers. Release each
   partial accumulator buffer after its last tensor-memory read completes,
-  before the remaining FP32 scaling and accumulation.
+  before the remaining FP32 scaling and accumulation. The epilogue also
+  releases its final accumulator buffer immediately after the last read.
 - Use 64-bit BF16 input loads, a hardware FP32 warp-max reduction, and
-  64-column tensor-memory transfers and epilogue subtiles.
+  statically unrolled 32-column accumulator transfers. The epilogue keeps
+  64-column transfers and subtiles.
 - Use two scale stages and two epilogue stages to retain six A/B stages.
   Accumulator, epilogue and producer register budgets are 256, 128 and 64.
+- Have four lanes in CTA zero acquire the independent final peer
+  acknowledgements concurrently. Other warps can retire once their copies
+  are published. The kernel remains active until those polling lanes finish,
+  so stream ordering prevents the next call from reusing scratch early.
 
 System publication fences, async-proxy fences and the final cross-rank
 consumption acknowledgement remain part of the protocol. Shared memory and
 tensor memory still limit the selected schedule to one CTA per SM.
+
+These changes follow two ideas in DeepGEMM's MegaMoE implementation:
+[restrict final NVLink synchronization to SM zero](https://github.com/deepseek-ai/DeepGEMM/blob/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/deep_gemm/include/deep_gemm/comm/barrier.cuh)
+and [release TMEM after its last read, before epilogue processing](https://github.com/deepseek-ai/DeepGEMM/blob/057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh).
+The projection keeps its existing FP32 scale arithmetic and caller-owned
+outputs. Register prefetch, remote completion notifications and wider output
+copies were also tested; the selected schedule retains the simpler unrolled
+accumulator loop and 128-bit output copies.
 
 ## Validation and timing
 
@@ -64,6 +78,9 @@ one of 16 changing-input graph replays, including zero groups, signed zeros,
 very small and large finite inputs, and repeated BF16 mantissas. It checks
 retained outputs, deliberate rank launch skew, epochs crossing 2^32 and one
 kernel per call on every rank. Keep result files and profiler traces local.
+An additional graph queues 32 calls with changing inputs and rank-dependent
+device delays, then replays three times and checks every retained output.
+This exercises scratch reuse without host synchronization between calls.
 
 Timing compares the frozen fused baseline, selected kernel and current TP1
 and TP4 runtime projections. Five alternating samples use 20 calls per graph
@@ -71,6 +88,9 @@ and ten graph replays per sample. Each sample takes the maximum across ranks;
 the report takes their median. Compilation, validation and profiling are
 outside these timing samples. This is projection validation, not end-to-end
 model accuracy or serving performance validation.
+For incremental optimization, snapshot the current selected kernel and pass
+that snapshot as `--baseline-kernel`; record both source hashes. The bundled
+baseline remains the older frozen schedule.
 
 ## Nsight Compute and IKET
 
@@ -124,3 +144,6 @@ GEMM roles together and compare the complete output tail. Independent phase
 medians do not add to a total median. Nsight sample fractions are not latency
 fractions, and long-scoreboard samples in synchronization helpers do not
 establish an HBM bandwidth bottleneck.
+With early retirement, most warps finish before CTA zero's polling warp.
+Compare that completion warp and each process's last exit as well as the
+all-warp summaries; median warp lifetime is not kernel latency.

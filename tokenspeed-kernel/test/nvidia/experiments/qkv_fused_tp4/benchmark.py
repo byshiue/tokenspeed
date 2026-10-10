@@ -211,6 +211,26 @@ def run_case(args, rank, world, device, models):
         saved = retained.clone()
         full()
         torch.testing.assert_close(retained, saved, rtol=0, atol=0)
+    # Queue changing inputs without host synchronization between calls. Rank-
+    # dependent device delays exercise early CTA retirement and scratch reuse;
+    # every output must survive all later calls in the graph.
+    queued_inputs = [torch.randn_like(x) for _ in range(4)]
+    queued_expected = [linear(value, ctx=ctx)[0].clone() for value in queued_inputs]
+    queued_outputs = [torch.empty_like(out) for _ in range(32)]
+    queued_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(queued_graph):
+        for index, tensor in enumerate(queued_outputs):
+            x.copy_(queued_inputs[index % len(queued_inputs)])
+            torch.cuda._sleep(25000 * ((index + rank) % world))
+            experiment(x, tensor)
+    for _ in range(3):
+        queued_graph.replay()
+    for index, tensor in enumerate(queued_outputs):
+        reference_output = queued_expected[index % len(queued_inputs)]
+        torch.testing.assert_close(
+            tensor[:, : reference_output.shape[1]], reference_output, rtol=0, atol=0
+        )
+    del queued_graph, queued_inputs, queued_expected, queued_outputs
     # Device-resident 64-bit epochs must keep working across the 32-bit boundary
     # without recapture or host-provided epoch arguments.
     # Restore the previous timing input so edge cases do not change the workload.
@@ -276,6 +296,9 @@ def run_case(args, rank, world, device, models):
         ],
         "retained_output_check": True,
         "rank_skew_check": True,
+        "queued_changing_input_calls": 32,
+        "queued_graph_replays": 3,
+        "device_rank_skew_check": True,
         "epoch_32bit_boundary_check": True,
         "epoch_after_benchmark": int(experiment.ready[0]),
         "used_epochs_agree": True,
