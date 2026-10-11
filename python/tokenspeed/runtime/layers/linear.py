@@ -1475,7 +1475,7 @@ class DPColumnParallelLinear(ColumnParallelLinear):
             self.projection_workspace,
             self.comm_backend,
         ):
-            return output[:, : self.logical_output_size], None
+            return output[: inputs.shape[0], : self.logical_output_size], None
         values, _ = projection_all_gather(
             inputs, rows, False, self.projection_workspace, self.comm_backend
         )

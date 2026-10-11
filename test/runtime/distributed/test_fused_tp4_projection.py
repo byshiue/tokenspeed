@@ -40,6 +40,10 @@ register_cuda_ci(est_time=120, suite="runtime-2gpu")
 
 @torch.no_grad()
 def _worker(rank, rendezvous, result_dir):
+    from tokenspeed_kernel.ops.communication.cute_dsl import (
+        cute_dsl_fused_tp4_projection,
+    )
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
     from tokenspeed_kernel.registry import KernelRegistry
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
@@ -101,7 +105,7 @@ def _worker(rank, rendezvous, result_dir):
                 torch.rand_like(linear.weight_scale_inv) * 0.005 + 0.005
             )
         with envs.TOKENSPEED_FUSED_TP4_PROJECTION.override(enabled):
-            prepare_dp_linear_communication(model, 256, torch.bfloat16, AutoBackend())
+            prepare_dp_linear_communication(model, 1024, torch.bfloat16, AutoBackend())
         models.append(model)
     baseline, candidate = models
     workspace = candidate[0].projection_workspace
@@ -123,7 +127,37 @@ def _worker(rank, rendezvous, result_dir):
             collective_global_num_tokens=physical,
         )
 
-    for counts in ([128] * 4, [127, 128, 1, 0], [129] * 4, [0] * 4):
+    for counts, fused in (
+        ([1] * 4, False),
+        ([16] * 4, False),
+        ([32] * 4, False),
+        ([33] * 4, False),
+        ([48] * 4, False),
+        ([63] * 4, False),
+        ([64] * 4, True),
+        ([65] * 4, False),
+        ([87] * 4, False),
+        ([88] * 4, True),
+        ([96] * 4, True),
+        ([127] * 4, True),
+        ([128] * 4, True),
+        ([32, 64, 128, 0], True),
+        ([127, 128, 1, 0], True),
+        ([129] * 4, True),
+        ([255] * 4, True),
+        ([256] * 4, True),
+        ([257] * 4, False),
+        ([383] * 4, False),
+        ([384] * 4, True),
+        ([512] * 4, True),
+        ([513] * 4, True),
+        ([640] * 4, True),
+        ([1024] * 4, True),
+        ([0, 0, 0, 65], False),
+        ([511, 256, 33, 0], True),
+        ([1, 0, 0, 0], False),
+        ([0] * 4, False),
+    ):
         torch.manual_seed(712 + rank)
         x = torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
         ctx = context(counts, counts)
@@ -132,19 +166,68 @@ def _worker(rank, rendezvous, result_dir):
             expected = left(x, ctx=ctx)[0]
             actual = right(x, ctx=ctx)[0]
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        assert int(state.ready[0]) - epoch == (2 if counts == [128] * 4 else 0)
+        assert int(state.ready[0]) - epoch == (2 if fused else 0)
+        if fused:
+            rows = max(counts)
+            bucket = max(32, 1 << (rows - 1).bit_length())
+            gathered, _ = baseline[0].comm_backend.projection_all_gather(
+                x, rows, False, baseline[0].projection_workspace
+            )
+            padded = gathered.new_zeros((4, bucket, 7168))
+            padded[:, :rows].copy_(gathered.view(4, rows, 7168))
+            values, scales = quantize_fp8(
+                padded.view(4 * bucket, 7168),
+                granularity="token_group",
+                group_size=128,
+                scale_encoding="float32",
+            )
+            torch.testing.assert_close(
+                state.a[: bucket * 4].view(torch.uint8),
+                values.view(torch.uint8),
+                rtol=0,
+                atol=0,
+            )
+            torch.testing.assert_close(state.sa[: bucket * 4], scales, rtol=0, atol=0)
 
     # Physical graph counts take precedence over smaller logical counts.
-    ctx = context([1] * 4, [128] * 4)
-    x = torch.randn((128, 7168), device=device, dtype=torch.bfloat16)
-    source = [torch.randn_like(x) for _ in range(3)]
-    source[0].zero_()
-    expected = [[layer(value, ctx=ctx)[0] for layer in baseline] for value in source]
+    graph_cases = (
+        ((32,) * 4, False, False),
+        ((33,) * 4, True, True),
+        ((48,) * 4, False, False),
+        ((64, 17, 0, 63), False, True),
+        ((88,) * 4, False, True),
+        ((96,) * 4, False, True),
+        ((127, 128, 1, 0), False, True),
+        ((129, 255, 128, 0), False, True),
+        ((257, 512, 33, 1), False, True),
+        ((513, 640, 0, 129), False, True),
+        ((32,) * 4, True, True),
+    )
+    contexts = {
+        counts: context([int(n > 0) for n in counts], list(counts))
+        for counts, _, _ in graph_cases
+    }
+    inputs = {
+        counts: torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
+        for counts in contexts
+    }
+    source = {
+        counts: [torch.randn_like(value) for _ in range(3)]
+        for counts, value in inputs.items()
+    }
+    expected = {}
+    for counts in contexts:
+        source[counts][0].zero_()
+        expected[counts] = [
+            [layer(value, ctx=contexts[counts])[0] for layer in baseline]
+            for value in source[counts]
+        ]
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        for layer in candidate:
-            layer(x, ctx=ctx)
+        for counts in contexts:
+            for layer in candidate:
+                layer(inputs[counts], ctx=contexts[counts])
     stream.synchronize()
     # Exercise device epoch width and successive layers without host joins.
     for flags in (state.ready, state.ack, state.input_flags):
@@ -152,20 +235,40 @@ def _worker(rank, rendezvous, result_dir):
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
+    # Interleave automatic 32-row fallback with padded and unequal fused calls.
+    # Explicit 32-row fusion remains available for kernel experiments.
+    calls = graph_cases * 6
     with torch.cuda.graph(graph, stream=stream):
         outputs = []
-        for index in range(12):
-            x.copy_(source[index % 3])
+        for index, (counts, native, _) in enumerate(calls):
+            repeat = index // len(graph_cases)
+            inputs[counts].copy_(source[counts][repeat % 3])
             torch.cuda._sleep(25000 * ((rank + index) % 4))
-            outputs.append(candidate[index % 2](x, ctx=ctx)[0])
+            layer = candidate[repeat % 2]
+            if native:
+                out = inputs[counts].new_empty((counts[rank], layer.output_size))
+                cute_dsl_fused_tp4_projection(
+                    state,
+                    inputs[counts],
+                    layer.weight,
+                    layer.weight_scale_inv,
+                    counts,
+                    out,
+                )
+                outputs.append(out[:, : layer.logical_output_size])
+            else:
+                outputs.append(layer(inputs[counts], ctx=contexts[counts])[0])
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
     for index, actual in enumerate(outputs):
+        counts, _, _ = calls[index]
+        repeat = index // len(graph_cases)
         torch.testing.assert_close(
-            actual, expected[index % 3][index % 2], rtol=0, atol=0
+            actual, expected[counts][repeat % 3][repeat % 2], rtol=0, atol=0
         )
-    assert int(state.ready[0]) > 2**32
+    fused_calls = sum(fused for _, _, fused in calls)
+    assert int(state.ready[0]) == 2**32 - 4 + 3 * fused_calls
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -180,13 +283,29 @@ def _worker(rank, rendezvous, result_dir):
     for model in models:
         release_dp_linear_communication(model)
     assert state.closed
-    torch.testing.assert_close(retained, expected[0][0], rtol=0, atol=0)
+    torch.testing.assert_close(retained, expected[(32,) * 4][0][0], rtol=0, atol=0)
     with envs.TOKENSPEED_FUSED_TP4_PROJECTION.override(True):
-        prepare_dp_linear_communication(candidate, 256, torch.bfloat16, AutoBackend())
-    assert candidate[0].projection_workspace.fused_column is not state
-    x.copy_(source[1])
+        prepare_dp_linear_communication(candidate, 32, torch.bfloat16, AutoBackend())
+    assert candidate[0].projection_workspace.fused_column is None
+    counts = (32,) * 4
+    inputs[counts].copy_(source[counts][1])
     torch.testing.assert_close(
-        candidate[1](x, ctx=ctx)[0], expected[1][1], rtol=0, atol=0
+        candidate[1](inputs[counts], ctx=contexts[counts])[0],
+        expected[counts][1][1],
+        rtol=0,
+        atol=0,
+    )
+    release_dp_linear_communication(candidate)
+    with envs.TOKENSPEED_FUSED_TP4_PROJECTION.override(True):
+        prepare_dp_linear_communication(candidate, 88, torch.bfloat16, AutoBackend())
+    assert candidate[0].projection_workspace.fused_column is not None
+    counts = (88,) * 4
+    inputs[counts].copy_(source[counts][2])
+    torch.testing.assert_close(
+        candidate[0](inputs[counts], ctx=contexts[counts])[0],
+        expected[counts][2][0],
+        rtol=0,
+        atol=0,
     )
     release_dp_linear_communication(candidate)
     dist.destroy_process_group()
@@ -218,7 +337,7 @@ def test_fused_projection_shape_gate():
         for size, k, n, rows, dtype in (
             (2, 7168, 49664, 128, torch.bfloat16),
             (4, 128, 49664, 128, torch.bfloat16),
-            (4, 7168, 49664, 127, torch.bfloat16),
+            (4, 7168, 49664, 0, torch.bfloat16),
             (4, 7168, 49664, 128, torch.float16),
         ):
             assert not fused_tp4_projection_supported(

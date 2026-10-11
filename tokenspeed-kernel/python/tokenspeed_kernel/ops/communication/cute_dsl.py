@@ -48,12 +48,14 @@ cute_dsl_fused_tp4_projection = error_fn
 def create_fused_tp4_projection_state(
     group: dist.ProcessGroup,
     device: torch.device,
+    max_rows: int,
 ) -> "FusedTP4ProjectionState":
     """Collectively allocate and compile a workspace before graph capture.
 
     Args:
         group: Four node-local eligible peers, in output-shard order.
         device: This peer's GB300 CUDA device.
+        max_rows: Maximum physical rows on any owner, used to prepare row buckets.
 
     Returns:
         Model-owned state; serialize calls and close after destroying graphs.
@@ -62,7 +64,7 @@ def create_fused_tp4_projection_state(
         FusedTP4ProjectionState,
     )
 
-    return FusedTP4ProjectionState(group, device)
+    return FusedTP4ProjectionState(group, device, max_rows)
 
 
 def fused_tp4_projection_supported(
@@ -79,7 +81,7 @@ def fused_tp4_projection_supported(
         group_size: Number of ranks in a node-local projection group.
         input_size: Full input channel count.
         output_size: Full padded output channel count.
-        max_rows: Prepared capacity per owner; calls require exactly 128 rows.
+        max_rows: Positive prepared capacity per owner.
         dtype: Unquantized activation/output dtype.
         device: Device owning the workspace.
 
@@ -91,7 +93,7 @@ def fused_tp4_projection_supported(
         current_platform().is_nvidia
         and device.type == "cuda"
         and (group_size, input_size, output_size) == (4, 7168, 49664)
-        and max_rows >= 128
+        and max_rows >= 1
         and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) == (10, 3)
         and torch.cuda.get_device_properties(device).multi_processor_count == 152
@@ -132,19 +134,22 @@ if current_platform().is_nvidia:
         inputs: torch.Tensor,
         weight: torch.Tensor,
         weight_scales: torch.Tensor,
+        owner_rows: tuple[int, ...],
         out: torch.Tensor,
     ) -> torch.Tensor:
         """Quantize/exchange owner inputs, multiply, and inverse-exchange outputs.
 
         Args:
             state: Collectively prepared workspace, shared only by serial calls.
-            inputs: Contiguous BF16 [128, 7168] owner activations on every rank.
+            inputs: Contiguous BF16 [R, 7168] containing this owner's actual rows.
             weight: Contiguous FP8 E4M3 [12416, 7168] local output-channel shard.
             weight_scales: Contiguous FP32 [97, 56] scales for 128x128 blocks.
-            out: Caller-owned contiguous BF16 [128, 49664] destination.
+            owner_rows: Physical row counts in group-rank order, identical on all
+                peers. Counts may differ or be zero; at least one must be positive.
+            out: Caller-owned contiguous BF16 [R, 49664] destination.
 
         Returns:
             out, valid across subsequent calls. All four peers must participate
             in the same order. Destroy referencing graphs before closing state.
         """
-        return state.run(inputs, weight, weight_scales, out)
+        return state.run(inputs, weight, weight_scales, owner_rows, out)

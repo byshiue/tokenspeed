@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Model-owned symmetric storage and precompiled fixed-shape projection."""
+"""Model-owned symmetric storage and precompiled projection row buckets."""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -38,15 +38,20 @@ class FusedTP4ProjectionState:
     Args:
         group: Four node-local GB300 ranks in output-shard order.
         device: This rank's CUDA device, with 152 SMs available to the grid.
+        max_rows: Maximum physical rows on any owner.
 
+    Power-of-two row buckets share storage and epochs and compile before use.
     Sequential layers share this storage, but supply their own weights to run.
     Concurrent models/streams require separate states. No layer weight or final
     output pointer is retained. Call close collectively after destroying graphs.
     """
 
-    def __init__(self, group: dist.ProcessGroup, device: torch.device) -> None:
+    def __init__(
+        self, group: dist.ProcessGroup, device: torch.device, max_rows: int
+    ) -> None:
         if (
             group.size() != 4
+            or max_rows < 1
             or torch.cuda.get_device_capability(device) != (10, 3)
             or torch.cuda.get_device_properties(device).multi_processor_count != 152
         ):
@@ -55,9 +60,15 @@ class FusedTP4ProjectionState:
         self.device = device
         self.rank = group.rank()
         self.closed = False
-        self.a = symm_mem.empty((512, 7168), dtype=torch.float8_e4m3fn, device=device)
-        self.sa = symm_mem.empty((512, 56), dtype=torch.float32, device=device)
-        self.receive = symm_mem.empty((128, 49664), dtype=torch.bfloat16, device=device)
+        self.max_rows = max_rows
+        capacity = max(32, 1 << (max_rows - 1).bit_length())
+        self.a = symm_mem.empty(
+            (capacity * 4, 7168), dtype=torch.float8_e4m3fn, device=device
+        )
+        self.sa = symm_mem.empty((capacity * 4, 56), dtype=torch.float32, device=device)
+        self.receive = symm_mem.empty(
+            (capacity, 49664), dtype=torch.bfloat16, device=device
+        )
         self.ready = symm_mem.empty((168,), dtype=torch.int64, device=device)
         self.ack = symm_mem.empty((168,), dtype=torch.int64, device=device)
         self.input_flags = symm_mem.empty((168,), dtype=torch.int64, device=device)
@@ -83,41 +94,56 @@ class FusedTP4ProjectionState:
             tuple(from_dlpack(t.unsqueeze(-1), assumed_align=16) for t in peers)
             for peers in self.peer_tensors[:2]
         )
-        self.peers = (
-            from_dlpack(self.receive.view(512, 12416, 1), assumed_align=16),
-            from_dlpack(self.receive.unsqueeze(-1), assumed_align=16),
-            *(
-                from_dlpack(
-                    t[:, self.rank * 12416 : (self.rank + 1) * 12416].unsqueeze(-1),
-                    assumed_align=16,
-                )
-                for t in self.peer_tensors[2]
-            ),
-        )
+        # Every bucket addresses the same allocations with its own logical
+        # row stride. Stream order and the final peer acknowledgements protect
+        # those views when consecutive calls use different row buckets.
+        self.row_views = {
+            rows: (
+                from_dlpack(self.a[: rows * 4].unsqueeze(-1), assumed_align=16),
+                from_dlpack(self.sa[: rows * 4].unsqueeze(-1), assumed_align=16),
+                (
+                    from_dlpack(
+                        self.receive[:rows].view(rows * 4, 12416, 1), assumed_align=16
+                    ),
+                    from_dlpack(self.receive[:rows].unsqueeze(-1), assumed_align=16),
+                    *(
+                        from_dlpack(
+                            t[
+                                :rows, self.rank * 12416 : (self.rank + 1) * 12416
+                            ].unsqueeze(-1),
+                            assumed_align=16,
+                        )
+                        for t in self.peer_tensors[2]
+                    ),
+                ),
+            )
+            for rows in (1 << exponent for exponent in range(5, capacity.bit_length()))
+        }
         self.peer_ready, self.peer_ack, self.peer_input_flags = (
             tuple(from_dlpack(t, assumed_align=16) for t in peers)
             for peers in self.peer_tensors[3:]
         )
-        self.a_cute = from_dlpack(self.a.unsqueeze(-1), assumed_align=16)
-        self.sa_cute = from_dlpack(self.sa.unsqueeze(-1), assumed_align=16)
         self.ready_cute = from_dlpack(self.ready, assumed_align=16)
         self.ack_cute = from_dlpack(self.ack, assumed_align=16)
         self.input_flags_cute = from_dlpack(self.input_flags, assumed_align=16)
-        inputs = torch.zeros((128, 7168), dtype=torch.bfloat16, device=device)
         weight = torch.zeros((12416, 7168), dtype=torch.float8_e4m3fn, device=device)
         scales = torch.ones((97, 56), dtype=torch.float32, device=device)
-        out = torch.empty_like(self.receive)
-        kernel = FusedBlockwiseGemmKernel(cutlass.Float32, False, (128, 128), (1, 1))
-        args = self._arguments(inputs, weight, scales, out)
-        self.compiled = cute.compile(
-            kernel, *args[:5], 152, *args[5:], lambda v: v, options="--opt-level=2"
-        )
         # A peer must finish zeroing its flags before another rank can publish.
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
-        # Exercise the compiled launch and mappings outside capture. Device epochs
-        # continue across warmup, eager calls, graph capture and graph replay.
-        self.run(inputs, weight, scales, out)
+        self.compiled = {}
+        for rows in self.row_views:
+            inputs = torch.zeros((rows, 7168), dtype=torch.bfloat16, device=device)
+            out = torch.empty((rows, 49664), dtype=torch.bfloat16, device=device)
+            kernel = FusedBlockwiseGemmKernel(
+                cutlass.Float32, False, (128, 128), (1, 1)
+            )
+            args = self._arguments(inputs, weight, scales, rows, out)
+            self.compiled[rows] = cute.compile(
+                kernel, *args[:5], 152, *args[5:], lambda v: v, options="--opt-level=2"
+            )
+            # Warm every supported bucket before capture; they share device epochs.
+            self.compiled[rows](*args)
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
 
@@ -126,23 +152,29 @@ class FusedTP4ProjectionState:
         inputs: torch.Tensor,
         weight: torch.Tensor,
         scales: torch.Tensor,
+        bucket: int,
         out: torch.Tensor,
     ) -> tuple:
+        a, sa, peers = self.row_views[bucket]
         return (
-            self.a_cute,
+            a,
             from_dlpack(weight.unsqueeze(-1), assumed_align=16),
-            self.peers[0],
-            self.sa_cute,
+            peers[0],
+            sa,
             from_dlpack(scales.unsqueeze(-1), assumed_align=16),
             cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream),
-            from_dlpack(out, assumed_align=16),
-            self.peers,
+            from_dlpack(out, assumed_align=16).mark_compact_shape_dynamic(
+                mode=0, stride_order=out.dim_order()
+            ),
+            peers,
             self.ready_cute,
             self.peer_ready,
             self.ack_cute,
             self.peer_ack,
             cutlass.Int32(self.rank),
-            from_dlpack(inputs, assumed_align=16),
+            from_dlpack(inputs, assumed_align=16).mark_compact_shape_dynamic(
+                mode=0, stride_order=inputs.dim_order()
+            ),
             self.input_peers,
             self.scale_peers,
             self.input_flags_cute,
@@ -154,16 +186,25 @@ class FusedTP4ProjectionState:
         inputs: torch.Tensor,
         weight: torch.Tensor,
         weight_scales: torch.Tensor,
+        owner_rows: tuple[int, ...],
         out: torch.Tensor,
     ) -> torch.Tensor:
         """Launch with this layer's tensors and return its owned destination."""
         if self.closed:
             raise RuntimeError("Fused TP4 projection workspace is closed")
+        if (
+            len(owner_rows) != 4
+            or min(owner_rows) < 0
+            or not 0 < max(owner_rows) <= self.max_rows
+        ):
+            raise ValueError("Fused TP4 projection counts exceed prepared capacity")
+        rows = owner_rows[self.rank]
+        bucket = max(32, 1 << (max(owner_rows) - 1).bit_length())
         for tensor, shape, dtype in (
-            (inputs, (128, 7168), torch.bfloat16),
+            (inputs, (rows, 7168), torch.bfloat16),
             (weight, (12416, 7168), torch.float8_e4m3fn),
             (weight_scales, (97, 56), torch.float32),
-            (out, (128, 49664), torch.bfloat16),
+            (out, (rows, 49664), torch.bfloat16),
         ):
             if (
                 tensor.shape != shape
@@ -173,7 +214,9 @@ class FusedTP4ProjectionState:
                 or tensor.data_ptr() % 16
             ):
                 raise ValueError("Incompatible fused TP4 projection tensor")
-        self.compiled(*self._arguments(inputs, weight, weight_scales, out))
+        self.compiled[bucket](
+            *self._arguments(inputs, weight, weight_scales, bucket, out)
+        )
         return out
 
     def close(self) -> None:
@@ -182,12 +225,11 @@ class FusedTP4ProjectionState:
             return
         torch.cuda.synchronize(self.device)
         dist.barrier(group=self.group)
-        self.compiled = None
-        self.input_peers = self.scale_peers = self.peers = ()
+        self.compiled = {}
+        self.row_views = {}
+        self.input_peers = self.scale_peers = ()
         self.peer_ready = self.peer_ack = self.peer_input_flags = ()
-        self.a_cute = self.sa_cute = self.ready_cute = self.ack_cute = (
-            self.input_flags_cute
-        ) = None
+        self.ready_cute = self.ack_cute = self.input_flags_cute = None
         self.peer_tensors = ()
         self.handles = []
         self.a = self.sa = self.receive = self.ready = self.ack = self.input_flags = (

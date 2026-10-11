@@ -38,6 +38,11 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
+# Minimum subgroup maximum for measured GB300 row buckets. Smaller batches
+# lose the fusion benefit to padding. Larger unmeasured buckets use 75% fill.
+_FUSED_MIN_ROWS_BY_BUCKET = {32: 33, 64: 64, 128: 88, 256: 129, 512: 384, 1024: 513}
+
+
 @dataclass(frozen=True)
 class ProjectionSpec:
     """Static layout and allocation bounds, identical on every subgroup peer.
@@ -323,13 +328,17 @@ class ProjectionBackend:
                 fused_tp4_projection_supported,
             )
 
-            eligible = spec.kind == "column" and fused_tp4_projection_supported(
-                len(spec.group),
-                spec.input_size,
-                spec.output_size,
-                spec.max_tokens,
-                spec.dtype,
-                spec.device,
+            eligible = (
+                spec.kind == "column"
+                and spec.max_tokens >= 64
+                and fused_tp4_projection_supported(
+                    len(spec.group),
+                    spec.input_size,
+                    spec.output_size,
+                    spec.max_tokens,
+                    spec.dtype,
+                    spec.device,
+                )
             )
             hosts = [None] * len(spec.group)
             dist.all_gather_object(
@@ -347,7 +356,9 @@ class ProjectionBackend:
                     )
 
                     workspace.fused_column = create_fused_tp4_projection_state(
-                        pg_manager.get_device_process_group(spec.group), spec.device
+                        pg_manager.get_device_process_group(spec.group),
+                        spec.device,
+                        spec.max_tokens,
                     )
 
         _warmup_projection(workspace)
@@ -363,9 +374,15 @@ class ProjectionBackend:
         workspace: ProjectionWorkspace,
     ) -> bool:
         """Write the complete column projection when its prepared fusion applies."""
+        # Use the subgroup maximum so unequal or empty owners take the same
+        # collective path. The native kernel supports every count; this gate
+        # keeps ordinary TP4 where its smaller GEMM is faster than padded fusion.
+        rows = max(owner_rows)
+        bucket = max(32, 1 << (rows - 1).bit_length())
+        minimum_rows = _FUSED_MIN_ROWS_BY_BUCKET.get(bucket, 3 * bucket // 4)
         if (
             workspace.fused_column is None
-            or owner_rows != (128, 128, 128, 128)
+            or rows < minimum_rows
             or weight_scales is None
             or weight.dtype != torch.float8_e4m3fn
             or weight_scales.dtype != torch.float32
@@ -377,9 +394,14 @@ class ProjectionBackend:
             cute_dsl_fused_tp4_projection,
         )
 
-        _check_workspace(128, workspace, self._fallback)
+        _check_workspace(rows, workspace, self._fallback)
         cute_dsl_fused_tp4_projection(
-            workspace.fused_column, inputs.contiguous(), weight, weight_scales, out
+            workspace.fused_column,
+            inputs.contiguous(),
+            weight,
+            weight_scales,
+            owner_rows,
+            out[: inputs.shape[0]],
         )
         return True
 

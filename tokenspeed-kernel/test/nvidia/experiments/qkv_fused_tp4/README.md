@@ -13,17 +13,28 @@ The baseline retains its original zero-group quantization convention for timing
 comparison; the selected kernel matches the aligned reference quantizer's
 epsilon clamp and the one-shot AllGather's signed-zero handling.
 
-The supported case is TP4 with equal 128-row owners, aligned widths, 128x128
-GEMM tiles and a fully resident grid on isolated node-local GB300 GPUs.
-Concurrent workspace use, uneven owners and arbitrary competing distributed
+The registered kernel supports TP4 with arbitrary or unequal owner rows within
+prepared capacity, aligned widths, 128x128 GEMM tiles and a fully resident grid
+on isolated node-local GB300 GPUs. The original candidate/profiling harness
+uses 128 rows. Concurrent workspace use and arbitrary competing distributed
 kernels are outside this experiment. The profile analysis expects four GPUs
 with 152 SMs each.
+
+Each call uses a common power-of-two row bucket covering the largest owner,
+with a minimum of 32. Input staging masks source loads and zero-fills row tails
+inside the kernel. The final copy returns only actual local rows. Empty owners
+still participate and compute their weight shard. Smaller buckets share GEMM
+tiles; larger buckets use several tiles per owner. Remote TMA stores and the
+final copy map those tiles to the corresponding owners and producer CTAs.
+Actual lengths are runtime parameters; only the finite row buckets specialize
+the precompiled kernels.
 
 ## Scheduling changes
 
 - Initialize independent GEMM pipelines before waiting for remote input.
-  Only the TMA and scale producers acquire their CTA's required input owner.
-  M-major scheduling keeps that owner unchanged across persistent tiles.
+  Only the TMA and scale producers acquire input owners. At up to 256 rows
+  per bucket, M-major scheduling keeps their owners unchanged across tiles.
+  Larger buckets acquire all owners once before entering the producer loop.
 - Release scale buffers after their values reach registers. Release each
   partial accumulator buffer after its last tensor-memory read completes,
   before the remaining FP32 scaling and accumulation. The epilogue also
@@ -92,6 +103,26 @@ model accuracy or serving performance validation.
 For incremental optimization, snapshot the current selected kernel and pass
 that snapshot as `--baseline-kernel`; record both source hashes. The bundled
 baseline remains the older frozen schedule.
+
+To compare explicit fusion and automatic dispatch with TP1 and unfused TP4, use:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node=4 \
+  "$QKV_TEST/benchmark_rows.py" --model "$QKV_CHECKPOINT" \
+  --owner-rows 32,32,32,32 64,64,64,64 96,96,96,96 127,128,1,0 129,255,128,0 \
+  --trace --output "$QKV_RESULTS/rows.json"
+```
+
+This checks exact BF16 outputs, FP8 values and scales on 16 inputs per row
+count tuple, including the edge cases above. Timing uses the same alternating
+CUDA-graph method. `fused_tp4` calls the registered kernel directly, including
+shapes where padding makes it slower. `auto_tp4` uses runtime dispatch.
+Traces verify the automatic choice and one kernel per explicit fused call
+on each GPU.
+`test/runtime/distributed/test_fused_tp4_projection.py` additionally alternates
+unfused calls with padded and unequal fused calls within one graph to check
+shared epochs and retained outputs. It also checks empty owners, tile and bucket
+boundaries, physical counts overriding logical counts, and release/reprepare.
 
 ## Nsight Compute and IKET
 

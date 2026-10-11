@@ -49,8 +49,9 @@ output tile into its row owner's symmetric receive buffer. A final local
 copy preserves ordinary caller-owned output tensors. Input publication and
 output consumption use 64-bit device epochs; no flag reset occurs on replay.
 
-Scheduling changes: the TMA and scale producers acquire only their CTA's
-input owner, once, after independent pipeline initialization. Quantization
+Scheduling changes: the TMA and scale producers acquire their required input
+owners once, after independent pipeline initialization. Buckets above 256 rows
+can change owners during scheduling and acquire all input owners. Quantization
 uses 64-bit BF16 loads and hardware warp-max reduction. Scale storage is
 released after register loads; the final partial-accumulator slot is released
 after its TMEM read completes and before the remaining FP32 arithmetic.
@@ -61,11 +62,12 @@ shared-memory capacity. Accumulator and epilogue register budgets remain 256
 and 128. Four lanes in CTA zero acquire the final peer acknowledgements;
 other warps can retire while stream ordering protects the next scratch reuse.
 
-The validated case is four node-local GB300 GPUs with 128 equal rows per
-rank, aligned widths and a fixed, fully resident grid on otherwise idle GPUs.
-The row-owner boundaries must align with 128-row GEMM tiles. This experiment
-is not registered in the runtime and does not support concurrent workspace
-use, arbitrary competing collectives, uneven owners or general shape tails.
+Four node-local GB300 GPUs use a common power-of-two row bucket, at least 32,
+aligned widths and a fixed, fully resident grid on idle GPUs. Input staging
+zero-fills each owner's row tail inside this kernel, and the final copy writes
+only that owner's actual rows. Empty owners still compute their weight shard
+and participate in every epoch. Remote stores split tiles at owner boundaries.
+Concurrent workspace use and arbitrary competing collectives are unsupported.
 """
 
 
@@ -479,14 +481,18 @@ class FusedBlockwiseGemmKernel:
 
         remote_atoms = ()
         remote_tensors = ()
+        # Keep the efficient 128-row TMEM transfer, then split shared memory
+        # at owner boundaries for remote stores.
+        remote_epi_tile = (min(peers[1].shape[0], 128), self.epi_tile[1])
+        remote_smem_layout = cute.composition(epi_smem_layout, remote_epi_tile)
         for peer in cutlass.range_constexpr(len(peer_ready)):
             remote = peers[peer + 2]
             remote_atom, remote_tensor = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
                 remote,
-                epi_smem_layout,
+                remote_smem_layout,
                 cute.composition(
-                    cute.make_identity_layout(remote.shape), self.epi_tile
+                    cute.make_identity_layout(remote.shape), remote_epi_tile
                 ),
             )
             remote_atoms = (*remote_atoms, remote_atom)
@@ -675,7 +681,13 @@ class FusedBlockwiseGemmKernel:
         GPU device kernel performing the Persistent batched GEMM computation.
         """
         self.stage_input(
-            input_source, input_peers, scale_peers, input_flags, peer_input_flags, rank
+            input_source,
+            peers[1].shape[0],
+            input_peers,
+            scale_peers,
+            input_flags,
+            peer_input_flags,
+            rank,
         )
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1078,8 +1090,10 @@ class FusedBlockwiseGemmKernel:
             is_valid_tile = cutlass.Boolean(1)
             is_valid_tile = tile_info[3] == 1
 
-            # M-major scheduling keeps this CTA on the same input owner.
-            self.await_input_owner(tile_info[0], input_flags, peer_input_flags, rank)
+            # Larger buckets can move this CTA between owners during the loop.
+            self.await_input_owner(
+                tile_info[0], peers[1].shape[0], input_flags, peer_input_flags, rank
+            )
 
             while is_valid_tile:
                 mma_tile_coord_mnl = (
@@ -1200,8 +1214,10 @@ class FusedBlockwiseGemmKernel:
             is_valid_tile = cutlass.Boolean(1)
             is_valid_tile = tile_info[3] == 1
 
-            # M-major scheduling keeps this CTA on the same input owner.
-            self.await_input_owner(tile_info[0], input_flags, peer_input_flags, rank)
+            # Larger buckets can move this CTA between owners during the loop.
+            self.await_input_owner(
+                tile_info[0], peers[1].shape[0], input_flags, peer_input_flags, rank
+            )
 
             while is_valid_tile:
                 #
@@ -1779,6 +1795,7 @@ class FusedBlockwiseGemmKernel:
             )
 
             remote_partitions = ()
+            remote_epi_tile = (min(peers[1].shape[0], 128), epi_tile[1])
             for peer in cutlass.range_constexpr(len(remote_atoms)):
                 remote_global = cute.local_tile(
                     remote_tensors[peer],
@@ -1788,7 +1805,7 @@ class FusedBlockwiseGemmKernel:
                 remote_tCgC = thr_mma.partition_C(remote_global)
                 remote_atom, remote_shared, remote_partition = (
                     self.epilog_gmem_copy_and_partition(
-                        epi_tidx, remote_atoms[peer], remote_tCgC, epi_tile, sC
+                        epi_tidx, remote_atoms[peer], remote_tCgC, remote_epi_tile, sC
                     )
                 )
                 remote_partitions = (*remote_partitions, remote_partition)
@@ -1914,32 +1931,30 @@ class FusedBlockwiseGemmKernel:
                     # TMA store C to global memory
                     #
                     if warp_idx == self.epilog_warp_id[0]:
-                        owner = (
-                            mma_tile_coord_mnl[0] * self.cta_tile_shape_mnk[0]
-                        ) // output.shape[0]
-                        local_m = mma_tile_coord_mnl[0] % (
-                            output.shape[0] // self.cta_tile_shape_mnk[0]
-                        )
-                        for peer in cutlass.range_constexpr(len(remote_atoms)):
-                            if owner == (rank + peer) % len(remote_atoms):
-                                remote_dest = remote_partitions[peer][
-                                    (
-                                        None,
-                                        None,
-                                        None,
-                                        local_m,
-                                        mma_tile_coord_mnl[1],
-                                        mma_tile_coord_mnl[2],
+                        owner_rows = peers[1].shape[0]
+                        owners_per_tile = max(1, 128 // owner_rows)
+                        for owner_slice in cutlass.range_constexpr(owners_per_tile):
+                            owner = (
+                                mma_tile_coord_mnl[0] * 128 // owner_rows + owner_slice
+                            )
+                            for peer in cutlass.range_constexpr(len(remote_atoms)):
+                                if owner == (rank + peer) % len(remote_atoms):
+                                    remote_dest = remote_partitions[peer][
+                                        (
+                                            None,
+                                            0,
+                                            subtile_idx,
+                                            mma_tile_coord_mnl[0]
+                                            % max(1, owner_rows // 128),
+                                            mma_tile_coord_mnl[1],
+                                            mma_tile_coord_mnl[2],
+                                        )
+                                    ]
+                                    cute.copy(
+                                        remote_atoms[peer],
+                                        remote_shared[(None, owner_slice, 0, c_buffer)],
+                                        remote_dest,
                                     )
-                                ]
-                                remote_dest = cute.group_modes(
-                                    remote_dest, 1, cute.rank(remote_dest)
-                                )
-                                cute.copy(
-                                    remote_atoms[peer],
-                                    bSG_sC[(None, c_buffer)],
-                                    remote_dest[(None, subtile_idx)],
-                                )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
                         c_pipeline.producer_acquire()
@@ -1995,6 +2010,7 @@ class FusedBlockwiseGemmKernel:
     def stage_input(
         self,
         source: cute.Tensor,
+        rows: cutlass.Constexpr,
         input_peers: tuple,
         scale_peers: tuple,
         flags: cute.Tensor,
@@ -2011,7 +2027,7 @@ class FusedBlockwiseGemmKernel:
         blocks = gx * gy * gz
         warp = tid // 32
         lane = tid % 32
-        rows, width = source.shape
+        valid_rows, width = source.shape
         groups_per_row = width // 128
         epoch = cute.arch.load(
             flags.iterator + 16 + block, cutlass.Int64, sem="acquire", scope="sys"
@@ -2037,12 +2053,17 @@ class FusedBlockwiseGemmKernel:
                 + cute.assume(row * width + k_group * 128 + lane * 4, divby=4),
                 cute.make_layout((4,), stride=(1,)),
             )
-            cute.copy(input_copy, input_tile, input_values)
+            input_values.fill(0)
+            if row < valid_rows:
+                cute.copy(input_copy, input_tile, input_values)
             values = input_values.load().to(cutlass.Float32)
-            # Match the reference one-shot AllGather's signed-zero handling
-            # before quantization; tiny negative nonzero inputs retain sign.
-            zeros = cute.zeros_like(values)
-            fragment.store(cute.where(values == zeros, zeros, values))
+            # The reference one-shot AllGather removes its BF16 -0 sentinel
+            # up to 128 rows. Larger NCCL gathers preserve source signed zeros.
+            if cutlass.const_expr(rows <= 128):
+                zeros = cute.zeros_like(values)
+                fragment.store(cute.where(values == zeros, zeros, values))
+            else:
+                fragment.store(values)
             amax = cutlass.Float32(0.0)
             for i in cutlass.range_constexpr(4):
                 value = fragment[i]
@@ -2097,7 +2118,8 @@ class FusedBlockwiseGemmKernel:
     @cute.jit
     def await_input_owner(
         self,
-        owner: cutlass.Int32,
+        tile_m: cutlass.Int32,
+        rows: cutlass.Constexpr,
         flags: cute.Tensor,
         peer_flags: tuple,
         rank: cutlass.Int32,
@@ -2109,9 +2131,17 @@ class FusedBlockwiseGemmKernel:
         epoch = cute.arch.load(
             flags.iterator + 16 + block, cutlass.Int64, sem="acquire", scope="sys"
         )
+        first_owner = tile_m * self.cta_tile_shape_mnk[0] // rows
+        owners_per_tile = max(1, self.cta_tile_shape_mnk[0] // rows)
+        # With more than eight M tiles, a 152-CTA scheduler can advance to
+        # another owner. Acquire every owner before this producer starts.
+        if cutlass.const_expr(rows > 256):
+            first_owner = cutlass.Int32(0)
+            owners_per_tile = len(peer_flags)
         if cute.arch.lane_idx() == 0:
             for peer in cutlass.range_constexpr(len(peer_flags)):
-                if owner == (rank + peer) % len(peer_flags):
+                owner = (rank + peer) % len(peer_flags)
+                if owner >= first_owner and owner < first_owner + owners_per_tile:
                     arrival = cute.arch.load(
                         peer_flags[peer].iterator,
                         cutlass.Int64,
@@ -2145,7 +2175,8 @@ class FusedBlockwiseGemmKernel:
         block = bx + gx * (by + gy * bz)
         blocks = gx * gy * gz
         width = output.shape[1]
-        rows = output.shape[0]
+        rows = peers[1].shape[0]
+        valid_rows = output.shape[0]
         epoch = cute.arch.load(
             ready.iterator + 16 + block, cutlass.Int64, sem="acquire", scope="sys"
         ) + cutlass.Int64(1)
@@ -2164,46 +2195,58 @@ class FusedBlockwiseGemmKernel:
             cute.nvgpu.CopyUniversalOp(), self.c_dtype, num_bits_per_copy=128
         )
         values = cute.make_rmem_tensor((8,), self.c_dtype)
-        # M is the contiguous scheduler coordinate and the fixed resident
-        # grid is divisible by TP4. A producer CTA owns one token owner for
-        # all of its persistent tiles. Copy each output tile when that CTA
-        # has drained its remote TMA stores, without joining unrelated CTAs.
-        assert rows == 128
+        # M is the contiguous scheduler coordinate. Each copy CTA handles a
+        # weight shard and strided N tiles. Smaller row buckets put multiple
+        # owners in one GEMM tile, so those N tiles can have different producer
+        # CTAs. Acquire each distinct producer before reading its output.
+        assert rows >= 32 and rows & (rows - 1) == 0
         world = len(peer_ready)
         shard_width = width // world
         n_tiles = shard_width // 128
         producer_groups = blocks // world
         producer = block // producer_groups
         first_column_tile = block % producer_groups
-        producer_block = rank + world * first_column_tile
-        for peer in cutlass.range_constexpr(len(peer_ready)):
-            if producer == (rank + peer) % world:
-                if tid == 0:
-                    count = cute.arch.load(
-                        peer_ready[peer].iterator + 16 + producer_block,
-                        cutlass.Int64,
-                        sem="acquire",
-                        scope="sys",
-                    )
-                    while count < epoch:
-                        count = cute.arch.load(
-                            peer_ready[peer].iterator + 16 + producer_block,
-                            cutlass.Int64,
-                            sem="acquire",
-                            scope="sys",
-                        )
-        cute.arch.barrier()
         tile_count = (
             n_tiles - first_column_tile + producer_groups - 1
         ) // producer_groups
-        vectors_per_tile = rows * 16
+        m_tiles = world * rows // self.cta_tile_shape_mnk[0]
+        # Column producer indices repeat after max(1, 128 / rows) steps.
+        # Owners larger than a GEMM tile also need each local M-tile producer.
+        for row_tile in cutlass.range_constexpr(max(1, rows // 128)):
+            if row_tile * 128 < valid_rows:
+                for step in cutlass.range_constexpr(max(1, 128 // rows)):
+                    if step < tile_count:
+                        column_tile = first_column_tile + step * producer_groups
+                        producer_block = (
+                            rank * rows // 128 + row_tile + m_tiles * column_tile
+                        ) % blocks
+                        for peer in cutlass.range_constexpr(len(peer_ready)):
+                            if producer == (rank + peer) % world:
+                                if tid == 0:
+                                    count = cute.arch.load(
+                                        peer_ready[peer].iterator + 16 + producer_block,
+                                        cutlass.Int64,
+                                        sem="acquire",
+                                        scope="sys",
+                                    )
+                                    while count < epoch:
+                                        count = cute.arch.load(
+                                            peer_ready[peer].iterator
+                                            + 16
+                                            + producer_block,
+                                            cutlass.Int64,
+                                            sem="acquire",
+                                            scope="sys",
+                                        )
+        cute.arch.barrier()
+        vectors_per_tile = valid_rows * 16
         total_vectors = vectors_per_tile * tile_count
         fragments = tuple(cute.make_rmem_tensor((8,), self.c_dtype) for _ in range(4))
         for base in cutlass.range(tid, total_vectors, self.threads_per_cta * 4):
             for item in cutlass.range_constexpr(4):
                 vector = base + item * self.threads_per_cta
                 if vector < total_vectors:
-                    row = (vector // 16) % rows
+                    row = (vector // 16) % valid_rows
                     column_tile = (
                         first_column_tile
                         + (vector // vectors_per_tile) * producer_groups
@@ -2219,7 +2262,7 @@ class FusedBlockwiseGemmKernel:
             for item in cutlass.range_constexpr(4):
                 vector = base + item * self.threads_per_cta
                 if vector < total_vectors:
-                    row = (vector // 16) % rows
+                    row = (vector // 16) % valid_rows
                     column_tile = (
                         first_column_tile
                         + (vector // vectors_per_tile) * producer_groups
@@ -2549,7 +2592,7 @@ class FusedBlockwiseGemmKernel:
             gC_mnl[((None, None), 0, 0, None, None, None)], epi_tile
         )
         tma_atom_c = atom
-        sC_for_tma_partition = cute.group_modes(sC, 0, 2)
+        sC_for_tma_partition = cute.group_modes(cute.flat_divide(sC, epi_tile), 0, 2)
         gC_for_tma_partition = cute.group_modes(gC_epi, 0, 2)
         # ((ATOM_V, REST_V), EPI_M, EPI_N)
         # ((ATOM_V, REST_V), EPI_M, EPI_N, loopM, loopN, loopL)
@@ -2696,9 +2739,9 @@ class FusedBlockwiseGemmKernel:
         tile_sched_params = utils.PersistentTileSchedulerParams(
             num_ctas_mnl, cluster_shape_mnl
         )
-        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
-            tile_sched_params, max_active_clusters
-        )
+        # Keep every flag slot's epoch advancing when row buckets alternate,
+        # including CTAs without a GEMM tile at 32 rows per owner.
+        grid = (1, 1, max_active_clusters)
 
         return tile_sched_params, grid
 
