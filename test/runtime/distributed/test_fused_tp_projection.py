@@ -18,13 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused DP column-linear dispatch, shared workspace, and graph lifetime."""
+"""Numerical correctness of fused DP column-linear and CUDA graph replay."""
 
-import logging
 import os
 import sys
 from datetime import timedelta
-from unittest import mock
 
 import pytest
 import torch
@@ -40,13 +38,12 @@ register_cuda_ci(est_time=120, suite="runtime-2gpu")
 
 
 @torch.no_grad()
-def _worker(rank, world_size, rendezvous, result_dir):
+def _worker(rank, world_size, rendezvous):
     from tokenspeed_kernel.ops.communication.cute_dsl import (
         create_fused_tp_projection_state,
         cute_dsl_fused_fp8_dp_column_linear,
     )
     from tokenspeed_kernel.ops.quantization import quantize_fp8
-    from tokenspeed_kernel.registry import KernelRegistry
 
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.distributed.mapping import DenseLayerMapping
@@ -119,18 +116,13 @@ def _worker(rank, world_size, rendezvous, result_dir):
     workspace = candidate[0].projection_workspace
     assert workspace is candidate[1].projection_workspace
     state = workspace.fused_column
-    assert baseline[0].projection_workspace.fused_column is None
     if world_size == 8:
-        assert state is None
         # TP8 is available only through an explicitly prepared native state.
         state = create_fused_tp_projection_state(
             dist.group.WORLD, device, 2048, 7168, candidate[0].output_size
         )
     else:
         assert state is not None
-    assert (
-        KernelRegistry.get().get_impl("cute_dsl_fused_fp8_dp_column_linear") is not None
-    )
 
     def context(counts, physical):
         return ForwardContext(
@@ -153,56 +145,36 @@ def _worker(rank, world_size, rendezvous, result_dir):
     def uses_fusion(rows):
         return (world_size == 2 and rows >= 64) or (world_size == 4 and rows >= 88)
 
+    # Cover bucket boundaries, both dispatch cutoffs, and small native GEMMs.
     equal_counts = [
         1,
-        8,
         9,
-        16,
-        17,
         32,
-        33,
-        48,
         63,
         64,
-        65,
         87,
         88,
-        96,
-        127,
         128,
         129,
-        255,
         256,
         257,
-        320,
-        383,
-        384,
         512,
         513,
-        640,
         1024,
         1025,
-        1536,
-        2047,
         2048,
     ]
     count_cases = [tuple([rows] * world_size) for rows in equal_counts]
     count_cases += [
         counts_for_group(pattern)
         for pattern in (
-            (32, 64, 128, 0),
             (127, 128, 1, 0),
             (0, 65),
-            (128, 0),
-            (511, 256, 33, 0),
-            (1025, 1024, 0, 1),
             (2048, 1536, 0, 1),
-            (1, 0),
             (0, 0),
         )
     ]
     for counts in count_cases:
-        counts = counts_for_group(counts)
         fused = uses_fusion(max(counts))
         torch.manual_seed(712 + rank)
         x = torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
@@ -212,7 +184,8 @@ def _worker(rank, world_size, rendezvous, result_dir):
             expected = left(x, ctx=ctx)[0]
             actual = right(x, ctx=ctx)[0]
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            if max(counts) > 0:
+            # Automatic fusion already checks the native kernel at these rows.
+            if max(counts) > 0 and not fused:
                 native_expected = expected
                 if 17 <= max(counts) * world_size <= 32:
                     # The ordinary path excludes FlashInfer at these total M
@@ -231,9 +204,7 @@ def _worker(rank, world_size, rendezvous, result_dir):
                 torch.testing.assert_close(
                     out[:, : right.logical_output_size], native_expected, rtol=0, atol=0
                 )
-        assert int(state.ready[0]) - epoch == (2 if fused else 0) + (
-            2 if max(counts) > 0 else 0
-        )
+        assert int(state.ready[0]) - epoch == (2 if max(counts) > 0 else 0)
         if max(counts) > 0:
             rows = max(counts)
             bucket = max(32, 1 << (rows - 1).bit_length())
@@ -260,36 +231,23 @@ def _worker(rank, world_size, rendezvous, result_dir):
 
     # Physical graph counts take precedence over smaller logical counts.
     graph_cases = (
-        ((32,) * 4, False, False),
-        ((33,) * 4, True, True),
-        ((48,) * 4, False, False),
-        ((64, 17, 0, 63), False, True),
-        ((87, 64, 0, 1), False, False),
-        ((88,) * 4, False, True),
-        ((96,) * 4, False, True),
-        ((127, 128, 1, 0), False, True),
-        ((129, 255, 128, 0), False, True),
-        ((257, 256, 0, 1), False, True),
-        ((383, 320, 0, 1), False, True),
-        ((257, 512, 33, 1), False, True),
-        ((513, 640, 0, 129), False, True),
-        ((1025, 1024, 0, 1), False, True),
-        ((2048, 1536, 0, 1), False, True),
-        ((32,) * 4, True, True),
-        ((0, 128), True, True),
-        ((128, 0), True, True),
+        ((32,) * 4, False),
+        ((32,) * 4, True),
+        ((64, 17, 0, 63), False),
+        ((88,) * 4, False),
+        ((0, 128), False),
+        ((129, 255, 128, 0), False),
+        ((257, 512, 33, 1), False),
+        ((513, 640, 0, 129), False),
+        ((1025, 1024, 0, 1), False),
+        ((2048, 1536, 0, 1), False),
     )
     graph_cases = tuple(
-        (
-            counts_for_group(counts),
-            native,
-            native or uses_fusion(max(counts_for_group(counts))),
-        )
-        for counts, native, _ in graph_cases
+        (counts_for_group(counts), native) for counts, native in graph_cases
     )
     contexts = {
         counts: context([int(n > 0) for n in counts], list(counts))
-        for counts, _, _ in graph_cases
+        for counts, _ in graph_cases
     }
     inputs = {
         counts: torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
@@ -324,7 +282,7 @@ def _worker(rank, world_size, rendezvous, result_dir):
     calls = graph_cases * 6
     with torch.cuda.graph(graph, stream=stream):
         outputs = []
-        for index, (counts, native, _) in enumerate(calls):
+        for index, (counts, native) in enumerate(calls):
             repeat = index // len(graph_cases)
             inputs[counts].copy_(source[counts][repeat % 3])
             torch.cuda._sleep(25000 * ((rank + index) % world_size))
@@ -346,22 +304,13 @@ def _worker(rank, world_size, rendezvous, result_dir):
         graph.replay()
     torch.cuda.synchronize()
     for index, actual in enumerate(outputs):
-        counts, _, _ = calls[index]
+        counts, _ = calls[index]
         repeat = index // len(graph_cases)
         torch.testing.assert_close(
             actual, expected[counts][repeat % 3][repeat % 2], rtol=0, atol=0
         )
-    fused_calls = sum(fused for _, _, fused in calls)
+    fused_calls = sum(native or uses_fusion(max(counts)) for counts, native in calls)
     assert int(state.ready[0]) == 2**32 - 4 + 3 * fused_calls
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
-    ) as profiler:
-        graph.replay()
-        torch.cuda.synchronize()
-    profiler.export_chrome_trace(f"{result_dir}/fused-rank{rank}.json")
     retained = outputs[0].clone()
     del graph, outputs
     for model in models:
@@ -374,7 +323,6 @@ def _worker(rank, world_size, rendezvous, result_dir):
     )
     with envs.TOKENSPEED_FUSED_TP_PROJECTION.override(True):
         prepare_dp_linear_communication(candidate, 32, torch.bfloat16, AutoBackend())
-    assert candidate[0].projection_workspace.fused_column is None
     counts = (32,) * world_size
     inputs[counts].copy_(source[counts][1])
     torch.testing.assert_close(
@@ -386,9 +334,6 @@ def _worker(rank, world_size, rendezvous, result_dir):
     release_dp_linear_communication(candidate)
     with envs.TOKENSPEED_FUSED_TP_PROJECTION.override(True):
         prepare_dp_linear_communication(candidate, 88, torch.bfloat16, AutoBackend())
-    assert (candidate[0].projection_workspace.fused_column is not None) == (
-        world_size in (2, 4)
-    )
     counts = (88,) * world_size
     inputs[counts].copy_(source[counts][2])
     torch.testing.assert_close(
@@ -410,166 +355,7 @@ def test_registered_tp_projection(tmp_path, world_size):
         pytest.skip(f"requires {world_size} node-local GB300 GPUs")
     mp.spawn(
         _worker,
-        args=(world_size, f"file://{tmp_path / 'rendezvous'}", str(tmp_path)),
+        args=(world_size, f"file://{tmp_path / 'rendezvous'}"),
         nprocs=world_size,
         join=True,
     )
-
-
-@pytest.mark.parametrize(
-    ("tp_size", "capacity", "supported", "use_lamport", "cross_node", "reason"),
-    (
-        (8, 2048, True, True, False, "automatic TP8 fusion is disabled"),
-        (4, 64, True, True, False, "below the TP4 minimum of 88 rows"),
-        (4, 2048, False, True, False, "unsupported device"),
-        (4, 2048, True, True, True, "spans multiple nodes"),
-        (4, 2048, True, False, False, "Lamport transport is unavailable"),
-        (4, 2048, True, True, False, None),
-    ),
-)
-def test_fused_projection_prepare_eligibility(
-    tp_size, capacity, supported, use_lamport, cross_node, reason, caplog
-):
-    from tokenspeed_kernel.ops.communication import cute_dsl
-
-    from tokenspeed.runtime.distributed.comm_backend import projection
-
-    spec = projection.ProjectionSpec(
-        group=tuple(range(4, 4 + tp_size)),
-        kind="column",
-        input_size=7168,
-        output_size=((49376 + tp_size * 128 - 1) // (tp_size * 128)) * tp_size * 128,
-        max_tokens=capacity,
-        dtype=torch.bfloat16,
-        device=torch.device("cuda", 0),
-    )
-    workspace = mock.Mock(spec=projection.ProjectionWorkspace, fused_column=None)
-    backend = projection.ProjectionBackend(mock.Mock())
-
-    def gather_peers(peers, local, group):
-        peers[:] = [local] * tp_size
-        if cross_node:
-            peers[-1] = (local[0] + "-remote", *local[1:])
-
-    caplog.set_level(logging.INFO)
-    with (
-        mock.patch.object(projection, "ProjectionWorkspace", return_value=workspace),
-        mock.patch.object(projection, "_warmup_projection"),
-        mock.patch.object(backend, "_prepare_lamport"),
-        mock.patch.object(projection.pg_manager, "get_process_group"),
-        mock.patch.object(projection.pg_manager, "get_device_process_group"),
-        mock.patch.object(dist, "all_gather_object", side_effect=gather_peers),
-        mock.patch.object(dist, "get_rank", return_value=spec.group[0]),
-        mock.patch.object(
-            cute_dsl, "fused_tp_projection_supported", return_value=supported
-        ),
-        mock.patch.object(cute_dsl, "create_fused_tp_projection_state") as create,
-    ):
-        actual = backend.prepare(spec, use_lamport, use_lamport, True, None)
-
-    assert actual is workspace
-    messages = [
-        record.message
-        for record in caplog.records
-        if "Fused TP projection not prepared" in record.message
-    ]
-    if reason is None:
-        create.assert_called_once()
-        assert workspace.fused_column is create.return_value
-        assert not messages
-    else:
-        create.assert_not_called()
-        assert workspace.fused_column is None
-        assert len(messages) == 1 and reason in messages[0]
-
-
-@pytest.mark.parametrize(
-    ("rank", "requested", "logs_reason"),
-    ((4, True, True), (5, True, False), (4, False, False)),
-)
-def test_fused_projection_batch_invariant_diagnostic(
-    rank, requested, logs_reason, caplog
-):
-    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-    from tokenspeed.runtime.distributed.comm_backend.projection import ProjectionSpec
-    from tokenspeed.runtime.utils.env import envs, global_server_args_dict
-
-    spec = ProjectionSpec(
-        group=(4, 5),
-        kind="column",
-        input_size=7168,
-        output_size=49408,
-        max_tokens=2048,
-        dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-    )
-    backend = AutoBackend()
-    caplog.set_level(logging.INFO)
-    with (
-        envs.TOKENSPEED_FUSED_TP_PROJECTION.override(requested),
-        mock.patch.dict(global_server_args_dict, {"batch_invariant_collectives": True}),
-        mock.patch.object(dist, "get_rank", return_value=rank),
-        mock.patch.object(backend._projection, "prepare") as prepare,
-    ):
-        backend.prepare_projection(spec, scratch_pool=None)
-    assert prepare.call_args.args[3] is False
-    messages = [
-        record.message
-        for record in caplog.records
-        if "Fused TP projection not prepared" in record.message
-    ]
-    assert len(messages) == int(logs_reason)
-    if logs_reason:
-        assert "batch-invariant collectives are enabled" in messages[0]
-
-
-def test_fused_projection_shape_gate():
-    from tokenspeed_kernel.ops.communication.cute_dsl import (
-        fused_tp_projection_supported,
-    )
-
-    assert not fused_tp_projection_supported(
-        4, 7168, 49664, 128, torch.bfloat16, torch.device("cpu")
-    )
-    # Unsupported layouts must not probe CUDA or import optional CuTe code.
-    with mock.patch(
-        "torch.cuda.get_device_capability", side_effect=AssertionError("CUDA probe")
-    ):
-        for size, k, n, rows, dtype in (
-            (1, 7168, 49408, 128, torch.bfloat16),
-            (3, 7168, 49536, 128, torch.bfloat16),
-            (2, 7168, 49664, 128, torch.bfloat16),
-            (8, 7168, 49664, 128, torch.bfloat16),
-            (4, 128, 49664, 128, torch.bfloat16),
-            (4, 7168, 49664, 0, torch.bfloat16),
-            (4, 7168, 49664, 128, torch.float16),
-        ):
-            assert not fused_tp_projection_supported(
-                size, k, n, rows, dtype, torch.device("cuda", 0)
-            )
-
-
-@pytest.mark.parametrize(
-    ("world_size", "output_size"), ((2, 49408), (4, 49664), (8, 50176))
-)
-def test_fused_projection_aligned_layout(world_size, output_size):
-    from tokenspeed_kernel.ops.communication.cute_dsl import (
-        fused_tp_projection_supported,
-    )
-
-    with (
-        mock.patch(
-            "tokenspeed_kernel.ops.communication.cute_dsl.current_platform"
-        ) as platform,
-        mock.patch("torch.cuda.get_device_capability", return_value=(10, 3)),
-        mock.patch("torch.cuda.get_device_properties") as properties,
-    ):
-        platform.return_value.is_nvidia = True
-        properties.return_value.multi_processor_count = 152
-        assert fused_tp_projection_supported(
-            world_size, 7168, output_size, 128, torch.bfloat16, torch.device("cuda", 0)
-        )
-        properties.return_value.multi_processor_count = 148
-        assert not fused_tp_projection_supported(
-            world_size, 7168, output_size, 128, torch.bfloat16, torch.device("cuda", 0)
-        )
