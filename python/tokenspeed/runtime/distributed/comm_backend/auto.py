@@ -559,7 +559,7 @@ class AutoBackend(CommBackend):
             scratch_pool,
         )
 
-    def try_projection_column(
+    def try_fused_dp_column_linear(
         self,
         tensor: torch.Tensor,
         weight: torch.Tensor,
@@ -568,7 +568,7 @@ class AutoBackend(CommBackend):
         out: torch.Tensor,
         workspace: ProjectionWorkspace,
     ) -> bool:
-        return self._projection.try_column(
+        return self._projection.try_fused_dp_column_linear(
             tensor, weight, weight_scales, owner_rows, out, workspace
         )
 

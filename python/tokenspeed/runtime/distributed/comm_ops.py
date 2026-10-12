@@ -145,7 +145,7 @@ def prepare_projection_collectives(
     return backend.prepare_projection(spec, scratch_pool)
 
 
-def try_projection_column(
+def try_fused_dp_column_linear(
     tensor: torch.Tensor,
     weight: torch.Tensor,
     weight_scales: torch.Tensor | None,
@@ -154,15 +154,29 @@ def try_projection_column(
     workspace: ProjectionWorkspace,
     backend: CommBackend | None,
 ) -> bool:
-    """Attempt a complete block-FP8 column projection into caller-owned out.
+    """Attempt a fused DP column-parallel linear operation on locally owned rows.
 
-    owner_rows contains physical counts in subgroup order, including graph
-    padding. None scales means the Linear's quantization format is unsupported.
-    False leaves out untouched and selects the ordinary AG/GEMM/A2A sequence.
+    Fuses input all-gather, quantization, GEMM, and inverse all-to-all so each
+    owner receives all output channels for its own input rows.
+
+    Args:
+        tensor: Full input channels for this owner's physical token rows.
+        weight: Local output-channel shard of the linear weight.
+        weight_scales: Block-FP8 weight scales, or None for unsupported formats.
+        owner_rows: Physical counts in subgroup order, including graph padding.
+        out: Caller-owned destination for this owner's complete output channels.
+        workspace: Collectively prepared scratch for this linear operation.
+        backend: Backend used to prepare the workspace; None selects the global
+            backend.
+
+    Returns:
+        True when the fused operation wrote out. False leaves out untouched so
+        the caller can run the ordinary all-gather, GEMM, and all-to-all path.
+        Invalid inputs and execution failures remain visible.
     """
     if backend is None:
         backend = get_global_backend()
-    return backend.try_projection_column(
+    return backend.try_fused_dp_column_linear(
         tensor, weight, weight_scales, owner_rows, out, workspace
     )
 

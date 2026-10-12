@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Prepared, fully resident TP2/4/8 block-FP8 column projection on GB300."""
+"""Fused block-FP8 DP column-parallel linear for TP2/4/8 groups on GB300."""
 
 from typing import TYPE_CHECKING
 
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
         FusedTPProjectionState,
     )
 
-cute_dsl_fused_tp_projection = error_fn
+cute_dsl_fused_fp8_dp_column_linear = error_fn
 
 
 def create_fused_tp_projection_state(
@@ -111,8 +111,8 @@ if current_platform().is_nvidia:
 
     @register_kernel(
         "communication",
-        "column_projection",
-        name="cute_dsl_fused_tp_projection",
+        "dp_column_linear",
+        name="cute_dsl_fused_fp8_dp_column_linear",
         solution="cute_dsl",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 3),
@@ -136,7 +136,7 @@ if current_platform().is_nvidia:
         },
         priority=Priority.SPECIALIZED,
     )
-    def cute_dsl_fused_tp_projection(
+    def cute_dsl_fused_fp8_dp_column_linear(
         state: "FusedTPProjectionState",
         inputs: torch.Tensor,
         weight: torch.Tensor,
@@ -144,7 +144,10 @@ if current_platform().is_nvidia:
         owner_rows: tuple[int, ...],
         out: torch.Tensor,
     ) -> torch.Tensor:
-        """Quantize/exchange owner inputs, multiply, and inverse-exchange outputs.
+        """Run fused block-FP8 DP column-parallel linear on locally owned rows.
+
+        Fuses input all-gather, quantization, GEMM, and inverse all-to-all in one
+        kernel per rank, returning every output channel to its token owner.
 
         Args:
             state: Collectively prepared workspace, shared only by serial calls.

@@ -225,12 +225,15 @@ An optional complete projection kernel follows the same ownership contract:
 the backend prepares its shared communication storage, each Linear supplies
 its own weights, and the caller owns the final output. Selection uses all
 physical subgroup counts so every peer takes the same collective path.
-Unsupported shapes retain the ordinary projection operations.
+`try_fused_dp_column_linear` returns true after writing the complete local output,
+or false without modifying it so the caller can use the ordinary projection
+operations.
 The fused column projection specializes its prepared state by TP size and padded
 channel widths; actual owner counts remain runtime data within warmed row buckets.
 Its peer-memory transport requires a node-local group. Cross-node groups retain
-the ordinary collectives, and automatic selection uses measurements for that TP
-size rather than inheriting another group's row thresholds.
+the ordinary collectives. Automatic fusion uses one TP-specific minimum for the
+maximum physical owner count. Row buckets select the prepared kernel variant
+independently of that threshold.
 
 ### Padding contract
 

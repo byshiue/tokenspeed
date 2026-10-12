@@ -38,13 +38,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
-# Minimum subgroup maximum for measured GB300 row buckets, by TP size.
-# Unmeasured TP sizes keep ordinary dispatch; direct kernel calls remain available.
-# Larger buckets of measured TP sizes require at least 75% fill.
-_FUSED_MIN_ROWS_BY_TP_AND_BUCKET = {
-    2: {32: 33, 64: 64, 128: 65, 256: 129, 512: 384, 1024: 513},
-    4: {32: 33, 64: 64, 128: 88, 256: 129, 512: 384, 1024: 513},
-}
+# Minimum physical subgroup maximum for automatic fusion, independent of bucket.
+# Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
+_FUSED_MIN_ROWS_BY_TP = {2: 64, 4: 88}
 
 
 @dataclass(frozen=True)
@@ -370,7 +366,7 @@ class ProjectionBackend:
         _warmup_projection(workspace)
         return workspace
 
-    def try_column(
+    def try_fused_dp_column_linear(
         self,
         inputs: torch.Tensor,
         weight: torch.Tensor,
@@ -379,16 +375,13 @@ class ProjectionBackend:
         out: torch.Tensor,
         workspace: ProjectionWorkspace,
     ) -> bool:
-        """Write the complete column projection when its prepared fusion applies."""
+        """Run fused DP column-linear, or leave out untouched and return False."""
         # Use the subgroup maximum so unequal or empty owners take the same
-        # collective path. The native kernel supports every count; this gate
-        # keeps ordinary TP where its smaller GEMM is faster than padded fusion.
+        # collective path. Each TP size uses one cutoff across all row buckets.
         rows = max(owner_rows)
-        bucket = max(32, 1 << (rows - 1).bit_length())
-        thresholds = _FUSED_MIN_ROWS_BY_TP_AND_BUCKET.get(len(owner_rows))
-        if thresholds is None:
+        minimum_rows = _FUSED_MIN_ROWS_BY_TP.get(len(owner_rows))
+        if minimum_rows is None:
             return False
-        minimum_rows = thresholds.get(bucket, 3 * bucket // 4)
         if (
             workspace.fused_column is None
             or rows < minimum_rows
@@ -400,11 +393,11 @@ class ProjectionBackend:
         ):
             return False
         from tokenspeed_kernel.ops.communication.cute_dsl import (
-            cute_dsl_fused_tp_projection,
+            cute_dsl_fused_fp8_dp_column_linear,
         )
 
         _check_workspace(rows, workspace, self._fallback)
-        cute_dsl_fused_tp_projection(
+        cute_dsl_fused_fp8_dp_column_linear(
             workspace.fused_column,
             inputs.contiguous(),
             weight,

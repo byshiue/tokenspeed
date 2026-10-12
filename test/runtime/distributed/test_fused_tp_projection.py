@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registered projection dispatch, shared weights/workspace and graph lifetime."""
+"""Fused DP column-linear dispatch, shared workspace, and graph lifetime."""
 
 import os
 import sys
@@ -41,7 +41,7 @@ register_cuda_ci(est_time=120, suite="runtime-2gpu")
 @torch.no_grad()
 def _worker(rank, world_size, rendezvous, result_dir):
     from tokenspeed_kernel.ops.communication.cute_dsl import (
-        cute_dsl_fused_tp_projection,
+        cute_dsl_fused_fp8_dp_column_linear,
     )
     from tokenspeed_kernel.ops.quantization import quantize_fp8
     from tokenspeed_kernel.registry import KernelRegistry
@@ -118,7 +118,9 @@ def _worker(rank, world_size, rendezvous, result_dir):
     assert workspace is candidate[1].projection_workspace
     state = workspace.fused_column
     assert state is not None and baseline[0].projection_workspace.fused_column is None
-    assert KernelRegistry.get().get_impl("cute_dsl_fused_tp_projection") is not None
+    assert (
+        KernelRegistry.get().get_impl("cute_dsl_fused_fp8_dp_column_linear") is not None
+    )
 
     def context(counts, physical):
         return ForwardContext(
@@ -139,11 +141,7 @@ def _worker(rank, world_size, rendezvous, result_dir):
         ]
 
     def uses_fusion(rows):
-        if world_size == 2:
-            return 64 <= rows <= 256 or 384 <= rows <= 1024
-        return world_size == 4 and (
-            rows == 64 or 88 <= rows <= 256 or 384 <= rows <= 1024
-        )
+        return (world_size == 2 and rows >= 64) or (world_size == 4 and rows >= 88)
 
     equal_counts = [
         1,
@@ -166,6 +164,7 @@ def _worker(rank, world_size, rendezvous, result_dir):
         255,
         256,
         257,
+        320,
         383,
         384,
         512,
@@ -210,7 +209,7 @@ def _worker(rank, world_size, rendezvous, result_dir):
                         padded_inputs, ctx=context(padded_counts, padded_counts)
                     )[0][: x.shape[0]]
                 out = x.new_empty((counts[rank], right.output_size))
-                cute_dsl_fused_tp_projection(
+                cute_dsl_fused_fp8_dp_column_linear(
                     state, x, right.weight, right.weight_scale_inv, counts, out
                 )
                 torch.testing.assert_close(
@@ -249,10 +248,13 @@ def _worker(rank, world_size, rendezvous, result_dir):
         ((33,) * 4, True, True),
         ((48,) * 4, False, False),
         ((64, 17, 0, 63), False, True),
+        ((87, 64, 0, 1), False, False),
         ((88,) * 4, False, True),
         ((96,) * 4, False, True),
         ((127, 128, 1, 0), False, True),
         ((129, 255, 128, 0), False, True),
+        ((257, 256, 0, 1), False, True),
+        ((383, 320, 0, 1), False, True),
         ((257, 512, 33, 1), False, True),
         ((513, 640, 0, 129), False, True),
         ((32,) * 4, True, True),
@@ -311,7 +313,7 @@ def _worker(rank, world_size, rendezvous, result_dir):
             layer = candidate[repeat % 2]
             if native:
                 out = inputs[counts].new_empty((counts[rank], layer.output_size))
-                cute_dsl_fused_tp_projection(
+                cute_dsl_fused_fp8_dp_column_linear(
                     state,
                     inputs[counts],
                     layer.weight,
