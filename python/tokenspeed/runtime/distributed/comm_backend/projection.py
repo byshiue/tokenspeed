@@ -20,6 +20,7 @@
 
 """Projection collective dispatch with separately owned persistent workspaces."""
 
+import logging
 import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -41,6 +42,8 @@ if TYPE_CHECKING:
 # Minimum physical subgroup maximum for automatic fusion, independent of bucket.
 # Other TP sizes keep ordinary dispatch; direct kernel calls remain available.
 _FUSED_MIN_ROWS_BY_TP = {2: 64, 4: 88}
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -321,6 +324,9 @@ class ProjectionBackend:
     ) -> ProjectionWorkspace:
         """Allocate and warm a workspace bound to this dispatcher's backend."""
         workspace = ProjectionWorkspace(spec, self._fallback, scratch_pool)
+        fused_disabled_reason = (
+            "Lamport transport is unavailable for this device, dtype, or routing policy"
+        )
         if use_lamport:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.
@@ -328,22 +334,39 @@ class ProjectionBackend:
                 fused_tp_projection_supported,
             )
 
-            eligible = (
-                spec.kind == "column"
-                and spec.max_tokens >= 64
-                and fused_tp_projection_supported(
-                    len(spec.group),
-                    spec.input_size,
-                    spec.output_size,
-                    spec.max_tokens,
-                    spec.dtype,
-                    spec.device,
+            minimum_rows = _FUSED_MIN_ROWS_BY_TP.get(len(spec.group))
+            if spec.kind != "column":
+                fused_disabled_reason = "only column projections support fusion"
+            elif minimum_rows is None:
+                fused_disabled_reason = (
+                    f"automatic TP{len(spec.group)} fusion is disabled"
                 )
-            )
+            elif spec.max_tokens < minimum_rows:
+                fused_disabled_reason = (
+                    f"prepared capacity {spec.max_tokens} is below the "
+                    f"TP{len(spec.group)} minimum of {minimum_rows} rows"
+                )
+            elif not fused_tp_projection_supported(
+                len(spec.group),
+                spec.input_size,
+                spec.output_size,
+                spec.max_tokens,
+                spec.dtype,
+                spec.device,
+            ):
+                fused_disabled_reason = (
+                    "unsupported device, activation dtype, or projection dimensions"
+                )
+            else:
+                fused_disabled_reason = None
             hosts = [None] * len(spec.group)
             dist.all_gather_object(
                 hosts,
-                (socket.gethostname(), use_fused_projection, eligible),
+                (
+                    socket.gethostname(),
+                    use_fused_projection,
+                    fused_disabled_reason is None,
+                ),
                 group=pg_manager.get_process_group("gloo", spec.group),
             )
             if len({value[1] for value in hosts}) != 1:
@@ -362,6 +385,20 @@ class ProjectionBackend:
                         spec.input_size,
                         spec.output_size,
                     )
+                elif fused_disabled_reason is None:
+                    fused_disabled_reason = "one or more peers cannot prepare fusion"
+            else:
+                fused_disabled_reason = "the projection group spans multiple nodes"
+
+        if (
+            use_fused_projection
+            and workspace.fused_column is None
+            and dist.get_rank() == spec.group[0]
+        ):
+            logger.info(
+                f"Fused TP projection not prepared for group {spec.group}: "
+                f"{fused_disabled_reason}; using ordinary projection"
+            )
 
         _warmup_projection(workspace)
         return workspace

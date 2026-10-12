@@ -27,6 +27,7 @@ implementation serves a collective; every public method asks it first.
 """
 
 import enum
+import logging
 
 import torch
 from tokenspeed_kernel.platform import current_platform
@@ -49,6 +50,8 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+
+logger = logging.getLogger(__name__)
 
 
 def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
@@ -550,12 +553,22 @@ class AutoBackend(CommBackend):
             and spec.dtype == torch.bfloat16
             and not self._force_deterministic_rsag()
         )
+        use_fused_projection = envs.TOKENSPEED_FUSED_TP_PROJECTION.get()
+        batch_invariant = self._batch_invariant_collectives()
+        if (
+            use_fused_projection
+            and batch_invariant
+            and torch.distributed.get_rank() == spec.group[0]
+        ):
+            logger.info(
+                f"Fused TP projection not prepared for group {spec.group}: "
+                "batch-invariant collectives are enabled; using ordinary projection"
+            )
         return self._projection.prepare(
             spec,
             use_lamport,
-            use_lamport and not self._batch_invariant_collectives(),
-            envs.TOKENSPEED_FUSED_TP_PROJECTION.get()
-            and not self._batch_invariant_collectives(),
+            use_lamport and not batch_invariant,
+            use_fused_projection and not batch_invariant,
             scratch_pool,
         )
 
