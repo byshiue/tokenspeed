@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Prepared, fully resident TP4 block-FP8 column projection on GB300."""
+"""Prepared, fully resident TP2/4/8 block-FP8 column projection on GB300."""
 
 from typing import TYPE_CHECKING
 
@@ -38,36 +38,40 @@ from tokenspeed_kernel.signature import (
 )
 
 if TYPE_CHECKING:
-    from tokenspeed_kernel.thirdparty.cute_dsl.fused_tp4_projection.workspace import (
-        FusedTP4ProjectionState,
+    from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection import (
+        FusedTPProjectionState,
     )
 
-cute_dsl_fused_tp4_projection = error_fn
+cute_dsl_fused_tp_projection = error_fn
 
 
-def create_fused_tp4_projection_state(
+def create_fused_tp_projection_state(
     group: dist.ProcessGroup,
     device: torch.device,
     max_rows: int,
-) -> "FusedTP4ProjectionState":
+    input_size: int,
+    output_size: int,
+) -> "FusedTPProjectionState":
     """Collectively allocate and compile a workspace before graph capture.
 
     Args:
-        group: Four node-local eligible peers, in output-shard order.
+        group: Two, four, or eight node-local peers, in output-shard order.
         device: This peer's GB300 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
+        input_size: Full input width, divisible by 128.
+        output_size: Padded output width, divisible by group size times 128.
 
     Returns:
         Model-owned state; serialize calls and close after destroying graphs.
     """
-    from tokenspeed_kernel.thirdparty.cute_dsl.fused_tp4_projection.workspace import (
-        FusedTP4ProjectionState,
+    from tokenspeed_kernel.ops.communication._cute_dsl.fused_tp_projection import (
+        FusedTPProjectionState,
     )
 
-    return FusedTP4ProjectionState(group, device, max_rows)
+    return FusedTPProjectionState(group, device, max_rows, input_size, output_size)
 
 
-def fused_tp4_projection_supported(
+def fused_tp_projection_supported(
     group_size: int,
     input_size: int,
     output_size: int,
@@ -75,7 +79,7 @@ def fused_tp4_projection_supported(
     dtype: torch.dtype,
     device: torch.device,
 ) -> bool:
-    """Return whether the static layout and device match the validated schedule.
+    """Return whether the static layout and device match the kernel constraints.
 
     Args:
         group_size: Number of ranks in a node-local projection group.
@@ -92,7 +96,10 @@ def fused_tp4_projection_supported(
     return (
         current_platform().is_nvidia
         and device.type == "cuda"
-        and (group_size, input_size, output_size) == (4, 7168, 49664)
+        and group_size in (2, 4, 8)
+        and input_size == 7168
+        and output_size
+        == ((49376 + group_size * 128 - 1) // (group_size * 128)) * group_size * 128
         and max_rows >= 1
         and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) == (10, 3)
@@ -105,7 +112,7 @@ if current_platform().is_nvidia:
     @register_kernel(
         "communication",
         "column_projection",
-        name="cute_dsl_fused_tp4_projection",
+        name="cute_dsl_fused_tp_projection",
         solution="cute_dsl",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(10, 3),
@@ -129,8 +136,8 @@ if current_platform().is_nvidia:
         },
         priority=Priority.SPECIALIZED,
     )
-    def cute_dsl_fused_tp4_projection(
-        state: "FusedTP4ProjectionState",
+    def cute_dsl_fused_tp_projection(
+        state: "FusedTPProjectionState",
         inputs: torch.Tensor,
         weight: torch.Tensor,
         weight_scales: torch.Tensor,
@@ -141,15 +148,16 @@ if current_platform().is_nvidia:
 
         Args:
             state: Collectively prepared workspace, shared only by serial calls.
-            inputs: Contiguous BF16 [R, 7168] containing this owner's actual rows.
-            weight: Contiguous FP8 E4M3 [12416, 7168] local output-channel shard.
-            weight_scales: Contiguous FP32 [97, 56] scales for 128x128 blocks.
+            inputs: Contiguous BF16 [R, K] containing this owner's actual rows.
+            weight: Contiguous FP8 E4M3 [N/P, K] local output-channel shard,
+                where P is the prepared group size and N the padded output width.
+            weight_scales: Contiguous FP32 [N/(P*128), K/128] block scales.
             owner_rows: Physical row counts in group-rank order, identical on all
                 peers. Counts may differ or be zero; at least one must be positive.
-            out: Caller-owned contiguous BF16 [R, 49664] destination.
+            out: Caller-owned contiguous BF16 [R, N] destination.
 
         Returns:
-            out, valid across subsequent calls. All four peers must participate
+            out, valid across subsequent calls. All peers must participate
             in the same order. Destroy referencing graphs before closing state.
         """
         return state.run(inputs, weight, weight_scales, owner_rows, out)

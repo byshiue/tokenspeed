@@ -554,7 +554,7 @@ class AutoBackend(CommBackend):
             spec,
             use_lamport,
             use_lamport and not self._batch_invariant_collectives(),
-            envs.TOKENSPEED_FUSED_TP4_PROJECTION.get()
+            envs.TOKENSPEED_FUSED_TP_PROJECTION.get()
             and not self._batch_invariant_collectives(),
             scratch_pool,
         )

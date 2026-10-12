@@ -38,9 +38,13 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.workspace import WorkspacePool
 
 
-# Minimum subgroup maximum for measured GB300 row buckets. Smaller batches
-# lose the fusion benefit to padding. Larger unmeasured buckets use 75% fill.
-_FUSED_MIN_ROWS_BY_BUCKET = {32: 33, 64: 64, 128: 88, 256: 129, 512: 384, 1024: 513}
+# Minimum subgroup maximum for measured GB300 row buckets, by TP size.
+# Unmeasured TP sizes keep ordinary dispatch; direct kernel calls remain available.
+# Larger buckets of measured TP sizes require at least 75% fill.
+_FUSED_MIN_ROWS_BY_TP_AND_BUCKET = {
+    2: {32: 33, 64: 64, 128: 65, 256: 129, 512: 384, 1024: 513},
+    4: {32: 33, 64: 64, 128: 88, 256: 129, 512: 384, 1024: 513},
+}
 
 
 @dataclass(frozen=True)
@@ -325,13 +329,13 @@ class ProjectionBackend:
             # CUDA IPC requires a node-local group. Agree on topology before
             # any rank attempts collective native allocation.
             from tokenspeed_kernel.ops.communication.cute_dsl import (
-                fused_tp4_projection_supported,
+                fused_tp_projection_supported,
             )
 
             eligible = (
                 spec.kind == "column"
                 and spec.max_tokens >= 64
-                and fused_tp4_projection_supported(
+                and fused_tp_projection_supported(
                     len(spec.group),
                     spec.input_size,
                     spec.output_size,
@@ -352,13 +356,15 @@ class ProjectionBackend:
                 self._prepare_lamport(workspace, use_lamport_reduction)
                 if use_fused_projection and all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
-                        create_fused_tp4_projection_state,
+                        create_fused_tp_projection_state,
                     )
 
-                    workspace.fused_column = create_fused_tp4_projection_state(
+                    workspace.fused_column = create_fused_tp_projection_state(
                         pg_manager.get_device_process_group(spec.group),
                         spec.device,
                         spec.max_tokens,
+                        spec.input_size,
+                        spec.output_size,
                     )
 
         _warmup_projection(workspace)
@@ -376,10 +382,13 @@ class ProjectionBackend:
         """Write the complete column projection when its prepared fusion applies."""
         # Use the subgroup maximum so unequal or empty owners take the same
         # collective path. The native kernel supports every count; this gate
-        # keeps ordinary TP4 where its smaller GEMM is faster than padded fusion.
+        # keeps ordinary TP where its smaller GEMM is faster than padded fusion.
         rows = max(owner_rows)
         bucket = max(32, 1 << (rows - 1).bit_length())
-        minimum_rows = _FUSED_MIN_ROWS_BY_BUCKET.get(bucket, 3 * bucket // 4)
+        thresholds = _FUSED_MIN_ROWS_BY_TP_AND_BUCKET.get(len(owner_rows))
+        if thresholds is None:
+            return False
+        minimum_rows = thresholds.get(bucket, 3 * bucket // 4)
         if (
             workspace.fused_column is None
             or rows < minimum_rows
@@ -391,11 +400,11 @@ class ProjectionBackend:
         ):
             return False
         from tokenspeed_kernel.ops.communication.cute_dsl import (
-            cute_dsl_fused_tp4_projection,
+            cute_dsl_fused_tp_projection,
         )
 
         _check_workspace(rows, workspace, self._fallback)
-        cute_dsl_fused_tp4_projection(
+        cute_dsl_fused_tp_projection(
             workspace.fused_column,
             inputs.contiguous(),
             weight,

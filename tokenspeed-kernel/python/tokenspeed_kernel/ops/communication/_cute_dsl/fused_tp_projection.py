@@ -27,18 +27,20 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cute.runtime import from_dlpack
-from tokenspeed_kernel.thirdparty.cute_dsl.fused_tp4_projection.optimized_kernel import (
-    FusedBlockwiseGemmKernel,
+from tokenspeed_kernel.thirdparty.cute_dsl.fused_tp_projection.kernel import (
+    FusedTPProjectionKernel,
 )
 
 
-class FusedTP4ProjectionState:
-    """Collectively prepare the validated TP4 schedule before graph capture.
+class FusedTPProjectionState:
+    """Collectively prepare a TP2/4/8 projection before graph capture.
 
     Args:
-        group: Four node-local GB300 ranks in output-shard order.
+        group: Two, four, or eight node-local GB300 ranks in output-shard order.
         device: This rank's CUDA device, with 152 SMs available to the grid.
         max_rows: Maximum physical rows on any owner.
+        input_size: Full input channel count, divisible by 128.
+        output_size: Padded output width, divisible by group size times 128.
 
     Power-of-two row buckets share storage and epochs and compile before use.
     Sequential layers share this storage, but supply their own weights to run.
@@ -47,27 +49,48 @@ class FusedTP4ProjectionState:
     """
 
     def __init__(
-        self, group: dist.ProcessGroup, device: torch.device, max_rows: int
+        self,
+        group: dist.ProcessGroup,
+        device: torch.device,
+        max_rows: int,
+        input_size: int,
+        output_size: int,
     ) -> None:
         if (
-            group.size() != 4
+            group.size() not in (2, 4, 8)
             or max_rows < 1
+            or input_size < 128
+            or input_size % 128
+            or output_size < group.size() * 128
+            or output_size % (group.size() * 128)
             or torch.cuda.get_device_capability(device) != (10, 3)
             or torch.cuda.get_device_properties(device).multi_processor_count != 152
         ):
-            raise ValueError("Fused TP4 projection requires four 152-SM GB300 GPUs")
+            raise ValueError(
+                "Fused TP projection requires aligned widths and TP2/4/8 GB300 GPUs"
+            )
         self.group = group
         self.device = device
         self.rank = group.rank()
+        self.world_size = group.size()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.shard_size = output_size // self.world_size
         self.closed = False
         self.max_rows = max_rows
         capacity = max(32, 1 << (max_rows - 1).bit_length())
         self.a = symm_mem.empty(
-            (capacity * 4, 7168), dtype=torch.float8_e4m3fn, device=device
+            (capacity * self.world_size, input_size),
+            dtype=torch.float8_e4m3fn,
+            device=device,
         )
-        self.sa = symm_mem.empty((capacity * 4, 56), dtype=torch.float32, device=device)
+        self.sa = symm_mem.empty(
+            (capacity * self.world_size, input_size // 128),
+            dtype=torch.float32,
+            device=device,
+        )
         self.receive = symm_mem.empty(
-            (capacity, 49664), dtype=torch.bfloat16, device=device
+            (capacity, output_size), dtype=torch.bfloat16, device=device
         )
         self.ready = symm_mem.empty((168,), dtype=torch.int64, device=device)
         self.ack = symm_mem.empty((168,), dtype=torch.int64, device=device)
@@ -85,8 +108,10 @@ class FusedTP4ProjectionState:
         self.handles = [symm_mem.rendezvous(tensor, group) for tensor in tensors]
         self.peer_tensors = tuple(
             tuple(
-                handle.get_buffer((self.rank + peer) % 4, tensor.shape, tensor.dtype)
-                for peer in range(4)
+                handle.get_buffer(
+                    (self.rank + peer) % self.world_size, tensor.shape, tensor.dtype
+                )
+                for peer in range(self.world_size)
             )
             for handle, tensor in zip(self.handles, tensors)
         )
@@ -99,17 +124,27 @@ class FusedTP4ProjectionState:
         # those views when consecutive calls use different row buckets.
         self.row_views = {
             rows: (
-                from_dlpack(self.a[: rows * 4].unsqueeze(-1), assumed_align=16),
-                from_dlpack(self.sa[: rows * 4].unsqueeze(-1), assumed_align=16),
+                from_dlpack(
+                    self.a[: rows * self.world_size].unsqueeze(-1), assumed_align=16
+                ),
+                from_dlpack(
+                    self.sa[: rows * self.world_size].unsqueeze(-1), assumed_align=16
+                ),
                 (
                     from_dlpack(
-                        self.receive[:rows].view(rows * 4, 12416, 1), assumed_align=16
+                        self.receive[:rows].view(
+                            rows * self.world_size, self.shard_size, 1
+                        ),
+                        assumed_align=16,
                     ),
                     from_dlpack(self.receive[:rows].unsqueeze(-1), assumed_align=16),
                     *(
                         from_dlpack(
                             t[
-                                :rows, self.rank * 12416 : (self.rank + 1) * 12416
+                                :rows,
+                                self.rank
+                                * self.shard_size : (self.rank + 1)
+                                * self.shard_size,
                             ].unsqueeze(-1),
                             assumed_align=16,
                         )
@@ -126,18 +161,24 @@ class FusedTP4ProjectionState:
         self.ready_cute = from_dlpack(self.ready, assumed_align=16)
         self.ack_cute = from_dlpack(self.ack, assumed_align=16)
         self.input_flags_cute = from_dlpack(self.input_flags, assumed_align=16)
-        weight = torch.zeros((12416, 7168), dtype=torch.float8_e4m3fn, device=device)
-        scales = torch.ones((97, 56), dtype=torch.float32, device=device)
+        weight = torch.zeros(
+            (self.shard_size, input_size), dtype=torch.float8_e4m3fn, device=device
+        )
+        scales = torch.ones(
+            (self.shard_size // 128, input_size // 128),
+            dtype=torch.float32,
+            device=device,
+        )
         # A peer must finish zeroing its flags before another rank can publish.
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         self.compiled = {}
         for rows in self.row_views:
-            inputs = torch.zeros((rows, 7168), dtype=torch.bfloat16, device=device)
-            out = torch.empty((rows, 49664), dtype=torch.bfloat16, device=device)
-            kernel = FusedBlockwiseGemmKernel(
-                cutlass.Float32, False, (128, 128), (1, 1)
+            inputs = torch.zeros(
+                (rows, input_size), dtype=torch.bfloat16, device=device
             )
+            out = torch.empty((rows, output_size), dtype=torch.bfloat16, device=device)
+            kernel = FusedTPProjectionKernel(cutlass.Float32, False, (128, 128), (1, 1))
             args = self._arguments(inputs, weight, scales, rows, out)
             self.compiled[rows] = cute.compile(
                 kernel, *args[:5], 152, *args[5:], lambda v: v, options="--opt-level=2"
@@ -191,20 +232,24 @@ class FusedTP4ProjectionState:
     ) -> torch.Tensor:
         """Launch with this layer's tensors and return its owned destination."""
         if self.closed:
-            raise RuntimeError("Fused TP4 projection workspace is closed")
+            raise RuntimeError("Fused TP projection workspace is closed")
         if (
-            len(owner_rows) != 4
+            len(owner_rows) != self.world_size
             or min(owner_rows) < 0
             or not 0 < max(owner_rows) <= self.max_rows
         ):
-            raise ValueError("Fused TP4 projection counts exceed prepared capacity")
+            raise ValueError("Fused TP projection counts exceed prepared capacity")
         rows = owner_rows[self.rank]
         bucket = max(32, 1 << (max(owner_rows) - 1).bit_length())
         for tensor, shape, dtype in (
-            (inputs, (rows, 7168), torch.bfloat16),
-            (weight, (12416, 7168), torch.float8_e4m3fn),
-            (weight_scales, (97, 56), torch.float32),
-            (out, (rows, 49664), torch.bfloat16),
+            (inputs, (rows, self.input_size), torch.bfloat16),
+            (weight, (self.shard_size, self.input_size), torch.float8_e4m3fn),
+            (
+                weight_scales,
+                (self.shard_size // 128, self.input_size // 128),
+                torch.float32,
+            ),
+            (out, (rows, self.output_size), torch.bfloat16),
         ):
             if (
                 tensor.shape != shape
@@ -213,7 +258,7 @@ class FusedTP4ProjectionState:
                 or not tensor.is_contiguous()
                 or tensor.data_ptr() % 16
             ):
-                raise ValueError("Incompatible fused TP4 projection tensor")
+                raise ValueError("Incompatible fused TP projection tensor")
         self.compiled[bucket](
             *self._arguments(inputs, weight, weight_scales, bucket, out)
         )

@@ -26,6 +26,39 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+"""Fused FP8 DP-column projection for a resident TP2/4/8 GPU grid.
+
+Derived from NVIDIA CUTLASS blockwise_gemm.py at revision
+0b55a2f691d69981583568fd9eb69687b1f0de8a; retain its BSD license above.
+
+One launch quantizes owned BF16 rows with FP32 1x128 scales, pushes FP8 rows
+and scales to peers, computes the column-sharded GEMM, and TMA-stores each
+output tile into its row owner's symmetric receive buffer. A final local
+copy preserves ordinary caller-owned output tensors. Input publication and
+output consumption use 64-bit device epochs; no flag reset occurs on replay.
+
+Scheduling changes: the TMA and scale producers acquire their required input
+owners once, after independent pipeline initialization. Schedules whose M-tile
+count does not divide the grid acquire all input owners. Quantization
+uses 64-bit BF16 loads and hardware warp-max reduction. Scale storage is
+released after register loads; the final partial-accumulator slot is released
+after its TMEM read completes and before the remaining FP32 arithmetic.
+The accumulator loop uses four statically unrolled 32-column TMEM transfers;
+the epilogue retains 64-column transfers and releases TMEM after its last read.
+Two scale stages and two output stages preserve all six A/B stages within
+shared-memory capacity. Accumulator and epilogue register budgets remain 256
+and 128. One lane per peer in CTA zero acquires the final acknowledgements;
+other warps can retire while stream ordering protects the next scratch reuse.
+
+Two, four, or eight node-local GB300 GPUs use a common power-of-two row bucket,
+at least 32,
+aligned widths and a fixed, fully resident grid on idle GPUs. Input staging
+zero-fills each owner's row tail inside this kernel, and the final copy writes
+only that owner's actual rows. Empty owners still compute their weight shard
+and participate in every epoch. Remote stores split tiles at owner boundaries.
+Concurrent workspace use and arbitrary competing collectives are unsupported.
+"""
+
 import math
 from typing import Tuple, Type, Union
 
@@ -38,76 +71,13 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-"""Experimental fused FP8 DP-column projection for a resident TP4 GPU grid.
 
-Derived from NVIDIA CUTLASS blockwise_gemm.py at revision
-0b55a2f691d69981583568fd9eb69687b1f0de8a; retain its BSD license above.
+class FusedTPProjectionKernel:
+    """Fuse owner quantization, column-sharded block-FP8 GEMM and output exchange.
 
-One launch quantizes owned BF16 rows with FP32 1x128 scales, pushes FP8 rows
-and scales to peers, computes the column-sharded GEMM, and TMA-stores each
-output tile into its row owner's symmetric receive buffer. A final local
-copy preserves ordinary caller-owned output tensors. Input publication and
-output consumption use 64-bit device epochs; no flag reset occurs on replay.
-
-Scheduling changes: the TMA and scale producers acquire their required input
-owners once, after independent pipeline initialization. Buckets above 256 rows
-can change owners during scheduling and acquire all input owners. Quantization
-uses 64-bit BF16 loads and hardware warp-max reduction. Scale storage is
-released after register loads; the final partial-accumulator slot is released
-after its TMEM read completes and before the remaining FP32 arithmetic.
-The accumulator loop uses four statically unrolled 32-column TMEM transfers;
-the epilogue retains 64-column transfers and releases TMEM after its last read.
-Two scale stages and two output stages preserve all six A/B stages within
-shared-memory capacity. Accumulator and epilogue register budgets remain 256
-and 128. Four lanes in CTA zero acquire the final peer acknowledgements;
-other warps can retire while stream ordering protects the next scratch reuse.
-
-Four node-local GB300 GPUs use a common power-of-two row bucket, at least 32,
-aligned widths and a fixed, fully resident grid on idle GPUs. Input staging
-zero-fills each owner's row tail inside this kernel, and the final copy writes
-only that owner's actual rows. Empty owners still compute their weight shard
-and participate in every epoch. Remote stores split tiles at owner boundaries.
-Concurrent workspace use and arbitrary competing collectives are unsupported.
-"""
-
-
-class FusedBlockwiseGemmKernel:
-    """This class implements batched matrix multiplication (C = (SFA * A) * (SFB * B)) with support for fp8 (e4m3fn, e5m2)
-    and architectural features specific to Blackwell GPUs with persistent tile scheduling and warp specialization.
-
-    :param acc_dtype: Data type for accumulation during computation
-    :type acc_dtype: type[cutlass.Numeric]
-    :param use_2cta_instrs: Whether to use CTA group 2 for advanced thread cooperation
-    :type use_2cta_instrs: bool
-    :param mma_tiler_mn: Shape of the Matrix Multiply-Accumulate (MMA) tile (M,N)
-    :type mma_tiler_mn: Tuple[int, int]
-    :param cluster_shape_mn: Cluster dimensions (M,N) for parallel processing
-    :type cluster_shape_mn: Tuple[int, int]
-
-    :note: Supported A/B data types:
-        - Float8E4M3FN
-
-    :note: Supported accumulator data types:
-        - Float32
-
-    :note: Supported C data types:
-        - Float16/BFloat16
-        - Other data types are not supported for accuracy issues
-
-    :note: Constraints:
-        - MMA tiler M must be 64/128/256
-        - MMA tiler N must be 128
-        - Cluster shape M must be multiple of 2
-        - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
-
-    Example:
-        >>> gemm = BlockwiseGemmKernel(
-        ...     acc_dtype=cutlass.Float32,
-        ...     use_2cta_instrs=True,
-        ...     mma_tiler_mn=(128, 128),
-        ...     cluster_shape_mn=(2, 2)
-        ... )
-        >>> gemm(a_tensor, b_tensor, c_tensor, sfa_tensor, sfb_tensor, max_active_clusters, stream)
+    Use 128x128 tiles, one-CTA clusters and a fully resident grid on node-local
+    GB300 peers. Persistent scheduling and warp specialization overlap TMA,
+    tensor-core MMA, FP32 block scaling, and the output epilogue.
     """
 
     def __init__(
@@ -142,11 +112,12 @@ class FusedBlockwiseGemmKernel:
 
         if mma_tiler_mn != (128, 128) or cluster_shape_mn != (1, 1) or use_2cta_instrs:
             raise ValueError(
-                "This TP4 experiment requires 128x128 tiles and one-CTA clusters"
+                "Fused TP projection requires 128x128 tiles and one-CTA clusters"
             )
         self.acc_dtype: Type[cutlass.Numeric] = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
+        self.num_ctas = 0
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
 
@@ -530,6 +501,7 @@ class FusedBlockwiseGemmKernel:
         )
 
         # Compute grid size
+        self.num_ctas = max_active_clusters
         self.tile_sched_params, grid = self._compute_grid(
             c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters
         )
@@ -2133,9 +2105,11 @@ class FusedBlockwiseGemmKernel:
         )
         first_owner = tile_m * self.cta_tile_shape_mnk[0] // rows
         owners_per_tile = max(1, self.cta_tile_shape_mnk[0] // rows)
-        # With more than eight M tiles, a 152-CTA scheduler can advance to
-        # another owner. Acquire every owner before this producer starts.
-        if cutlass.const_expr(rows > 256):
+        # M is the contiguous scheduler coordinate. A CTA retains its M tile
+        # only when the grid stride is a multiple of the number of M tiles.
+        # Otherwise later iterations may read any owner, regardless of TP size.
+        m_tiles = cute.ceil_div(len(peer_flags) * rows, self.cta_tile_shape_mnk[0])
+        if cutlass.const_expr(self.num_ctas % m_tiles != 0):
             first_owner = cutlass.Int32(0)
             owners_per_tile = len(peer_flags)
         if cute.arch.lane_idx() == 0:
@@ -2209,7 +2183,8 @@ class FusedBlockwiseGemmKernel:
         tile_count = (
             n_tiles - first_column_tile + producer_groups - 1
         ) // producer_groups
-        m_tiles = world * rows // self.cta_tile_shape_mnk[0]
+        # TP2 at the 32-row bucket has one partially filled M tile.
+        m_tiles = cute.ceil_div(world * rows, self.cta_tile_shape_mnk[0])
         # Column producer indices repeat after max(1, 128 / rows) steps.
         # Owners larger than a GEMM tile also need each local M-tile producer.
         for row_tile in cutlass.range_constexpr(max(1, rows // 128)):
@@ -2302,7 +2277,7 @@ class FusedBlockwiseGemmKernel:
                 cute.arch.store(ready.iterator, epoch, sem="release", scope="sys")
                 cute.arch.store(ack.iterator, epoch, sem="release", scope="sys")
             cute.arch.barrier()
-        # Four lanes in CTA zero acquire the independent peer acknowledgements.
+        # One lane per peer acquires its acknowledgement in CTA zero.
         # Other warps may retire: stream order waits for these polling lanes.
         if block == 0:
             address = peer_ack[0].iterator
