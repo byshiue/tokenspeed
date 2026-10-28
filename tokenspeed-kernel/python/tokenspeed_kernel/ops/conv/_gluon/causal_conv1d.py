@@ -20,6 +20,8 @@
 
 """One prefill kernel with compile-time rolling and parallel token tactics."""
 
+from __future__ import annotations
+
 from tokenspeed_kernel._triton import gl, gluon, triton
 
 
@@ -526,7 +528,9 @@ def gluon_causal_conv1d_prefill_kernel(
     WINDOW_ROWS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     ENABLE_PDL: gl.constexpr,
+    MODEL_TOKEN_STRIDE: gl.constexpr,
 ):
+    input_stride: gl.constexpr = MODEL_TOKEN_STRIDE or CHANNELS
     if ENABLE_PDL:
         gl.inline_asm_elementwise(
             "griddepcontrol.wait; mov.u32 $0, 0;",
@@ -564,11 +568,10 @@ def gluon_causal_conv1d_prefill_kernel(
         return
     if token == 0:
         history = gl.load(History + request)
-        # Specialize the compact first tile too. The rolling loop must not
-        # repeat runtime stride branches for every token.
+        # A fixed model projection stride preserves vector loads without
+        # specializing on batch-dependent strides in the general path.
         if (
-            not TOKEN_PARALLEL
-            and sx_token == CHANNELS
+            (MODEL_TOKEN_STRIDE > 0 or (not TOKEN_PARALLEL and sx_token == CHANNELS))
             and sx_channel == 1
             and so_token == CHANNELS
             and so_channel == 1
@@ -585,7 +588,7 @@ def gluon_causal_conv1d_prefill_kernel(
                 length,
                 slot,
                 history,
-                CHANNELS,
+                input_stride,
                 1,
                 CHANNELS,
                 1,
@@ -642,7 +645,7 @@ def gluon_causal_conv1d_prefill_kernel(
             )
 
     elif (
-        sx_token == CHANNELS
+        (MODEL_TOKEN_STRIDE > 0 or sx_token == CHANNELS)
         and sx_channel == 1
         and so_token == CHANNELS
         and so_channel == 1
@@ -659,7 +662,7 @@ def gluon_causal_conv1d_prefill_kernel(
             length,
             slot,
             False,
-            CHANNELS,
+            input_stride,
             1,
             CHANNELS,
             1,
